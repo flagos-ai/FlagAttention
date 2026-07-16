@@ -1,24 +1,27 @@
 import math
+
 import torch
 
 
-def attention(q,
-              k,
-              v,
-              causal,
-              dropout_p=0.0,
-              dropout_mask=None,
-              sm_scale=None,
-              return_log_normalizer=False,
-              return_total_attention=False,
-              upcast=False):
+def attention(
+    q,
+    k,
+    v,
+    causal,
+    dropout_p=0.0,
+    dropout_mask=None,
+    sm_scale=None,
+    return_log_normalizer=False,
+    return_total_attention=False,
+    upcast=False,
+):
     input_dtype = q.dtype
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
     # (B, H, T, D)
     D = q.shape[-1]
     if sm_scale is None:
-        sm_scale = 1. / math.sqrt(D)
+        sm_scale = 1.0 / math.sqrt(D)
 
     num_heads_q = q.shape[1]
     num_heads_k = k.shape[1]
@@ -62,9 +65,11 @@ def attention(q,
 
     has_extra_return = return_log_normalizer or return_total_attention
     if has_extra_return:
-        outs = (attn_output,
-                log_normalizer if return_log_normalizer else None,
-                tot_attn if return_total_attention else None)
+        outs = (
+            attn_output,
+            log_normalizer if return_log_normalizer else None,
+            tot_attn if return_total_attention else None,
+        )
         return outs
     else:
         return attn_output

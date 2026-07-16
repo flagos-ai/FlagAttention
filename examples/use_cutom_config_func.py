@@ -1,11 +1,15 @@
 import torch
-import flag_attn
 
+import flag_attn
 
 # replace the default config function
 from flag_attn import flash
+
+
 def get_fwd_config(B, H, M, N, D, causal):
     return (64, 64, 1, 4)
+
+
 flash.get_fwd_config = get_fwd_config
 
 B, H, M, N, D = 2, 16, 4096, 4096, 128

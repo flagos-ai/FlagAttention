@@ -1,5 +1,6 @@
 import torch
 import triton
+
 import flag_attn
 
 NUM_BLOCKS = 1000

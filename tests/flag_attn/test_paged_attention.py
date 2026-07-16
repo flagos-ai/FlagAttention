@@ -1,5 +1,5 @@
-import torch
 import pytest
+import torch
 
 import flag_attn
 
@@ -116,11 +116,15 @@ def test_paged_attention_by_num_splits(
         num_splits=num_splits,
     )
 
-@pytest.mark.parametrize("num_seqs, num_query_heads, query_group_size, head_size, block_size, max_seq_len, num_splits", [
-    (1, 12, 1, 64, 16, 2, 0),
-    (16, 64, 8, 32, 16, 2048, 2),
-    (16, 64, 1, 64, 16, 2048, 6),
-])
+
+@pytest.mark.parametrize(
+    "num_seqs, num_query_heads, query_group_size, head_size, block_size, max_seq_len, num_splits",
+    [
+        (1, 12, 1, 64, 16, 2, 0),
+        (16, 64, 8, 32, 16, 2048, 2),
+        (16, 64, 1, 64, 16, 2048, 6),
+    ],
+)
 def test_paged_attention_by_case(
     num_seqs,
     num_query_heads,

@@ -2,11 +2,13 @@ import torch
 import triton
 import triton.language as tl
 
+
 # Requires triton 2.2.0
 def attention(
     query: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
     key_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
-    value_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE], required same stride with key_cache
+    # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE], required same stride with key_cache
+    value_cache: torch.Tensor,
     context_lens: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     attn_scale: float,
@@ -29,9 +31,12 @@ def attention(
         padded_group_size = triton.next_power_of_2(query_group_size)
 
     assert head_size in (16, 32, 64, 128, 256, 512), f"head_size={head_size}"
-    assert padded_group_size == 1 or kv_block_size >= 16, f"kv_block_size={kv_block_size}"
+    assert (
+        padded_group_size == 1 or kv_block_size >= 16
+    ), f"kv_block_size={kv_block_size}"
     # query_group_size in (1, 2, 4, 8, 16, 32, 64, 128, 256)
-    # assert query_group_size > 0 and query_group_size & (query_group_size-1) == 0, f"query_group_size={query_group_size}"
+    # assert query_group_size > 0 and query_group_size & (query_group_size-1) == 0,
+    # f"query_group_size={query_group_size}"
 
     # config for A100
     # TODO: support more devices and optimize
@@ -107,8 +112,9 @@ def attention(
                 device=out.device,
             )
 
-            assert (partition_size >= kv_block_size) and (partition_size % kv_block_size == 0), \
-                f"partition_size={partition_size}, kv_block_size={kv_block_size}"
+            assert (partition_size >= kv_block_size) and (
+                partition_size % kv_block_size == 0
+            ), f"partition_size={partition_size}, kv_block_size={kv_block_size}"
             _paged_attn_kernel[grid](
                 m_i,
                 l_i,
@@ -408,9 +414,9 @@ def _paged_attn_v2_reduce_kernel(
     l_i = tl.load(l_i_ptr + ml_offset, mask=mask, other=0.0)
     l_i *= tl.exp(m_i - m[None, :])
     # l: [QUERY_GROUP_SIZE]
-    l = tl.sum(l_i, axis=0)
+    log_sum = tl.sum(l_i, axis=0)
     # r: [NUM_PARTITIONS, QUERY_GROUP_SIZE]
-    r = l_i / l[None, :]
+    r = l_i / log_sum[None, :]
     r = tl.reshape(r, (NUM_PARTITIONS, QUERY_GROUP_SIZE, 1))
 
     tmp_out_offset = (

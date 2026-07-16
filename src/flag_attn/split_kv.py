@@ -1,4 +1,5 @@
 import math
+
 import torch
 import triton
 import triton.language as tl
@@ -11,18 +12,47 @@ the gpu's SM's.
 For more details, refer to https://princeton-nlp.github.io/flash-decoding/.
 """
 
+
 @triton.jit
 def _fwd_split_kv_kernel(
-    Q, K, V, sm_scale,
-    L, O,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_oz, stride_oh, stride_os, stride_om, stride_ok,
-    Z, H, M, N, P_SEQ, N_SPLIT_SIZE, S, num_groups,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
-    IS_CAUSAL: tl.constexpr, LARGER_M: tl.constexpr,
-    DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
+    Q,
+    K,
+    V,
+    sm_scale,
+    L,
+    O,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_os,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    M,
+    N,
+    P_SEQ,
+    N_SPLIT_SIZE,
+    S,
+    num_groups,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    LARGER_M: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
 ):
     input_dtype = Q.dtype.element_ty
     # -- grid id --
@@ -45,8 +75,10 @@ def _fwd_split_kv_kernel(
     V += off_z * stride_vz + off_hk * stride_vh
 
     # offset pointers for (batch & head, split)
-    O += off_z * stride_oz + off_h * stride_oh + n_split_id * stride_os # o's shape is (B, H, S, M, D)
-    L += ((off_z * H + off_h) * S + n_split_id) * M # l's shape is (B, H, S, M)
+    O += (
+        off_z * stride_oz + off_h * stride_oh + n_split_id * stride_os
+    )  # o's shape is (B, H, S, M, D)
+    L += ((off_z * H + off_h) * S + n_split_id) * M  # l's shape is (B, H, S, M)
 
     offs_m_base = tl.arange(0, BLOCK_M)
     offs_m = start_m * BLOCK_M + offs_m_base
@@ -54,8 +86,12 @@ def _fwd_split_kv_kernel(
     offs_k = tl.arange(0, BLOCK_DMODEL)
 
     # initialize pointers to value-like data
-    q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk) # (BLOCK_M, BLOCK_DMODEL)
-    o_ptrs = O + (offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok) # (BLOCK_M, BLOCK_DMODEL)
+    q_ptrs = Q + (
+        offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
+    )  # (BLOCK_M, BLOCK_DMODEL)
+    o_ptrs = O + (
+        offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok
+    )  # (BLOCK_M, BLOCK_DMODEL)
     l_ptrs = L + offs_m
 
     # initialize pointer to m and l, fp32 for accumulators
@@ -70,12 +106,14 @@ def _fwd_split_kv_kernel(
         mask_m = offs_m < M
         q = tl.load(q_ptrs, mask=mask_m[:, None])
 
-    #Dot I trick: to place q in registers, it saves shared memory
+    # Dot I trick: to place q in registers, it saves shared memory
     if BLOCK_DMODEL < 128:
-        I = tl.where(offs_k[:, None] == offs_k,
-                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 1.0, dtype=input_dtype),
-                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 0.0, dtype=input_dtype))
-        q = tl.dot(q, I).to(input_dtype)
+        identity = tl.where(
+            offs_k[:, None] == offs_k,
+            tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 1.0, dtype=input_dtype),
+            tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 0.0, dtype=input_dtype),
+        )
+        q = tl.dot(q, identity).to(input_dtype)
     # else:
     #     I = tl.where(offs_m_base[:, None] == offs_m_base,
     #                  tl.full((BLOCK_M, BLOCK_M), 1.0, dtype=input_dtype),
@@ -102,8 +140,12 @@ def _fwd_split_kv_kernel(
 
     # loop over k, v and update accumulators
     offs_n_init = N_LEFT + offs_n_base
-    k_ptrs = K + (offs_k[:, None] * stride_vk + offs_n_init[None, :] * stride_vn) # (BLOCK_DMODEL, BLOCK_N)
-    v_ptrs = V + (offs_n_init[:, None] * stride_kn + offs_k[None, :] * stride_kk) # (BLOCK_N, BLOCK_DMODEL)
+    k_ptrs = K + (
+        offs_k[:, None] * stride_vk + offs_n_init[None, :] * stride_vn
+    )  # (BLOCK_DMODEL, BLOCK_N)
+    v_ptrs = V + (
+        offs_n_init[:, None] * stride_kn + offs_k[None, :] * stride_kk
+    )  # (BLOCK_N, BLOCK_DMODEL)
     for start_n in range(N_LEFT, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n = start_n + offs_n_base
@@ -147,26 +189,42 @@ def _fwd_split_kv_kernel(
     if IS_CAUSAL and LARGER_M:
         is_empty_line = (offs_m + P_SEQ) < 0
         acc = tl.where(is_empty_line[:, None], 0.0, acc * (1.0 / l_i[:, None]))
-        l = tl.where(is_empty_line, float("-inf"), m_i * sm_scale + tl.log(l_i))
+        log_sum = tl.where(is_empty_line, float("-inf"), m_i * sm_scale + tl.log(l_i))
     else:
         acc = acc * (1.0 / l_i[:, None])
-        l = m_i * sm_scale + tl.log(l_i) # log(normalizer)
+        log_sum = m_i * sm_scale + tl.log(l_i)  # log(normalizer)
 
     if DIVISIBLE_M:
-        tl.store(l_ptrs, l, cache_modifier=".cg")
+        tl.store(l_ptrs, log_sum, cache_modifier=".cg")
         tl.store(o_ptrs, acc.to(input_dtype), cache_modifier=".cg")
     else:
-        tl.store(l_ptrs, l, mask=mask_m, cache_modifier=".cg")
-        tl.store(o_ptrs, acc.to(input_dtype), mask=mask_m[:, None], cache_modifier=".cg")
+        tl.store(l_ptrs, log_sum, mask=mask_m, cache_modifier=".cg")
+        tl.store(
+            o_ptrs, acc.to(input_dtype), mask=mask_m[:, None], cache_modifier=".cg"
+        )
+
 
 @triton.jit
 def _fwd_combine_kv_splits(
-    multiple_o, multiple_l,
-    final_o, final_l,
-    stride_mul_oz, stride_mul_oh, stride_mul_os, stride_mul_om, stride_mul_ok,
-    stride_fin_oz, stride_fin_oh, stride_fin_om, stride_fin_ok,
-    Z, H, M, S,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    multiple_o,
+    multiple_l,
+    final_o,
+    final_l,
+    stride_mul_oz,
+    stride_mul_oh,
+    stride_mul_os,
+    stride_mul_om,
+    stride_mul_ok,
+    stride_fin_oz,
+    stride_fin_oh,
+    stride_fin_om,
+    stride_fin_ok,
+    Z,
+    H,
+    M,
+    S,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
     DIVISIBLE_M: tl.constexpr,
 ):
     start_m = tl.program_id(0)
@@ -174,8 +232,8 @@ def _fwd_combine_kv_splits(
     offs_z = tl.program_id(2)
 
     # offset
-    multiple_o += offs_z * stride_mul_oz + offs_h * stride_mul_oh # (B, H, S, M, D)
-    multiple_l += (offs_z * H + offs_h) * S * M # (B, H, S, M)
+    multiple_o += offs_z * stride_mul_oz + offs_h * stride_mul_oh  # (B, H, S, M, D)
+    multiple_l += (offs_z * H + offs_h) * S * M  # (B, H, S, M)
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     if not DIVISIBLE_M:
@@ -187,11 +245,11 @@ def _fwd_combine_kv_splits(
     l_ptrs = multiple_l + offs_m
     for _ in range(0, S):
         if DIVISIBLE_M:
-            l = tl.load(l_ptrs)
+            log_sum = tl.load(l_ptrs)
         else:
-            l = tl.load(l_ptrs, mask=mask_m)
-        m_new = tl.maximum(m, l)
-        acc = acc * tl.exp(m - m_new) + tl.exp(l - m_new)
+            log_sum = tl.load(l_ptrs, mask=mask_m)
+        m_new = tl.maximum(m, log_sum)
+        acc = acc * tl.exp(m - m_new) + tl.exp(log_sum - m_new)
         m = m_new
         l_ptrs += M
     l_acc = m + tl.log(acc)
@@ -200,12 +258,16 @@ def _fwd_combine_kv_splits(
     o_acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
     l_ptrs = multiple_l + offs_m
     offs_k = tl.arange(0, BLOCK_DMODEL)
-    o_ptrs = multiple_o + offs_m[:, None] * stride_mul_om + offs_k[None, :] * stride_mul_ok
+    o_ptrs = (
+        multiple_o + offs_m[:, None] * stride_mul_om + offs_k[None, :] * stride_mul_ok
+    )
     for _ in range(0, S):
-        l = tl.load(l_ptrs, mask=offs_m < M)
-        rescale = tl.exp(l - l_acc)
+        log_sum = tl.load(l_ptrs, mask=offs_m < M)
+        rescale = tl.exp(log_sum - l_acc)
         if DIVISIBLE_M:
-            o = tl.load(o_ptrs, )
+            o = tl.load(
+                o_ptrs,
+            )
         else:
             o = tl.load(o_ptrs, mask=mask_m[:, None])
         o_acc += o * rescale[:, None]
@@ -226,17 +288,21 @@ def _fwd_combine_kv_splits(
         tl.store(a_ptrs, o_acc, mask=mask_m[:, None])
         tl.store(b_ptrs, l_acc, mask=mask_m)
 
+
 def get_fwd_config(B, H, M, N, D, causal):
     # BLOCK_M, BLOCK_N, num_stages, num_warps
     return (16, 128, 1, 4)
 
-# this function is adapted from https://github.com/Dao-AILab/flash-attention/blob/61a777247900f6c2a37376f3ffd7134385fdc95c/csrc/flash_attn/flash_api.cpp#L235
+
+# this function is adapted from:
+# https://github.com/Dao-AILab/flash-attention/blob/61a777247900f6c2a37376f3ffd7134385fdc95c/csrc/flash_attn/flash_api.cpp#L235
 def num_splits_herustic(B, H, M, N, BLOCK_M, BLOCK_N, num_sms, max_splits):
     num_blocks_without_split_kv = B * H * triton.cdiv(M, BLOCK_M)
     if num_blocks_without_split_kv >= 0.8 * num_sms:
         return 1
 
     num_n_blocks = triton.cdiv(N, BLOCK_N)
+
     def num_split_avaiable(s):
         blocks_per_split = triton.cdiv(num_n_blocks, s)
         return s == 1 or (blocks_per_split * s - num_n_blocks < blocks_per_split)
@@ -247,7 +313,7 @@ def num_splits_herustic(B, H, M, N, BLOCK_M, BLOCK_N, num_sms, max_splits):
         return eff
 
     max_efficiency = 0.0
-    plans = [] # (num_split, efficiency)
+    plans = []  # (num_split, efficiency)
     max_splits = min(num_sms, num_n_blocks, max_splits)
 
     for num_split in range(1, max_splits + 1):
@@ -278,7 +344,7 @@ def attention(q, k, v, causal=False, sm_scale=None):
     larger_m = M > N
 
     if sm_scale is None:
-        sm_scale = 1. / math.sqrt(D)
+        sm_scale = 1.0 / math.sqrt(D)
 
     # to work around https://github.com/openai/triton/issues/2441
     device = torch.cuda.device_of(q)
@@ -298,17 +364,46 @@ def attention(q, k, v, causal=False, sm_scale=None):
         grid = (triton.cdiv(M, BLOCK_M), S, H * B)
         N_SPLIT_SIZE = triton.cdiv(triton.cdiv(N, BLOCK_N), S) * BLOCK_N
         _fwd_split_kv_kernel[grid](
-            q, k, v, sm_scale,
-            multiple_l, multiple_o,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            multiple_o.stride(0), multiple_o.stride(1), multiple_o.stride(2), multiple_o.stride(3), multiple_o.stride(4),
-            B, H, M, N, P_SEQ, N_SPLIT_SIZE, S, num_groups,
-            BLOCK_M=BLOCK_M, BLOCK_DMODEL=D, BLOCK_N=BLOCK_N,
-            IS_CAUSAL=causal, LARGER_M=larger_m,
-            DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
-            num_stages=num_stages, num_warps=num_warps,
+            q,
+            k,
+            v,
+            sm_scale,
+            multiple_l,
+            multiple_o,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            multiple_o.stride(0),
+            multiple_o.stride(1),
+            multiple_o.stride(2),
+            multiple_o.stride(3),
+            multiple_o.stride(4),
+            B,
+            H,
+            M,
+            N,
+            P_SEQ,
+            N_SPLIT_SIZE,
+            S,
+            num_groups,
+            BLOCK_M=BLOCK_M,
+            BLOCK_DMODEL=D,
+            BLOCK_N=BLOCK_N,
+            IS_CAUSAL=causal,
+            LARGER_M=larger_m,
+            DIVISIBLE_M=divisible_m,
+            DIVISIBLE_N=divisible_n,
+            num_stages=num_stages,
+            num_warps=num_warps,
         )
 
         if S == 1:
@@ -318,13 +413,27 @@ def attention(q, k, v, causal=False, sm_scale=None):
         final_o = torch.empty_like(q)
         grid = (triton.cdiv(M, BLOCK_M), H, B)
         _fwd_combine_kv_splits[grid](
-            multiple_o, multiple_l,
-            final_o, final_l,
-            multiple_o.stride(0), multiple_o.stride(1), multiple_o.stride(2), multiple_o.stride(3), multiple_o.stride(4),
-            final_o.stride(0), final_o.stride(1), final_o.stride(2), final_o.stride(3),
-            B, H, M, S,
-            BLOCK_M=BLOCK_M, BLOCK_DMODEL=D,
+            multiple_o,
+            multiple_l,
+            final_o,
+            final_l,
+            multiple_o.stride(0),
+            multiple_o.stride(1),
+            multiple_o.stride(2),
+            multiple_o.stride(3),
+            multiple_o.stride(4),
+            final_o.stride(0),
+            final_o.stride(1),
+            final_o.stride(2),
+            final_o.stride(3),
+            B,
+            H,
+            M,
+            S,
+            BLOCK_M=BLOCK_M,
+            BLOCK_DMODEL=D,
             DIVISIBLE_M=divisible_m,
-            num_stages=num_stages, num_warps=num_warps,
+            num_stages=num_stages,
+            num_warps=num_warps,
         )
     return final_o

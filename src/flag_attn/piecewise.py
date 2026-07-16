@@ -11,22 +11,31 @@ in the training set.
 It takes as input two q's and two k's as inputs. The attention score is the dot product
 of (q1, k1) or (q2, k2) depending on whether the distance between q & k exceeds a threshold.
 
-The code is adapted from triton's [tutorial](https://github.com/openai/triton/blob/5162871c6cae01a8508a309cf21a8e6b68a4c091/python/tutorials/06-fused-attention.py).
+The code is adapted from triton's tutorial:
+https://github.com/openai/triton/blob/5162871c6cae01a8508a309cf21a8e6b68a4c091/python/tutorials/06-fused-attention.py
 """
 
 import math
+
 import torch
 import triton
 import triton.language as tl
 
 __all__ = ["attention"]
 
+
 # --------------------------- public API ---------------------------
 class PiecewiseAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q1, k1, q2, k2, v, w, causal, sm_scale):
         # shape constraints
-        Dq1, Dk1, Dq2, Dk2, Dv = q1.shape[-1], k1.shape[-1], q2.shape[-1], k2.shape[-1], v.shape[-1]
+        Dq1, Dk1, Dq2, Dk2, Dv = (
+            q1.shape[-1],
+            k1.shape[-1],
+            q2.shape[-1],
+            k2.shape[-1],
+            v.shape[-1],
+        )
         assert Dq1 == Dk1 == Dq2 == Dk2 == Dv
         assert Dk1 in {16, 32, 64, 128}
 
@@ -36,7 +45,7 @@ class PiecewiseAttention(torch.autograd.Function):
         larger_m = M > N
 
         if sm_scale is None:
-            sm_scale = 1. / math.sqrt(D)
+            sm_scale = 1.0 / math.sqrt(D)
 
         # to work around https://github.com/openai/triton/issues/2441
         device = torch.cuda.device_of(q1)
@@ -52,20 +61,53 @@ class PiecewiseAttention(torch.autograd.Function):
             L = torch.empty((B, H, M), device=q1.device, dtype=torch.float32)
 
             _fwd_kernel[grid](
-                q1, k1, q2, k2, v, sm_scale,
+                q1,
+                k1,
+                q2,
+                k2,
+                v,
+                sm_scale,
                 L,
                 o,
-                q1.stride(0), q1.stride(1), q1.stride(2), q1.stride(3),
-                k1.stride(0), k1.stride(1), k1.stride(2), k1.stride(3),
-                q2.stride(0), q2.stride(1), q2.stride(2), q2.stride(3),
-                k2.stride(0), k2.stride(1), k2.stride(2), k2.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                B, H, M, N, P_SEQ,
-                w = w, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=D,
-                IS_CAUSAL=causal, LARGER_M=larger_m,
-                DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
-                num_warps=num_warps, num_stages=num_stages,
+                q1.stride(0),
+                q1.stride(1),
+                q1.stride(2),
+                q1.stride(3),
+                k1.stride(0),
+                k1.stride(1),
+                k1.stride(2),
+                k1.stride(3),
+                q2.stride(0),
+                q2.stride(1),
+                q2.stride(2),
+                q2.stride(3),
+                k2.stride(0),
+                k2.stride(1),
+                k2.stride(2),
+                k2.stride(3),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                v.stride(3),
+                o.stride(0),
+                o.stride(1),
+                o.stride(2),
+                o.stride(3),
+                B,
+                H,
+                M,
+                N,
+                P_SEQ,
+                w=w,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_DMODEL=D,
+                IS_CAUSAL=causal,
+                LARGER_M=larger_m,
+                DIVISIBLE_M=divisible_m,
+                DIVISIBLE_N=divisible_n,
+                num_warps=num_warps,
+                num_stages=num_stages,
             )
 
         ctx.save_for_backward(q1, k1, q2, k2, v, o, L)
@@ -87,7 +129,7 @@ class PiecewiseAttention(torch.autograd.Function):
         larger_m = M > N
 
         if sm_scale is None:
-            sm_scale = 1. / math.sqrt(D)
+            sm_scale = 1.0 / math.sqrt(D)
 
         # to work around https://github.com/openai/triton/issues/2441
         device = torch.cuda.device_of(q1)
@@ -101,13 +143,23 @@ class PiecewiseAttention(torch.autograd.Function):
             delta = torch.empty((B, H, M), device=q1.device, dtype=torch.float32)
             grid = (triton.cdiv(M, BLOCK_M), H, B)
             _bwd_preprocess[grid](
-                o, do,
+                o,
+                do,
                 delta,
-                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                delta.stride(0), delta.stride(1), delta.stride(2),
+                o.stride(0),
+                o.stride(1),
+                o.stride(2),
+                o.stride(3),
+                do.stride(0),
+                do.stride(1),
+                do.stride(2),
+                do.stride(3),
+                delta.stride(0),
+                delta.stride(1),
+                delta.stride(2),
                 M,
-                BLOCK_M=BLOCK_M, D_HEAD=D,
+                BLOCK_M=BLOCK_M,
+                D_HEAD=D,
                 DIVISIBLE_M=divisible_m,
             )
 
@@ -116,24 +168,66 @@ class PiecewiseAttention(torch.autograd.Function):
             dv = torch.empty_like(v)
             grid = (triton.cdiv(N, BLOCK_N), H, B)
             _bwd_kv_kernel[grid](
-                q1, k1, q2, k2, v, sm_scale, do,
-                dk1,dk2, dv,
-                L, delta,
-                q1.stride(0), q1.stride(1), q1.stride(2), q1.stride(3),
-                k1.stride(0), k1.stride(1), k1.stride(2), k1.stride(3),
-                q2.stride(0), q2.stride(1), q2.stride(2), q2.stride(3),
-                k2.stride(0), k2.stride(1), k2.stride(2), k2.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                dk1.stride(0), dk1.stride(1), dk1.stride(2), dk1.stride(3),
-                dk2.stride(0), dk2.stride(1), dk2.stride(2), dk2.stride(3),
-                dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-                B, H, M, N, P_SEQ,
+                q1,
+                k1,
+                q2,
+                k2,
+                v,
+                sm_scale,
+                do,
+                dk1,
+                dk2,
+                dv,
+                L,
+                delta,
+                q1.stride(0),
+                q1.stride(1),
+                q1.stride(2),
+                q1.stride(3),
+                k1.stride(0),
+                k1.stride(1),
+                k1.stride(2),
+                k1.stride(3),
+                q2.stride(0),
+                q2.stride(1),
+                q2.stride(2),
+                q2.stride(3),
+                k2.stride(0),
+                k2.stride(1),
+                k2.stride(2),
+                k2.stride(3),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                v.stride(3),
+                do.stride(0),
+                do.stride(1),
+                do.stride(2),
+                do.stride(3),
+                dk1.stride(0),
+                dk1.stride(1),
+                dk1.stride(2),
+                dk1.stride(3),
+                dk2.stride(0),
+                dk2.stride(1),
+                dk2.stride(2),
+                dk2.stride(3),
+                dv.stride(0),
+                dv.stride(1),
+                dv.stride(2),
+                dv.stride(3),
+                B,
+                H,
+                M,
+                N,
+                P_SEQ,
                 w=w,
-                BLOCK_M=BLOCK_M, BLOCK_DMODEL=D,
+                BLOCK_M=BLOCK_M,
+                BLOCK_DMODEL=D,
                 BLOCK_N=BLOCK_N,
                 CAUSAL=causal,
-                DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
+                DIVISIBLE_M=divisible_m,
+                DIVISIBLE_N=divisible_n,
                 num_stages=num_stages,
                 num_warps=num_warps,
             )
@@ -142,23 +236,62 @@ class PiecewiseAttention(torch.autograd.Function):
             dq2 = torch.zeros_like(q2)
             grid = (triton.cdiv(M, BLOCK_M), H, B)
             _bwd_q_kernel[grid](
-                q1, k1, q2, k2, v, sm_scale, do,
-                dq1, dq2,
-                L, delta,
-                q1.stride(0), q1.stride(1), q1.stride(2), q1.stride(3),
-                k1.stride(0), k1.stride(1), k1.stride(2), k1.stride(3),
-                q2.stride(0), q2.stride(1), q2.stride(2), q2.stride(3),
-                k2.stride(0), k2.stride(1), k2.stride(2), k2.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                dq1.stride(0), dq1.stride(1), dq1.stride(2), dq1.stride(3),
-                dq2.stride(0), dq2.stride(1), dq2.stride(2), dq2.stride(3),
-                B, H, M, N, P_SEQ,
+                q1,
+                k1,
+                q2,
+                k2,
+                v,
+                sm_scale,
+                do,
+                dq1,
+                dq2,
+                L,
+                delta,
+                q1.stride(0),
+                q1.stride(1),
+                q1.stride(2),
+                q1.stride(3),
+                k1.stride(0),
+                k1.stride(1),
+                k1.stride(2),
+                k1.stride(3),
+                q2.stride(0),
+                q2.stride(1),
+                q2.stride(2),
+                q2.stride(3),
+                k2.stride(0),
+                k2.stride(1),
+                k2.stride(2),
+                k2.stride(3),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                v.stride(3),
+                do.stride(0),
+                do.stride(1),
+                do.stride(2),
+                do.stride(3),
+                dq1.stride(0),
+                dq1.stride(1),
+                dq1.stride(2),
+                dq1.stride(3),
+                dq2.stride(0),
+                dq2.stride(1),
+                dq2.stride(2),
+                dq2.stride(3),
+                B,
+                H,
+                M,
+                N,
+                P_SEQ,
                 w=w,
-                BLOCK_M=BLOCK_M, BLOCK_DMODEL=D,
+                BLOCK_M=BLOCK_M,
+                BLOCK_DMODEL=D,
                 BLOCK_N=BLOCK_N,
-                CAUSAL=causal, LARGER_M=larger_m,
-                DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
+                CAUSAL=causal,
+                LARGER_M=larger_m,
+                DIVISIBLE_M=divisible_m,
+                DIVISIBLE_N=divisible_n,
                 num_stages=num_stages,
                 num_warps=num_warps,
             )
@@ -181,7 +314,8 @@ def attention(q1, k1, q2, k2, v, dist_threshold, causal=False, sm_scale=None):
         q2(torch.Tensor): The second queries. The shape is (batch_size, nheads, seqlen_q, headdim).
         k2(torch.Tensor): The second keys. The shape is (batch_size, nheads, seqlen_k, headdim).
         v(torch.Tensor): The values. The shape is (batch_size, nheads, seqlen_k, headdim).
-        dist_threshold(int): The threshold of distance between q and k. When the distance is not greater than w, the attention score is dot(q1, k1); otherwise dot(q2, k2).
+        dist_threshold(int): The threshold of distance between q and k. When the distance
+            is not greater than w, the attention score is dot(q1, k1); otherwise dot(q2, k2).
         causal(bool): Whether causal masking is applied to attention scores before applying softmax.
         sm_scale(float): The scaling of attention scores before applying softmax.
 
@@ -189,6 +323,7 @@ def attention(q1, k1, q2, k2, v, dist_threshold, causal=False, sm_scale=None):
         out: (torch.Tensor): The output. The shape is (batch_size, nheads, seqlen_q, headdim).
     """
     return PiecewiseAttention.apply(q1, k1, q2, k2, v, dist_threshold, causal, sm_scale)
+
 
 # --------------------------- Forward ---------------------------
 def get_fwd_config(B, H, M, N, D, causal):
@@ -220,23 +355,54 @@ def get_fwd_config(B, H, M, N, D, causal):
         BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 1, 4
     return BLOCK_M, BLOCK_N, num_stages, num_warps
 
+
 @triton.jit
 def _fwd_kernel(
-    Q1, K1, Q2, K2, V, sm_scale,
+    Q1,
+    K1,
+    Q2,
+    K2,
+    V,
+    sm_scale,
     L,
     O,
-    stride_q1z, stride_q1h, stride_q1m, stride_q1k,
-    stride_k1z, stride_k1h, stride_k1n, stride_k1k,
-    stride_q2z, stride_q2h, stride_q2m, stride_q2k,
-    stride_k2z, stride_k2h, stride_k2n, stride_k2k,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_oz, stride_oh, stride_om, stride_ok,
-    Z, H, M, N, P_SEQ,
+    stride_q1z,
+    stride_q1h,
+    stride_q1m,
+    stride_q1k,
+    stride_k1z,
+    stride_k1h,
+    stride_k1n,
+    stride_k1k,
+    stride_q2z,
+    stride_q2h,
+    stride_q2m,
+    stride_q2k,
+    stride_k2z,
+    stride_k2h,
+    stride_k2n,
+    stride_k2k,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    M,
+    N,
+    P_SEQ,
     w: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    IS_CAUSAL: tl.constexpr, LARGER_M: tl.constexpr,
-    DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    LARGER_M: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
 ):
     input_dtype = Q1.dtype.element_ty
     # -- grid id --
@@ -265,12 +431,24 @@ def _fwd_kernel(
     offs_k = tl.arange(0, BLOCK_DMODEL)
 
     # initialize pointers to v alue-like data
-    q1_ptrs = Q1 + (offs_m[:, None] * stride_q1m + offs_k[None, :] * stride_q1k) # (BLOCK_M, BLOCK_DMODEL)
-    q2_ptrs = Q2 + (offs_m[:, None] * stride_q2m + offs_k[None, :] * stride_q2k) # (BLOCK_M, BLOCK_DMODEL)
-    k1_ptrs = K1 + (offs_n_init[:, None] * stride_k1n + offs_k[None, :] * stride_k1k) # (BLOCK_N, BLOCK_DMODEL)
-    k2_ptrs = K2 + (offs_n_init[:, None] * stride_k2n + offs_k[None, :] * stride_k2k) # (BLOCK_N, BLOCK_DMODEL)
-    v_ptrs = V + (offs_n_init[:, None] * stride_vn + offs_k[None, :] * stride_vk) # (BLOCK_N, BLOCK_DMODEL)
-    o_ptrs = O + (offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok) # (BLOCK_M, BLOCK_DMODEL)
+    q1_ptrs = Q1 + (
+        offs_m[:, None] * stride_q1m + offs_k[None, :] * stride_q1k
+    )  # (BLOCK_M, BLOCK_DMODEL)
+    q2_ptrs = Q2 + (
+        offs_m[:, None] * stride_q2m + offs_k[None, :] * stride_q2k
+    )  # (BLOCK_M, BLOCK_DMODEL)
+    k1_ptrs = K1 + (
+        offs_n_init[:, None] * stride_k1n + offs_k[None, :] * stride_k1k
+    )  # (BLOCK_N, BLOCK_DMODEL)
+    k2_ptrs = K2 + (
+        offs_n_init[:, None] * stride_k2n + offs_k[None, :] * stride_k2k
+    )  # (BLOCK_N, BLOCK_DMODEL)
+    v_ptrs = V + (
+        offs_n_init[:, None] * stride_vn + offs_k[None, :] * stride_vk
+    )  # (BLOCK_N, BLOCK_DMODEL)
+    o_ptrs = O + (
+        offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok
+    )  # (BLOCK_M, BLOCK_DMODEL)
     l_ptrs = L + offs_m
 
     # initialize pointer to m and l, fp32 for accumulators
@@ -289,11 +467,13 @@ def _fwd_kernel(
 
     # Dot I trick: it converts q1, q2 into mma layout and saves shared memory
     # better way to generate a eye matrix. avoid casting from bool
-    I = tl.where(offs_k[:, None] == offs_k,
-                 tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 1.0, dtype=input_dtype),
-                 tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 0.0, dtype=input_dtype))
-    q1 = tl.dot(q1, I).to(input_dtype)
-    q2 = tl.dot(q2, I).to(input_dtype)
+    identity = tl.where(
+        offs_k[:, None] == offs_k,
+        tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 1.0, dtype=input_dtype),
+        tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 0.0, dtype=input_dtype),
+    )
+    q1 = tl.dot(q1, identity).to(input_dtype)
+    q2 = tl.dot(q2, identity).to(input_dtype)
 
     # loop over k, v and update accumulator
     # see note "Loop-Bound-For-N"
@@ -325,9 +505,9 @@ def _fwd_kernel(
         s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
         # TODO: more careful masking
-        s += tl.where(piecewise_mask,
-                       tl.dot(q2, tl.trans(k2)),
-                       tl.dot(q1, tl.trans(k1)))
+        s += tl.where(
+            piecewise_mask, tl.dot(q2, tl.trans(k2)), tl.dot(q1, tl.trans(k1))
+        )
         if not DIVISIBLE_N:
             s = tl.where(mask_n, s, float("-inf"))
         if IS_CAUSAL:
@@ -369,6 +549,7 @@ def _fwd_kernel(
         tl.store(l_ptrs, l_i, mask=mask_m)
         tl.store(o_ptrs, acc.to(input_dtype), mask=mask_m[:, None])
 
+
 # --------------------------- Backward ---------------------------
 def get_bwd_config(B, H, M, N, D, causal):
     # A100
@@ -404,15 +585,26 @@ def get_bwd_config(B, H, M, N, D, causal):
         BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 1, 4
     return BLOCK_M, BLOCK_N, num_stages, num_warps
 
+
 @triton.jit
 def _bwd_preprocess(
-    Out, DO,
+    Out,
+    DO,
     Delta,
-    stride_oz, stride_oh, stride_om, stride_ok,
-    stride_doz, stride_doh, stride_dom, stride_dok,
-    stride_dz, stride_dh, stride_dm,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    stride_doz,
+    stride_doh,
+    stride_dom,
+    stride_dok,
+    stride_dz,
+    stride_dh,
+    stride_dm,
     M,
-    BLOCK_M: tl.constexpr, D_HEAD: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    D_HEAD: tl.constexpr,
     DIVISIBLE_M: tl.constexpr,
 ):
     off_h = tl.program_id(1)
@@ -449,25 +641,66 @@ def _bwd_preprocess(
 
 @triton.jit
 def _bwd_kv_kernel(
-    Q1, K1, Q2, K2, V, sm_scale, DO,
-    DK1, DK2, DV,
+    Q1,
+    K1,
+    Q2,
+    K2,
+    V,
+    sm_scale,
+    DO,
+    DK1,
+    DK2,
+    DV,
     L,
     D,
-    stride_q1z, stride_q1h, stride_q1m, stride_q1k,
-    stride_k1z, stride_k1h, stride_k1n, stride_k1k,
-    stride_q2z, stride_q2h, stride_q2m, stride_q2k,
-    stride_k2z, stride_k2h, stride_k2n, stride_k2k,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_doz, stride_doh, stride_dom, stride_dok,
-    stride_dk1z, stride_dk1h, stride_dk1n, stride_dk1k,
-    stride_dk2z, stride_dk2h, stride_dk2n, stride_dk2k,
-    stride_dvz, stride_dvh, stride_dvn, stride_dvk,
-    Z, H, M, N, P_SEQ,
+    stride_q1z,
+    stride_q1h,
+    stride_q1m,
+    stride_q1k,
+    stride_k1z,
+    stride_k1h,
+    stride_k1n,
+    stride_k1k,
+    stride_q2z,
+    stride_q2h,
+    stride_q2m,
+    stride_q2k,
+    stride_k2z,
+    stride_k2h,
+    stride_k2n,
+    stride_k2k,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_doz,
+    stride_doh,
+    stride_dom,
+    stride_dok,
+    stride_dk1z,
+    stride_dk1h,
+    stride_dk1n,
+    stride_dk1k,
+    stride_dk2z,
+    stride_dk2h,
+    stride_dk2n,
+    stride_dk2k,
+    stride_dvz,
+    stride_dvh,
+    stride_dvn,
+    stride_dvk,
+    Z,
+    H,
+    M,
+    N,
+    P_SEQ,
     w: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
-    DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
 ):
     input_dtype = Q1.dtype.element_ty
     # -- grid id --
@@ -504,18 +737,35 @@ def _bwd_kv_kernel(
     offs_m_base = tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BLOCK_DMODEL)
 
-
     # initialize pointers to value-like data
-    q1_ptrs = Q1 + (offs_m_init[:, None] * stride_q1m + offs_k[None, :] * stride_q1k) # (BLOCK_M, BLOCK_DMODEL)
-    q2_ptrs = Q2 + (offs_m_init[:, None] * stride_q2m + offs_k[None, :] * stride_q2k) # (BLOCK_M, BLOCK_DMODEL)
-    k1_ptrs = K1 + (offs_k[:, None] * stride_k1k + offs_n[None, :] * stride_k1n) # (BLOCK_DMODEL, BLOCK_N)
-    k2_ptrs = K2 + (offs_k[:, None] * stride_k2k + offs_n[None, :] * stride_k2n) # (BLOCK_DMODEL, BLOCK_N)
-    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_k[None, :] * stride_vk) # (BLOCK_N, BLOCK_DMODEL)
-    do_ptrs = DO + (offs_m_init[:, None] * stride_dom + offs_k[None, :] * stride_dok) # (BLOCK_M, BLOCK_DMODEL)
+    q1_ptrs = Q1 + (
+        offs_m_init[:, None] * stride_q1m + offs_k[None, :] * stride_q1k
+    )  # (BLOCK_M, BLOCK_DMODEL)
+    q2_ptrs = Q2 + (
+        offs_m_init[:, None] * stride_q2m + offs_k[None, :] * stride_q2k
+    )  # (BLOCK_M, BLOCK_DMODEL)
+    k1_ptrs = K1 + (
+        offs_k[:, None] * stride_k1k + offs_n[None, :] * stride_k1n
+    )  # (BLOCK_DMODEL, BLOCK_N)
+    k2_ptrs = K2 + (
+        offs_k[:, None] * stride_k2k + offs_n[None, :] * stride_k2n
+    )  # (BLOCK_DMODEL, BLOCK_N)
+    v_ptrs = V + (
+        offs_n[:, None] * stride_vn + offs_k[None, :] * stride_vk
+    )  # (BLOCK_N, BLOCK_DMODEL)
+    do_ptrs = DO + (
+        offs_m_init[:, None] * stride_dom + offs_k[None, :] * stride_dok
+    )  # (BLOCK_M, BLOCK_DMODEL)
 
-    dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_k[None, :] * stride_dvk) # (BLOCK_N, BLOCK_DMODEL)
-    dk1_ptrs = DK1 + (offs_n[:, None] * stride_dk1n + offs_k[None, :] * stride_dk1k) # (BLOCK_N, BLOCK_DMODEL)
-    dk2_ptrs = DK2 + (offs_n[:, None] * stride_dk2n + offs_k[None, :] * stride_dk2k) # (BLOCK_N, BLOCK_DMODEL)
+    dv_ptrs = DV + (
+        offs_n[:, None] * stride_dvn + offs_k[None, :] * stride_dvk
+    )  # (BLOCK_N, BLOCK_DMODEL)
+    dk1_ptrs = DK1 + (
+        offs_n[:, None] * stride_dk1n + offs_k[None, :] * stride_dk1k
+    )  # (BLOCK_N, BLOCK_DMODEL)
+    dk2_ptrs = DK2 + (
+        offs_n[:, None] * stride_dk2n + offs_k[None, :] * stride_dk2k
+    )  # (BLOCK_N, BLOCK_DMODEL)
 
     # k and v stay in SRAM throughout
     if DIVISIBLE_N:
@@ -542,23 +792,23 @@ def _bwd_kv_kernel(
         if DIVISIBLE_M:
             q1 = tl.load(q1_ptrs)
             q2 = tl.load(q2_ptrs)
-            do = tl.load(do_ptrs) # (BLOCK_M, BLOCK_DMODEL)
+            do = tl.load(do_ptrs)  # (BLOCK_M, BLOCK_DMODEL)
             delta = tl.load(D + offs_m)
-            l = tl.load(L + offs_m)
+            log_sum = tl.load(L + offs_m)
         else:
             mask_m = offs_m < M
             q1 = tl.load(q1_ptrs, mask=mask_m[:, None])
             q2 = tl.load(q2_ptrs, mask=mask_m[:, None])
-            do = tl.load(do_ptrs, mask=mask_m[:, None]) # (BLOCK_M, BLOCK_DMODEL)
+            do = tl.load(do_ptrs, mask=mask_m[:, None])  # (BLOCK_M, BLOCK_DMODEL)
             delta = tl.load(D + offs_m, mask=mask_m)
-            l = tl.load(L + offs_m, mask=mask_m)
+            log_sum = tl.load(L + offs_m, mask=mask_m)
 
         # recompute p = softmax(qk, dim=-1).T
-        piecewise_mask = (P_SEQ + offs_m[:, None]) >= (offs_n[None, :] + w) # (BLOCK_M, BLOCK_N)
+        piecewise_mask = (P_SEQ + offs_m[:, None]) >= (
+            offs_n[None, :] + w
+        )  # (BLOCK_M, BLOCK_N)
         s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        s += tl.where(piecewise_mask,
-                       tl.dot(q2, k2),
-                       tl.dot(q1, k1))
+        s += tl.where(piecewise_mask, tl.dot(q2, k2), tl.dot(q1, k1))
 
         # NOTE: since softmax in backward is pointwise, the normalizer has been saved in fwd)
         # So masking on s is not needed.
@@ -569,18 +819,19 @@ def _bwd_kv_kernel(
 
         # -- recompute p ---
         # l = tl.load(L + offs_m, mask=mask_m)
-        p = tl.math.exp2(s * qk_scale - l[:, None] * log2e) # (BLOCK_M, BLOCK_N)
+        p = tl.math.exp2(s * qk_scale - log_sum[:, None] * log2e)  # (BLOCK_M, BLOCK_N)
         if not DIVISIBLE_M:
-            valid_mask = mask_m[:, None] # & mask_n
+            valid_mask = mask_m[:, None]  # & mask_n
             p = tl.where(valid_mask, p, 0.0)
         if CAUSAL:
-            causal_mask = (P_SEQ + offs_m[:, None]) >= (offs_n[None, :]) # (BLOCK_M, BLOCK_N)
+            causal_mask = (P_SEQ + offs_m[:, None]) >= (
+                offs_n[None, :]
+            )  # (BLOCK_M, BLOCK_N)
             p = tl.where(causal_mask, p, 0.0)
-
 
         # compute dv = dot(p, do)
         # do = tl.load(do_ptrs, mask=mask_m[:, None]) # (BLOCK_M, BLOCK_DMODEL)
-        dv += tl.dot(tl.trans(p.to(do.dtype)), do) # (BLOCK_N, BLOCK_DMODEL)
+        dv += tl.dot(tl.trans(p.to(do.dtype)), do)  # (BLOCK_N, BLOCK_DMODEL)
 
         # compute dp = dot(v, do)
         # delta = tl.load(D + offs_m, mask=mask_m)
@@ -594,7 +845,7 @@ def _bwd_kv_kernel(
 
         # compute ds = p * (dp - delta[:, None])
         # move scale out to dk at last
-        ds = p * (dp - delta[:, None]) # (BLOCK_M, BLOCK_N)
+        ds = p * (dp - delta[:, None])  # (BLOCK_M, BLOCK_N)
 
         # mask ds To ensure no small values
         if not DIVISIBLE_M:
@@ -618,35 +869,79 @@ def _bwd_kv_kernel(
     dk2 *= sm_scale
 
     if DIVISIBLE_N:
-        tl.store(dk1_ptrs, dk1.to(input_dtype)) # (BLOCK_N, BLOCK_DMODEL)
-        tl.store(dk2_ptrs, dk2.to(input_dtype)) # (BLOCK_N, BLOCK_DMODEL)
-        tl.store(dv_ptrs, dv.to(input_dtype)) # (BLOCK_N, BLOCK_DMODEL)
+        tl.store(dk1_ptrs, dk1.to(input_dtype))  # (BLOCK_N, BLOCK_DMODEL)
+        tl.store(dk2_ptrs, dk2.to(input_dtype))  # (BLOCK_N, BLOCK_DMODEL)
+        tl.store(dv_ptrs, dv.to(input_dtype))  # (BLOCK_N, BLOCK_DMODEL)
     else:
-        tl.store(dk1_ptrs, dk1.to(input_dtype), mask=mask_n[:, None]) # (BLOCK_N, BLOCK_DMODEL)
-        tl.store(dk2_ptrs, dk2.to(input_dtype), mask=mask_n[:, None]) # (BLOCK_N, BLOCK_DMODEL)
-        tl.store(dv_ptrs, dv.to(input_dtype), mask=mask_n[:, None]) # (BLOCK_N, BLOCK_DMODEL)
+        tl.store(
+            dk1_ptrs, dk1.to(input_dtype), mask=mask_n[:, None]
+        )  # (BLOCK_N, BLOCK_DMODEL)
+        tl.store(
+            dk2_ptrs, dk2.to(input_dtype), mask=mask_n[:, None]
+        )  # (BLOCK_N, BLOCK_DMODEL)
+        tl.store(
+            dv_ptrs, dv.to(input_dtype), mask=mask_n[:, None]
+        )  # (BLOCK_N, BLOCK_DMODEL)
 
 
 @triton.jit
 def _bwd_q_kernel(
-    Q1, K1, Q2, K2, V, sm_scale, DO,
-    DQ1, DQ2,
+    Q1,
+    K1,
+    Q2,
+    K2,
+    V,
+    sm_scale,
+    DO,
+    DQ1,
+    DQ2,
     L,
     D,
-    stride_q1z, stride_q1h, stride_q1m, stride_q1k,
-    stride_k1z, stride_k1h, stride_k1n, stride_k1k,
-    stride_q2z, stride_q2h, stride_q2m, stride_q2k,
-    stride_k2z, stride_k2h, stride_k2n, stride_k2k,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_doz, stride_doh, stride_dom, stride_dok,
-    stride_dq1z, stride_dq1h, stride_dq1m, stride_dq1k,
-    stride_dq2z, stride_dq2h, stride_dq2m, stride_dq2k,
-    Z, H, M, N, P_SEQ,
+    stride_q1z,
+    stride_q1h,
+    stride_q1m,
+    stride_q1k,
+    stride_k1z,
+    stride_k1h,
+    stride_k1n,
+    stride_k1k,
+    stride_q2z,
+    stride_q2h,
+    stride_q2m,
+    stride_q2k,
+    stride_k2z,
+    stride_k2h,
+    stride_k2n,
+    stride_k2k,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_doz,
+    stride_doh,
+    stride_dom,
+    stride_dok,
+    stride_dq1z,
+    stride_dq1h,
+    stride_dq1m,
+    stride_dq1k,
+    stride_dq2z,
+    stride_dq2h,
+    stride_dq2m,
+    stride_dq2k,
+    Z,
+    H,
+    M,
+    N,
+    P_SEQ,
     w: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr, LARGER_M: tl.constexpr,
-    DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    LARGER_M: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
 ):
     input_dtype = Q1.dtype.element_ty
     # -- grid id --
@@ -680,15 +975,31 @@ def _bwd_q_kernel(
     offs_k = tl.arange(0, BLOCK_DMODEL)
 
     # initialize pointers to value-like data
-    q1_ptrs = Q1 + (offs_m[:, None] * stride_q1m + offs_k[None, :] * stride_q1k) # (BLOCK_M, BLOCK_DMODEL)
-    q2_ptrs = Q2 + (offs_m[:, None] * stride_q2m + offs_k[None, :] * stride_q2k) # (BLOCK_M, BLOCK_DMODEL)
-    k1_ptrs = K1 + (offs_n_init[:, None] * stride_k1n + offs_k[None, :] * stride_k1k) # (BLOCK_N, BLOCK_DMODEL)
-    k2_ptrs = K2 + (offs_n_init[:, None] * stride_k2n + offs_k[None, :] * stride_k2k) # (BLOCK_N, BLOCK_DMODEL)
-    v_ptrs = V + (offs_n_init[:, None] * stride_vn + offs_k[None, :] * stride_vk) # (BLOCK_N, BLOCK_DMODEL)
+    q1_ptrs = Q1 + (
+        offs_m[:, None] * stride_q1m + offs_k[None, :] * stride_q1k
+    )  # (BLOCK_M, BLOCK_DMODEL)
+    q2_ptrs = Q2 + (
+        offs_m[:, None] * stride_q2m + offs_k[None, :] * stride_q2k
+    )  # (BLOCK_M, BLOCK_DMODEL)
+    k1_ptrs = K1 + (
+        offs_n_init[:, None] * stride_k1n + offs_k[None, :] * stride_k1k
+    )  # (BLOCK_N, BLOCK_DMODEL)
+    k2_ptrs = K2 + (
+        offs_n_init[:, None] * stride_k2n + offs_k[None, :] * stride_k2k
+    )  # (BLOCK_N, BLOCK_DMODEL)
+    v_ptrs = V + (
+        offs_n_init[:, None] * stride_vn + offs_k[None, :] * stride_vk
+    )  # (BLOCK_N, BLOCK_DMODEL)
 
-    dq1_ptrs = DQ1 + (offs_m[:, None] * stride_dq1m + offs_k[None, :] * stride_dq1k) # (BLOCK_M, BLOCK_DMODEL)
-    dq2_ptrs = DQ2 + (offs_m[:, None] * stride_dq2m + offs_k[None, :] * stride_dq2k) # (BLOCK_M, BLOCK_DMODEL)
-    do_ptrs = DO + (offs_m[:, None] * stride_dom + offs_k[None, :] * stride_dok) # (BLOCK_M, BLOCK_DMODEL)
+    dq1_ptrs = DQ1 + (
+        offs_m[:, None] * stride_dq1m + offs_k[None, :] * stride_dq1k
+    )  # (BLOCK_M, BLOCK_DMODEL)
+    dq2_ptrs = DQ2 + (
+        offs_m[:, None] * stride_dq2m + offs_k[None, :] * stride_dq2k
+    )  # (BLOCK_M, BLOCK_DMODEL)
+    do_ptrs = DO + (
+        offs_m[:, None] * stride_dom + offs_k[None, :] * stride_dok
+    )  # (BLOCK_M, BLOCK_DMODEL)
 
     # pointer to row-wise quantities in value-like data
     d_ptrs = D + offs_m
@@ -700,14 +1011,14 @@ def _bwd_q_kernel(
         q2 = tl.load(q2_ptrs)
         do = tl.load(do_ptrs)
         delta = tl.load(d_ptrs)
-        l = tl.load(l_ptrs)
+        log_sum = tl.load(l_ptrs)
     else:
         mask_m = offs_m < M
         q1 = tl.load(q1_ptrs, mask=mask_m[:, None])
         q2 = tl.load(q2_ptrs, mask=mask_m[:, None])
         do = tl.load(do_ptrs, mask=mask_m[:, None])
         delta = tl.load(d_ptrs, mask=mask_m)
-        l = tl.load(l_ptrs, mask=mask_m)
+        log_sum = tl.load(l_ptrs, mask=mask_m)
 
     # initialize dq
     dq1 = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
@@ -738,18 +1049,20 @@ def _bwd_q_kernel(
             k2 = tl.load(k2_ptrs, mask=mask_n[:, None])
 
         # recompute p = softmax(qk * sm_scale, dim=-1)
-        piecewise_mask = (P_SEQ + offs_m[:, None]) >= (offs_n[None, :] + w) # (BLOCK_M, BLOCK_N)
+        piecewise_mask = (P_SEQ + offs_m[:, None]) >= (
+            offs_n[None, :] + w
+        )  # (BLOCK_M, BLOCK_N)
         s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        s += tl.where(piecewise_mask,
-                       tl.dot(q2, tl.trans(k2)),
-                       tl.dot(q1, tl.trans(k1)))
+        s += tl.where(
+            piecewise_mask, tl.dot(q2, tl.trans(k2)), tl.dot(q1, tl.trans(k1))
+        )
         # NOTE: since softmax in backward is pointwise, the normalizer has been saved in fwd)
         # So masking on s is not needed.
         # if CAUSAL:
         #     s = tl.where(causal_mask & valid_mask, s, float("-inf"))
         # else:
         #     s = tl.where(valid_mask, s, float("-inf"))
-        p = tl.math.exp2(s * qk_scale - l[:, None] * log2e) # (BLOCK_M, BLOCK_N)
+        p = tl.math.exp2(s * qk_scale - log_sum[:, None] * log2e)  # (BLOCK_M, BLOCK_N)
 
         # compute dp = dot(v, do)
         dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -762,13 +1075,15 @@ def _bwd_q_kernel(
 
         # compute ds = p * (dp - delta[:, None])
         # move scale out to dq at last
-        ds = p * (dp - delta[:, None]) # (BLOCK_M, BLOCK_N)
+        ds = p * (dp - delta[:, None])  # (BLOCK_M, BLOCK_N)
 
         # mask ds to ensure no small values
         if not DIVISIBLE_N:
             ds = tl.where(mask_n, ds, 0.0)
         if CAUSAL:
-            causal_mask = (P_SEQ + offs_m[:, None]) >= (offs_n[None, :]) # (BLOCK_M, BLOCK_N)
+            causal_mask = (P_SEQ + offs_m[:, None]) >= (
+                offs_n[None, :]
+            )  # (BLOCK_M, BLOCK_N)
             ds = tl.where(causal_mask, ds, 0.0)
 
         ds2 = tl.where(piecewise_mask, ds, 0.0).to(input_dtype)

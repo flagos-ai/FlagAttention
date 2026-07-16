@@ -1,4 +1,5 @@
 import torch
+
 import flag_attn
 
 B, H, M, N, D = 2, 16, 4000, 4000, 128

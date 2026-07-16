@@ -1,12 +1,15 @@
 import math
+
 import torch
 import triton
 import triton.language as tl
 
+
 def get_fwd_config(B, H, M, N, D, causal):
     return (32, 32, 1, 4)
 
-def total_attention(q, k, l, causal=False, sm_scale=None):
+
+def total_attention(q, k, log_sum, causal=False, sm_scale=None):
     Dq, Dk = q.shape[-1], k.shape[-1]
     assert Dq == Dk
     assert Dk in {16, 32, 64, 128}
@@ -21,7 +24,7 @@ def total_attention(q, k, l, causal=False, sm_scale=None):
     P_SEQ = N - M
 
     if sm_scale is None:
-        sm_scale = 1. / math.sqrt(D)
+        sm_scale = 1.0 / math.sqrt(D)
 
     # to work around https://github.com/openai/triton/issues/2441
     device = torch.cuda.device_of(q)
@@ -35,27 +38,64 @@ def total_attention(q, k, l, causal=False, sm_scale=None):
         grid = (triton.cdiv(N, BLOCK_N), H, B)
         tot_attn = torch.empty((B, H, N), dtype=torch.float32, device=q.device)
         _total_attention_kernel[grid](
-            q, k, l, tot_attn, sm_scale,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            B, H, M, N, P_SEQ, num_groups,
-            BLOCK_M=BLOCK_M, BLOCK_DMODEL=D, BLOCK_N=BLOCK_N,
+            q,
+            k,
+            log_sum,
+            tot_attn,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            B,
+            H,
+            M,
+            N,
+            P_SEQ,
+            num_groups,
+            BLOCK_M=BLOCK_M,
+            BLOCK_DMODEL=D,
+            BLOCK_N=BLOCK_N,
             CAUSAL=causal,
-            DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
-            num_stages=num_stages, num_warps=num_warps,
+            DIVISIBLE_M=divisible_m,
+            DIVISIBLE_N=divisible_n,
+            num_stages=num_stages,
+            num_warps=num_warps,
         )
     return tot_attn
 
 
 @triton.jit
 def _total_attention_kernel(
-    Q, K, L, TA, sm_scale,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    Z, H, M, N, P_SEQ, num_groups,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
+    Q,
+    K,
+    L,
+    TA,
+    sm_scale,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    Z,
+    H,
+    M,
+    N,
+    P_SEQ,
+    num_groups,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
-    DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
 ):
     # -- grid id --
     start_n = tl.program_id(0)
@@ -69,7 +109,7 @@ def _total_attention_kernel(
     Q += off_z * stride_qz + off_h * stride_qh
     K += off_z * stride_kz + off_hk * stride_kh
     L += (off_z * H + off_h) * M
-    TA += (off_z * H + off_h) * N # (b, h, n)
+    TA += (off_z * H + off_h) * N  # (b, h, n)
 
     if CAUSAL:
         lo = tl.maximum(start_n * BLOCK_N - P_SEQ, 0)
@@ -83,9 +123,13 @@ def _total_attention_kernel(
     offs_k = tl.arange(0, BLOCK_DMODEL)
 
     # initialize pointers to value-like data
-    q_ptrs = Q + (offs_m_init[:, None] * stride_qm + offs_k[None, :] * stride_qk) # (BLOCK_M, BLOCK_DMODEL)
-    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk) # (BLOCK_N, BLOCK_DMODEL)
-    ta_ptrs = TA + offs_n # (BLOCK_N, )
+    q_ptrs = Q + (
+        offs_m_init[:, None] * stride_qm + offs_k[None, :] * stride_qk
+    )  # (BLOCK_M, BLOCK_DMODEL)
+    k_ptrs = K + (
+        offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk
+    )  # (BLOCK_N, BLOCK_DMODEL)
+    ta_ptrs = TA + offs_n  # (BLOCK_N, )
 
     # k and v stay in SRAM throughout
     if DIVISIBLE_N:
@@ -101,13 +145,15 @@ def _total_attention_kernel(
     for start_m in range(lo, M, BLOCK_M):
         start_m = tl.multiple_of(start_m, BLOCK_M)
         offs_m = start_m + offs_m_base
-        causal_mask = (P_SEQ + offs_m[:, None]) >= (offs_n[None, :]) # (BLOCK_M, BLOCK_N)
+        causal_mask = (P_SEQ + offs_m[:, None]) >= (
+            offs_n[None, :]
+        )  # (BLOCK_M, BLOCK_N)
 
         if DIVISIBLE_M:
             q = tl.load(q_ptrs)
         else:
             mask_m = offs_m < M
-            valid_mask = mask_m[:, None] # & mask_n
+            valid_mask = mask_m[:, None]  # & mask_n
             q = tl.load(q_ptrs, mask=mask_m[:, None])
         # recompute p = softmax(qk * sm_scale, dim=-1)
         s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -121,10 +167,10 @@ def _total_attention_kernel(
 
         # -- recompute p ---
         if DIVISIBLE_M:
-            l = tl.load(L + offs_m)
+            log_sum = tl.load(L + offs_m)
         else:
-            l = tl.load(L + offs_m, mask=mask_m)
-        p = tl.math.exp2(s * qk_scale - l[:, None] * log2e) # (BLOCK_M, BLOCK_N)
+            log_sum = tl.load(L + offs_m, mask=mask_m)
+        p = tl.math.exp2(s * qk_scale - log_sum[:, None] * log2e)  # (BLOCK_M, BLOCK_N)
 
         if not DIVISIBLE_M:
             p = tl.where(valid_mask, p, 0.0)
@@ -135,8 +181,7 @@ def _total_attention_kernel(
         # increment pointers
         q_ptrs += BLOCK_M * stride_qm
 
-
     if DIVISIBLE_N:
-        tl.store(ta_ptrs, tot_attn) # (BLOCK_N,)
+        tl.store(ta_ptrs, tot_attn)  # (BLOCK_N,)
     else:
-        tl.store(ta_ptrs, tot_attn, mask=mask_n) # (BLOCK_N, )
+        tl.store(ta_ptrs, tot_attn, mask=mask_n)  # (BLOCK_N, )

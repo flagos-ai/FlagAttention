@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def recompute_mask_kernel(mask, B, H, M, N, dropout_p, seed, offset):
     row, b, h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -14,6 +15,7 @@ def recompute_mask_kernel(mask, B, H, M, N, dropout_p, seed, offset):
         pmask = tl.rand(seed, rng_offs, n_rounds=6) > dropout_p
         row_mask = start_n + tl.arange(0, BLOCK) < N
         tl.store(mask + offs, pmask, mask=row_mask)
+
 
 def recompute_mask(B, H, M, N, dropout_p, seed, offset, device):
     mask = torch.full((B, H, M, N), True, dtype=torch.bool, device=device)

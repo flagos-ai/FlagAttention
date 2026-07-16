@@ -40,4 +40,3 @@ override_dh_auto_test:
 	echo "Found build dir: $$found_dir"; \
 	PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$$found_dir" python3 -c \
 	    "import importlib.util; s = importlib.util.find_spec('flag_attn'); assert s and s.origin, 'flag_attn not findable'; print('OK: flag_attn at', s.origin)"
-
