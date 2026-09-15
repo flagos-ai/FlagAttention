@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from benchmark.base import Benchmark
-from flag_attn.runtime.backend._enflame.kda import chunk_kda
+from flag_attn.runtime.backend._enflame.FLA.kda import chunk_kda
 
 DEVICE = "gcu"
 LOWER_BOUND = -5.0

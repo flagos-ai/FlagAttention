@@ -29,8 +29,9 @@ try:
     import vllm
 
     print("vllm.__version__", vllm.__version__)
-except BaseException:
+except Exception as exc:
     HAS_VLLM = False
+    VLLM_IMPORT_ERROR = str(exc)
 
 
 def vllm_paged_attention(
@@ -123,7 +124,7 @@ def vllm_paged_attention(
         for query_group_size in [1, 8]
         for head_size in [64, 128]
         for block_size in [16, 32]
-        for version in [1, 2]
+        for version in ([1, 2] if HAS_VLLM else [1])
         for dtype in [torch.float16]
     ]
 )
@@ -199,5 +200,6 @@ def paged_attention_benchmark_with_vllm(
     return total_flops / ms * 1e-9
 
 
-if HAS_VLLM:
-    paged_attention_benchmark_with_vllm.run(print_data=True)
+if not HAS_VLLM:
+    print(f"[baseline] vLLM 0.3 paged attention unavailable: {VLLM_IMPORT_ERROR}")
+paged_attention_benchmark_with_vllm.run(print_data=True)

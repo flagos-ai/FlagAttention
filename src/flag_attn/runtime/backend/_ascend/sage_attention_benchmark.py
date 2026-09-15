@@ -17,8 +17,6 @@ import argparse
 import torch
 import triton
 
-from flag_attn.runtime.backend._ascend import forward
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark SageAttention QK INT8 / PV FP16 forward")
@@ -35,8 +33,14 @@ def parse_args():
 
 def benchmark(args):
     if hasattr(torch, "npu") and torch.npu.is_available():
+        from flag_attn.runtime.backend._ascend import forward
+
         device = "npu"
     elif torch.cuda.is_available():
+        # The Ascend kernel statically unrolls the KV loop for its NPU backend.
+        # Use the CUDA implementation when running this benchmark on CUDA.
+        from flag_attn.sage_attention import forward
+
         device = "cuda"
     else:
         raise RuntimeError("SageAttention benchmark requires a CUDA or NPU device")

@@ -19,9 +19,8 @@ import torch
 import torch.nn.functional as F
 
 pytest.importorskip("triton.experimental.tle.language", reason="chunk_kda requires Triton TLE >= 3.6")
-pytest.importorskip("flaggems_vllm", reason="chunk_kda currently uses FlagGems index helpers")
 
-from fla.chunk_kda import chunk_kda_fwd_infer
+from flag_attn import chunk_kda
 
 LOWER_BOUND = -5.0
 ASSERT_RATIO = 0.005
@@ -239,7 +238,7 @@ def test_chunk_kda_matches_recurrent_reference(
         noncontiguous=noncontiguous,
     )
 
-    actual, actual_final = chunk_kda_fwd_infer(*args, **kwargs)
+    actual, actual_final = chunk_kda(*args, **kwargs)
     expected, expected_final = _reference(
         *args,
         scale=kwargs["scale"],

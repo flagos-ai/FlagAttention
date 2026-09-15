@@ -566,6 +566,12 @@ def parse_junit(path: Path, exit_code: int) -> dict[str, Any]:
             message = outcome_element.attrib.get("message") or (
                 outcome_element.text or ""
             ).strip()
+            if outcome == "skipped":
+                # Collection skips use the generic message "collection skipped";
+                # the unavailable module or device is described in the body.
+                reason = (outcome_element.text or "").strip()
+                if reason and reason not in message:
+                    message = f"{message}\n{reason}"
             details.setdefault(outcome, []).append(
                 {"test": nodeid, "reason": message[:4000]}
             )
@@ -577,7 +583,11 @@ def parse_junit(path: Path, exit_code: int) -> dict[str, Any]:
         status = "Error"
     elif counts["failed"] or exit_code == 1:
         status = "Failed"
-    elif exit_code == 5 or total == 0:
+    elif exit_code == 5:
+        # A module-level importorskip collects no runnable tests (exit 5),
+        # but pytest still records why the module was skipped in JUnit.
+        status = "Skipped" if total and counts["skipped"] == total else "NotFound"
+    elif total == 0:
         status = "NotFound"
     elif exit_code != 0:
         status = "Error"
@@ -1082,9 +1092,9 @@ def build_parser() -> argparse.ArgumentParser:
 def has_failures(results: dict[str, Any]) -> bool:
     bad_statuses = {"Failed", "Error", "Timeout"}
     return any(
-        record.get(phase, {}).get("status") in bad_statuses
+        record.get("accuracy", {}).get("status") in bad_statuses | {"NotFound"}
+        or record.get("performance", {}).get("status") in bad_statuses
         for record in results.values()
-        for phase in ("accuracy", "performance")
     )
 
 

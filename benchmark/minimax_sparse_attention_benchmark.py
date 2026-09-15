@@ -804,3 +804,7 @@ def test_msa_benchmark(request) -> None:
         rep=int(request.config.getoption("--iter", default=DEFAULT_REP)),
     )
     run_benchmark(args)
+
+
+if __name__ == "__main__":
+    run_benchmark(MSABenchmarkArgs())

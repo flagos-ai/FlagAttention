@@ -7,6 +7,7 @@ import torch
 
 from flag_attn import chunk_gdn2
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
+from flag_attn.gdn2.native.output import chunk_gla_fwd_kernel_o
 
 ASSERT_RATIO = 0.01
 
@@ -207,3 +208,70 @@ def test_k1_tle_resource_controls_are_enabled():
     source = Path(module.__file__).read_text(encoding="utf-8")
     assert "tle.gpu.alloc" in source
     assert "tle.gpu.local_ptr" in source
+
+
+@pytest.fixture(scope="module", params=[torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def output_composition_case(request):
+    """An independent FP32 oracle for inter-chunk and intra-chunk output."""
+    torch.manual_seed(42)
+    dtype = request.param
+    B, T, H, K, V, BT = 1, 4096, 16, 64, 64, 64
+    NT = T // BT
+    q = torch.randn(B, T, H, K, device="cuda", dtype=dtype) / math.sqrt(K)
+    g = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 3
+    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
+    h = torch.randn(B, NT, H, K, V, device="cuda", dtype=dtype) * 0.01
+    scores = torch.randn(B, NT, H, BT, BT, device="cuda", dtype=dtype).tril() * 0.02
+    A = scores.permute(0, 1, 3, 2, 4).contiguous().view(B, T, H, BT)
+    scale = K**-0.5
+
+    qg = (q.float() * g.exp2()).to(dtype)
+    qg = qg.view(B, NT, BT, H, K).permute(0, 1, 3, 2, 4)
+    values = v.view(B, NT, BT, H, V).permute(0, 1, 3, 2, 4)
+    expected = qg.float() @ h.float() * scale + scores.float() @ values.float()
+    expected = expected.permute(0, 1, 3, 2, 4).contiguous().view(B, T, H, V)
+    return q, v, g, h, A, scale, expected
+
+
+@pytest.mark.parametrize(
+    "config",
+    chunk_gla_fwd_kernel_o.fn.configs,
+    ids=lambda config: (
+        f"bk{config.kwargs['BK']}-bv{config.kwargs['BV']}-"
+        f"warps{config.num_warps}-stages{config.num_stages}"
+    ),
+)
+@torch.inference_mode()
+def test_gdn2_output_config_matches_reference(output_composition_case, config):
+    q, v, g, h, A, scale, expected = output_composition_case
+    B, T, H, K = q.shape
+    V, BT = v.shape[-1], A.shape[-1]
+    actual = torch.empty_like(v)
+    # Launch each production candidate directly so a fast, faulty configuration
+    # cannot evade coverage by losing an autotune timing comparison.
+    kernel = chunk_gla_fwd_kernel_o.fn.fn
+    for _ in range(3):
+        kernel[((V + config.kwargs["BV"] - 1) // config.kwargs["BV"], T // BT, B * H)](
+            q,
+            v,
+            g,
+            h,
+            actual,
+            A,
+            None,
+            None,
+            scale,
+            T,
+            H=H,
+            HV=H,
+            K=K,
+            V=V,
+            BT=BT,
+            STATE_V_FIRST=False,
+            IS_VARLEN=False,
+            **config.kwargs,
+            num_warps=config.num_warps,
+            num_stages=config.num_stages,
+        )
+        _assert_close("output composition", actual, expected)

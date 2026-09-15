@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.gated_delta_rule.index import prepare_chunk_indices
+from flag_attn.FLA.index import prepare_chunk_indices
 
 from ..triton_ops_helper import exp2
 
@@ -80,7 +80,9 @@ def chunk_gla_fwd_kernel_o(
     A += (bos * HV + i_hv) * BT
 
     output = tl.zeros([BT, BV], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
+    # Multi-stage pipelining of this reduction produces NaNs on Hopper with
+    # upstream Triton 3.7 (for example BK=32, 4 warps and 3 stages).
+    for i_k in tl.range(tl.cdiv(K, BK), num_stages=1):
         p_q = tl.make_block_ptr(
             q, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
         )
@@ -96,10 +98,10 @@ def chunk_gla_fwd_kernel_o(
                 h, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0)
             )
 
-        q_block = tl.load(p_q, boundary_check=(0, 1))
-        g_block = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+        q_block = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
+        g_block = tl.load(p_g, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
         qg = (q_block * exp2(g_block)).to(q_block.dtype)
-        state = tl.load(p_h, boundary_check=(0, 1))
+        state = tl.load(p_h, boundary_check=(0, 1), padding_option="zero")
         if STATE_V_FIRST:
             output += tl.dot(qg, tl.trans(state).to(qg.dtype))
         else:
@@ -115,8 +117,8 @@ def chunk_gla_fwd_kernel_o(
     p_A = tl.make_block_ptr(
         A, (T, BT), (HV * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
     )
-    values = tl.load(p_v, boundary_check=(0, 1))
-    scores = tl.load(p_A, boundary_check=(0, 1))
+    values = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
+    scores = tl.load(p_A, boundary_check=(0, 1), padding_option="zero")
     scores = tl.where(causal_mask, scores, 0.0).to(values.dtype)
     output += tl.dot(scores, values)
     tl.store(p_o, output.to(p_o.dtype.element_ty), boundary_check=(0, 1))

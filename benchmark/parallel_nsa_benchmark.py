@@ -20,10 +20,10 @@ from typing import Callable
 import torch
 import torch_gcu
 
-from flag_attn.runtime.backend._enflame.nsa import (
+from flag_attn.runtime.backend._enflame.FLA.nsa import (
     parallel_nsa,
 )
-from flag_attn.runtime.backend._enflame.nsa.parallel_nsa_compression import (
+from flag_attn.runtime.backend._enflame.FLA.nsa.parallel_nsa_compression import (
     parallel_nsa_compression,
 )
 

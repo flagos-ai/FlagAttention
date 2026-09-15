@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from fla.chunk_kda import chunk_kda_fwd_infer
+from flag_attn.FLA.chunk_kda import chunk_kda_fwd_infer
 
 try:
     import flash_kda
