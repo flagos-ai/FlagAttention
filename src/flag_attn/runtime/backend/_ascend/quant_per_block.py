@@ -1,4 +1,4 @@
-# Copyright 2026 FlagOS Contributors
+# Copyright 2024 SageAttention Team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import torch
 import triton
 import triton.language as tl
-from flag_attn.runtime.backend._ascend.quant_per_block import per_block_int8
+
 
 @triton.jit
 def quant_per_block_int8_kernel(Input, Output, Scale, L,
