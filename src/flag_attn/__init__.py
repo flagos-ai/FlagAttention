@@ -46,7 +46,7 @@ from flag_attn import testing # noqa: F401
 
 _FLA_EXPORTS = {
     "chunk_gdn2": (
-        "flag_attn.runtime.backend._enflame.FLA.gdn2",
+        "flag_attn.runtime.backend._nvidia.gdn2",
         "chunk_gdn2",
     ),
     "chunk_kda": (
@@ -70,6 +70,12 @@ def __getattr__(name: str):
         module_name, attribute_name = _FLA_EXPORTS[name]
     except KeyError as exc:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    if name == "chunk_gdn2":
+        from flag_attn.runtime.backend import get_backend_name
+
+        backend = get_backend_name()
+        if backend != "nvidia":
+            module_name = f"flag_attn.runtime.backend._{backend}.FLA.gdn2"
     value = getattr(importlib.import_module(module_name), attribute_name)
     globals()[name] = value
     return value

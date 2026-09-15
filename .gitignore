@@ -1,3 +1,6 @@
+# Server-local baselines and speedup measurements
+/BaselineBenchmark/
+
 # results of benchmark
 benchmark/results*/
 playground/
@@ -133,5 +136,3 @@ venv.bak/
 .dmypy.json
 dmypy.json
 
-# Server-local native baselines and speedup experiments.
-/BaselineBenchmark/
