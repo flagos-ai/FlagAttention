@@ -1,0 +1,87 @@
+# Curated NVIDIA configs for the GLA kernels.
+# Cover common K/V tile sizes and model dimensions without the original
+# Cartesian search over every warp/stage combination.
+
+chunk_fwd_kernel_h:
+  - META: {BK: 32, BV: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 32, BV: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 64, BV: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 64, BV: 64}
+    num_warps: 4
+    num_stages: 3
+chunk_bwd_kernel_dh:
+  - META: {BK: 32, BV: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 32, BV: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 64, BV: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 64, BV: 64}
+    num_warps: 4
+    num_stages: 3
+
+chunk_gla_fwd_A_kernel_intra_sub_inter:
+  - META: {BK: 32}
+    num_warps: 1
+    num_stages: 2
+  - META: {BK: 32}
+    num_warps: 1
+    num_stages: 3
+  - META: {BK: 64}
+    num_warps: 1
+    num_stages: 2
+  - META: {BK: 64}
+    num_warps: 1
+    num_stages: 3
+chunk_gla_fwd_kernel_o:
+  - META: {BK: 32, BV: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 64, BV: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 32, BV: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 64, BV: 128}
+    num_warps: 4
+    num_stages: 3
+chunk_gla_fwd_kernel_o_tle:
+  - META: {BK: 32, BV: 64, B_VCHUNK: 1}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 64, BV: 64, B_VCHUNK: 1}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 32, BV: 128, B_VCHUNK: 1}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 64, BV: 128, B_VCHUNK: 1}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 32, BV: 64, B_VCHUNK: 2}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 32, BV: 64, B_VCHUNK: 4}
+    num_warps: 4
+    num_stages: 3
+
+# Backward state candidates are intentionally conservative and verified with
+# STATE_V_FIRST, including the D=128 path.
+chunk_gla_bwd_kernel_dv:
+  - META: {BK: 64, BV: 64}
+    num_warps: 4
+    num_stages: 3
+chunk_gla_bwd_kernel_inter:
+  - META: {BK: 64, BV: 64}
+    num_warps: 4
+    num_stages: 3

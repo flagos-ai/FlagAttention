@@ -1,0 +1,102 @@
+# Curated Enflame S60 Triton configurations.
+# FLAG_ATTN_FAST_AUTOTUNE=1 selects the first entry for each kernel.
+
+chunk_local_cumsum_vector_kernel:
+  - META: {BS: 32}
+    num_warps: 2
+
+chunk_gdn2_fwd_kernel_intra_token_parallel:
+  - META: {BH: 8}
+    num_warps: 1
+
+chunk_gdn2_fwd_kernel_inter_solve_fused:
+  - META: {BK: 64}
+    num_warps: 1
+
+recompute_w_u_fwd_gdn2_kernel:
+  - META: {}
+    num_warps: 2
+    num_stages: 2
+
+chunk_gated_delta_rule_fwd_kernel_h_blockdim64:
+  - META: {BV: 64}
+    num_warps: 2
+    num_stages: 3
+
+# GLA forward score construction. These candidates retain coverage for
+# narrow and wide key dimensions while avoiding the full Cartesian search.
+chunk_gla_fwd_A_kernel_intra_sub_inter:
+  - META: {BK: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 32}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 16}
+    num_warps: 1
+    num_stages: 1
+
+chunk_gla_fwd_A_kernel_intra_sub_intra:
+  - META: {}
+    num_warps: 1
+    num_stages: 2
+  - META: {}
+    num_warps: 1
+    num_stages: 1
+  # Retain one wider execution configuration for unseen BC/BK combinations,
+  # especially the FP16 BC=16 path.
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+
+chunk_gla_fwd_A_kernel_intra_sub_intra_split:
+  - META: {}
+    num_warps: 1
+    num_stages: 3
+  - META: {}
+    num_warps: 2
+    num_stages: 3
+
+chunk_gla_fwd_A_kernel_intra_sub_intra_merge:
+  - META: {}
+    num_warps: 1
+    num_stages: 3
+  - META: {}
+    num_warps: 2
+    num_stages: 3
+
+# Non-TLE output path.
+chunk_gla_fwd_kernel_o:
+  - META: {BK: 64, BV: 64}
+    num_warps: 2
+    num_stages: 1
+  - META: {BK: 32, BV: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 64, BV: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BK: 32, BV: 128}
+    num_warps: 2
+    num_stages: 2
+
+# TLE output path. Full S60 tuning selected the 128 tile for K/V <= 128 and
+# the 256 tile for K/V >= 256. Keep those measured winners first, then retain
+# a small tile and two asymmetric tiles for unseen K/V combinations. All S60
+# winners used one value chunk, one warp, and two stages.
+chunk_gla_fwd_kernel_o_tle:
+  - META: {BK: 128, BV: 128, B_VCHUNK: 1}
+    num_warps: 1
+    num_stages: 2
+  - META: {BK: 256, BV: 256, B_VCHUNK: 1}
+    num_warps: 1
+    num_stages: 2
+  - META: {BK: 64, BV: 64, B_VCHUNK: 1}
+    num_warps: 1
+    num_stages: 2
+  - META: {BK: 128, BV: 256, B_VCHUNK: 1}
+    num_warps: 1
+    num_stages: 2
+  - META: {BK: 256, BV: 128, B_VCHUNK: 1}
+    num_warps: 1
+    num_stages: 2
