@@ -15,6 +15,7 @@
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "chunk_gdn2": (".gdn2", "chunk_gdn2"),
     "sage_attention_forward": (".sage_attention", "forward"),
 }
 
