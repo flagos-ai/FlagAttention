@@ -18,6 +18,12 @@ import pytest
 import torch
 
 from flag_attn.sage_attention import forward, per_block_int8
+from flag_attn.runtime.backend import get_backend_name
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_backend_name() != "nvidia",
+    reason="NVIDIA CUDA is required",
+)
 
 
 def _expand_scale(scale, block_size, length):
@@ -64,9 +70,12 @@ def _reference(q, k, v, q_scale, k_scale, tensor_layout, attn_mask=None):
 
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
-def test_forward_matches_dequantized_reference(tensor_layout, num_kv_heads):
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("tuned", [False, True])
+def test_forward_matches_dequantized_reference(tensor_layout, num_kv_heads, head_dim, output_dtype, tuned):
     torch.manual_seed(2026)
-    batch_size, num_query_heads, seq_len, head_dim = 1, 2, 128, 64
+    batch_size, num_query_heads, seq_len = 1, 2, 128
     q = torch.randn(batch_size, num_query_heads, seq_len, head_dim, device="cuda", dtype=torch.float16)
     k = torch.randn(batch_size, num_kv_heads, seq_len, head_dim, device="cuda", dtype=torch.float16)
     v = torch.randn(batch_size, num_kv_heads, seq_len, head_dim, device="cuda", dtype=torch.float16)
@@ -85,6 +94,8 @@ def test_forward_matches_dequantized_reference(tensor_layout, num_kv_heads):
         k_scale,
         tensor_layout=tensor_layout,
         return_lse=True,
+        output_dtype=output_dtype,
+        maxnreg=(168 if head_dim == 64 else 128) if tuned else None,
     )
     expected, expected_lse = _reference(
         q_int8,

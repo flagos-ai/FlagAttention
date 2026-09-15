@@ -6,8 +6,8 @@ import torch
 import triton
 
 from flag_attn import chunk_gated_delta_rule
-from flag_attn.gated_delta_rule import chunk_gated_delta_rule_fwd
-from flag_attn.gated_delta_rule.compat import has_triton_tle
+from flag_attn.FLA.gated_delta_rule import chunk_gated_delta_rule_fwd
+from flag_attn.utils import has_triton_tle
 
 ASSERT_RATIO = 0.01
 RECOMPUTE_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_RECOMPUTE_TLE"

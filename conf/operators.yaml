@@ -1,0 +1,223 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+ops:
+  - id: chunk_gated_delta_rule_fwd
+    description: Run the forward path for chunked gated delta rule attention.
+    for:
+      - chunk_gated_delta_rule_fwd
+    labels:
+      - fused
+      - FLA
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_recompute_tle_matches_native
+      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_full_tle_matches_native
+      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_public_api_matches_native
+      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_two_kernel_matches_native
+      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_hybrid_matches_two_kernel
+      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_hybrid_matches_fla
+      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_public_api_uses_two_kernel
+  - id: chunk_gla
+    description: Run fixed-length, state-v-first, and variable-length chunked gated linear attention.
+    for:
+      - chunk_gla
+    labels:
+      - fused
+      - FLA
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_chunk_gla.py::test_chunk
+      - tests/flag_attn/test_chunk_gla.py::test_chunk_state_v_first
+      - tests/flag_attn/test_chunk_gla.py::test_chunk_varlen
+    benchmark: benchmark/chunk_gla_benchmark.py
+  - id: flash_attention
+    description: Run FlashAttention forward, including its auxiliary-output path.
+    for:
+      - flash_attention
+    labels:
+      - fused
+      - Attention
+      - FlashAttention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - stable: '0.2'
+    tests:
+      - tests/flag_attn/test_flash_attention.py::test_attention_fwd
+      - tests/flag_attn/test_flash_attention.py::test_attention_with_aux_outs
+    benchmark: benchmark/flash_benchmark.py
+  - id: flash_attention_backward
+    description: Run the backward path for FlashAttention.
+    for:
+      - flash_attention
+    labels:
+      - fused
+      - Attention
+      - FlashAttention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - stable: '0.2'
+    tests:
+      - tests/flag_attn/test_flash_attention.py::test_attention_bwd
+  - id: flash_attention_dropout
+    description: Run FlashAttention dropout forward, backward, and mask recomputation paths.
+    for:
+      - flash_attention
+    labels:
+      - fused
+      - Attention
+      - FlashAttention
+      - dropout
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - stable: '0.2'
+    tests:
+      - tests/flag_attn/test_flash_attention.py::test_attention_fwd_dropout
+      - tests/flag_attn/test_flash_attention.py::test_attention_bwd_dropout
+      - tests/flag_attn/test_dropout.py::test_recompute_mask
+  - id: flash_attention_split_kv
+    description: Run split-KV FlashAttention for long KV sequences and grouped-query layouts.
+    for:
+      - flash_attention_split_kv
+    labels:
+      - fused
+      - Attention
+      - FlashAttention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_flash_attention.py::test_attention_splitkv
+    benchmark: benchmark/flash_decoding_benchmark.py
+  - id: minimax_m3_index_topk
+    description: Select MiniMax M3 prefill sparse-attention top-k blocks.
+    for:
+      - minimax_m3_index_topk
+    labels:
+      - fused
+      - Attention
+      - MiniMax
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_topk_streaming_partial_tile_excludes_padding
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_topk_radix_path
+  - id: minimax_m3_sparse_attn
+    description: Run the MiniMax M3 sparse-attention prefill path.
+    for:
+      - minimax_m3_index_score
+      - minimax_m3_index_topk
+      - minimax_m3_sparse_attn
+    labels:
+      - fused
+      - Attention
+      - MiniMax
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_bf16
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_fp8
+    benchmark: benchmark/minimax_sparse_attention_benchmark.py
+  - id: minimax_m3_sparse_attn_decode
+    description: Run the MiniMax M3 sparse-attention decode and decode top-k paths.
+    for:
+      - minimax_m3_index_decode
+      - minimax_m3_index_decode_score
+      - minimax_m3_sparse_attn_decode
+    labels:
+      - fused
+      - Attention
+      - MiniMax
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_bf16
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_selection_bf16
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_k16_bf16
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_identity_out_and_score_out_bf16
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_fp8
+  - id: paged_attention
+    description: Run paged KV-cache attention with automatic, explicit, and targeted split selection.
+    for:
+      - paged_attention
+    labels:
+      - fused
+      - Attention
+      - vLLM
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_paged_attention.py::test_paged_attention_default
+      - tests/flag_attn/test_paged_attention.py::test_paged_attention_by_num_splits
+      - tests/flag_attn/test_paged_attention.py::test_paged_attention_by_case
+    benchmark: benchmark/paged_benchmark.py
+    benchmark_requires:
+      - vllm
+  - id: piecewise_attention
+    description: Run the forward path for piecewise attention.
+    for:
+      - piecewise_attention
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - stable: '0.2'
+    tests:
+      - tests/flag_attn/test_piecewise_attention.py::test_attention_fwd
+    benchmark: benchmark/piecewise_benchmark.py
+  - id: piecewise_attention_backward
+    description: Run the backward path for piecewise attention.
+    for:
+      - piecewise_attention
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - stable: '0.2'
+    tests:
+      - tests/flag_attn/test_piecewise_attention.py::test_attention_bwd

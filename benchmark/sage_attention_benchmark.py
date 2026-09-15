@@ -61,10 +61,10 @@ def benchmark(args):
                 q_scale,
                 k_scale,
                 output_dtype=dtype,
-                maxnreg=args.maxnreg,
+                maxnreg=args.maxnreg if args.maxnreg is not None else (168 if args.head_dim == 64 else 128),
             )
 
-        latency_ms = triton.testing.do_bench(run, warmup=args.warmup, rep=args.rep)
+        latency_ms = triton.testing.do_bench(run, warmup=args.warmup, rep=args.rep, return_mode="median")
         flops = 4 * args.batch_size * args.num_heads * seq_len * seq_len * args.head_dim
         tflops = flops / latency_ms * 1e-9
         print(f"{seq_len}\t{latency_ms:.4f}\t{tflops:.2f}")
