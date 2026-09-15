@@ -296,6 +296,51 @@ def test_chunk_gated_delta_rule_fwd_two_kernel_matches_native(dtype, shape):
     _assert_close("final_state", actual[3], baseline[3])
 
 
+def _two_kernel_configs():
+    if not _cuda_tle_available():
+        return [None]
+    from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import (
+        _chunk_gdn_two_kernel_fwd_kernel,
+    )
+
+    return [
+        pytest.param(
+            config,
+            id=f"BV{config.kwargs['BV']}-warps{config.num_warps}-stages{config.num_stages}",
+        )
+        for config in _chunk_gdn_two_kernel_fwd_kernel.configs
+    ]
+
+
+@pytest.mark.skipif(
+    not _cuda_tle_available(), reason="GDN autotune configurations require CUDA/TLE"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("config", _two_kernel_configs())
+@torch.inference_mode()
+def test_chunk_gated_delta_rule_two_kernel_configs(dtype, config):
+    from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import (
+        _chunk_gdn_two_kernel_fwd_kernel,
+    )
+
+    torch.manual_seed(42)
+    args = _make_inputs(4, 2048, 16, 128, 128, dtype, use_initial_state=False)
+    baseline = _call_fwd(args, full_tle=False, recompute_tle=False)
+    q, k, v, _, beta, scale, _, _, _ = args
+    output = torch.empty_like(v)
+    final_state = torch.empty_like(baseline[3])
+    # Exercise every candidate: autotuning measures speed without validating
+    # the recurrent state, so checking only the winner can hide bad configs.
+    _chunk_gdn_two_kernel_fwd_kernel.fn[(triton.cdiv(128, config.kwargs["BV"]), 64)](
+        q=q, k=k, v=v, beta=beta, A=baseline[2], g=baseline[0],
+        o=output, final_state=final_state, scale=scale,
+        T=2048, H=16, Hg=16, K=128, V=128, BT=64,
+        **config.all_kwargs(),
+    )
+    _assert_close("o", output, baseline[1])
+    _assert_close("final_state", final_state, baseline[3])
+
+
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN hybrid tests require CUDA/TLE"
 )

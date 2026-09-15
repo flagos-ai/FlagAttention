@@ -70,7 +70,8 @@ if HAS_TWO_KERNEL_TLE:
     @libentry()
     @libtuner(
         configs=[
-            triton.Config({"BV": 64}, num_warps=4, num_stages=1),
+            # The single-stage asynchronous-load configuration corrupts the
+            # recurrent state from the second chunk on Hopper (K=128).
             triton.Config({"BV": 64}, num_warps=4, num_stages=3),
             triton.Config({"BV": 32}, num_warps=2, num_stages=2),
         ],

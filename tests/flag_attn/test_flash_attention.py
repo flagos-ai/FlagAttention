@@ -31,6 +31,47 @@ def report(name, actual, expected):
     print(f"{name}: \tmax_difference: {max_diff(actual, expected):0.6f}\tzero_diff elements: {zero_percent(actual, expected):0.3f}%")
 
 
+@pytest.mark.parametrize("seed", [17, 35, 36, 68, 77])
+@pytest.mark.parametrize("operator", ["flash_attention", "flash_attention_split_kv"])
+def test_splitkv_large_logits(seed, operator):
+    # These inputs expose early rounding of split outputs and cancellation in
+    # the softmax/combine steps. Keep the same accuracy bound as the main suite.
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn((1, 2, 4, 16), generator=generator, device="cuda", dtype=torch.float16) * 10
+    k = torch.randn((1, 1, 8202, 16), generator=generator, device="cuda", dtype=torch.float16) * 10
+    v = torch.randn(k.shape, generator=generator, device="cuda", dtype=torch.float16) * 10
+    expected = flag_attn.testing.flash_attention(q, k, v, False, upcast=True)
+    baseline = flag_attn.testing.flash_attention(q, k, v, False, upcast=False)
+    actual = getattr(flag_attn, operator)(q, k, v)
+    assert actual.dtype == q.dtype
+    assert max_diff(actual, expected) <= 2 * max_diff(baseline, expected) + 1e-5
+
+
+def test_splitkv_single_split_preserves_dtype():
+    generator = torch.Generator(device="cuda").manual_seed(2026)
+    q, k, v = [
+        torch.randn((1, 1, 16, 16), generator=generator, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    actual = flag_attn.flash_attention_split_kv(q, k, v)
+    expected = flag_attn.testing.flash_attention(q, k, v, False, upcast=True)
+    assert actual.dtype == q.dtype
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("operator", ["flash_attention", "flash_attention_split_kv"])
+def test_splitkv_independent_kv_strides(operator):
+    generator = torch.Generator(device="cuda").manual_seed(2026)
+    q = torch.randn((2, 4, 1, 32), generator=generator, device="cuda", dtype=torch.float16)
+    k = torch.randn((2, 2, 257, 32), generator=generator, device="cuda", dtype=torch.float16)
+    v = torch.randn((2, 257, 2, 32), generator=generator, device="cuda", dtype=torch.float16).transpose(1, 2)
+    assert k.stride() != v.stride()
+    actual = getattr(flag_attn, operator)(q, k, v)
+    expected = flag_attn.testing.flash_attention(q, k, v, False, upcast=True)
+    baseline = flag_attn.testing.flash_attention(q, k, v, False, upcast=False)
+    assert max_diff(actual, expected) <= 2 * max_diff(baseline, expected) + 1e-5
+
+
 @pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
 @pytest.mark.parametrize('scale', [1.0, 2.0, 3.0, 4.0])
 @pytest.mark.parametrize('B, Hq, Hk, M, N, D', [
@@ -75,7 +116,7 @@ def test_attention_fwd(B, Hq, Hk, M, N, D, causal, stride_order, dtype, scale, d
     torch_max_diff = max_diff(o_torch, o_ref)
     triton_max_diff = max_diff(o_hyp, o_ref)
     report("o hyp", o_hyp, o_ref)
-    report("o torch", o_hyp, o_ref)
+    report("o torch", o_torch, o_ref)
     assert triton_max_diff <= 2 * torch_max_diff + 1e-5
 
 
@@ -123,7 +164,7 @@ def test_attention_splitkv(B, Hq, Hk, M, N, D, causal, stride_order, dtype, scal
     torch_max_diff = max_diff(o_torch, o_ref)
     triton_max_diff = max_diff(o_hyp, o_ref)
     report("o hyp", o_hyp, o_ref)
-    report("o torch", o_hyp, o_ref)
+    report("o torch", o_torch, o_ref)
     assert triton_max_diff <= 2 * torch_max_diff + 1e-5
 
 @pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
@@ -189,6 +230,20 @@ def test_attention_bwd(B, Hq, Hk, M, N, D, causal, stride_order, dtype, scale, d
     assert gq_triton_max_diff < 2 * gq_torch_max_diff + 1e-5
     assert gk_triton_max_diff < 2 * gk_torch_max_diff + 1e-5
     assert gv_triton_max_diff < 2 * gv_torch_max_diff + 1e-5
+
+
+@pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
+@pytest.mark.parametrize('seed', [55, 94])
+def test_attention_bwd_dropout_bfloat16_precision(device_id, seed):
+    # These seeds expose dQ error from rounding scaled output gradients and O.
+    # Reuse the full gradient checks and their existing accuracy bounds.
+    with torch.random.fork_rng(devices=[device_id]):
+        torch.manual_seed(seed)
+        test_attention_bwd_dropout(
+            B=2, H=4, M=4096, N=4096, D=16, causal=True, dropout_p=0.8,
+            stride_order='BTHD', dtype=torch.bfloat16, scale=1.0,
+            device_id=device_id,
+        )
 
 
 @pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))

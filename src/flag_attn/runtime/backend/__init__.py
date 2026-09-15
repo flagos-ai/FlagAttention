@@ -12,19 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+from .device_finder import DeviceDetector, detect_vendor
 
 
 def get_backend_name() -> str:
-    override = os.environ.get("FLAG_ATTN_BACKEND")
-    if override:
-        return override.removeprefix("_")
-    try:
-        import torch
-        if torch.version.hip is not None:
-            return "amd"
-        if torch.version.cuda is not None:
-            return "nvidia"
-    except ImportError:
-        pass
-    return "nvidia"
+    """Return the selected vendor, including CUDA-compatible vendor runtimes."""
+    return detect_vendor()
+
+
+def is_metax_backend() -> bool:
+    return get_backend_name() == "metax"
+
+
+__all__ = ["DeviceDetector", "get_backend_name", "is_metax_backend"]

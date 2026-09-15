@@ -12,10 +12,10 @@ import triton
 
 torch_gcu = pytest.importorskip("torch_gcu")
 
-from flag_attn.runtime.backend._enflame.nsa.index import (
+from flag_attn.runtime.backend._enflame.FLA.index import (
     prepare_token_indices_enflame as prepare_token_indices,
 )
-from flag_attn.runtime.backend._enflame.nsa import parallel_nsa
+from flag_attn.runtime.backend._enflame.FLA.nsa import parallel_nsa
 
 def _device():
     index = int(

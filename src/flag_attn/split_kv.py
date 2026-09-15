@@ -116,8 +116,8 @@ def _fwd_split_kv_kernel(
 
     # loop over k, v and update accumulators
     offs_n_init = N_LEFT + offs_n_base
-    k_ptrs = K + (offs_k[:, None] * stride_vk + offs_n_init[None, :] * stride_vn) # (BLOCK_DMODEL, BLOCK_N)
-    v_ptrs = V + (offs_n_init[:, None] * stride_kn + offs_k[None, :] * stride_kk) # (BLOCK_N, BLOCK_DMODEL)
+    k_ptrs = K + (offs_k[:, None] * stride_kk + offs_n_init[None, :] * stride_kn) # (BLOCK_DMODEL, BLOCK_N)
+    v_ptrs = V + (offs_n_init[:, None] * stride_vn + offs_k[None, :] * stride_vk) # (BLOCK_N, BLOCK_DMODEL)
     for start_n in range(N_LEFT, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n = start_n + offs_n_base
@@ -144,7 +144,8 @@ def _fwd_split_kv_kernel(
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(s, 1))
         alpha = tl.math.exp2((m_i - m_i_new) * qk_scale)
-        p = tl.math.exp2(s * qk_scale - m_i_new[:, None] * qk_scale)
+        # Subtract before scaling to avoid cancellation for large logits.
+        p = tl.math.exp2((s - m_i_new[:, None]) * qk_scale)
 
         # -- scale and update acc: acc *= alpha[:, None]--
         acc *= alpha[:, None]
@@ -168,10 +169,10 @@ def _fwd_split_kv_kernel(
 
     if DIVISIBLE_M:
         tl.store(l_ptrs, l, cache_modifier=".cg")
-        tl.store(o_ptrs, acc.to(input_dtype), cache_modifier=".cg")
+        tl.store(o_ptrs, acc, cache_modifier=".cg")
     else:
         tl.store(l_ptrs, l, mask=mask_m, cache_modifier=".cg")
-        tl.store(o_ptrs, acc.to(input_dtype), mask=mask_m[:, None], cache_modifier=".cg")
+        tl.store(o_ptrs, acc, mask=mask_m[:, None], cache_modifier=".cg")
 
 @triton.jit
 def _fwd_combine_kv_splits(
@@ -217,7 +218,8 @@ def _fwd_combine_kv_splits(
     o_ptrs = multiple_o + offs_m[:, None] * stride_mul_om + offs_k[None, :] * stride_mul_ok
     for _ in range(0, S):
         l = tl.load(l_ptrs, mask=offs_m < M)
-        rescale = tl.exp(l - l_acc)
+        # Normalize relative to the maximum without rounding m + log(acc).
+        rescale = tl.exp(l - m) / acc
         if DIVISIBLE_M:
             o = tl.load(o_ptrs, )
         else:
@@ -308,7 +310,8 @@ def attention(q, k, v, causal=False, sm_scale=None):
 
         # consider using 3d grid to avoid div & rem
         multiple_l = torch.empty((B, H, S, M), dtype=torch.float32, device="cuda")
-        multiple_o = torch.empty((B, H, S, M, D), dtype=torch.float16, device="cuda")
+        partial_dtype = torch.float32 if S > 1 else q.dtype
+        multiple_o = torch.empty((B, H, S, M, D), dtype=partial_dtype, device=q.device)
         grid = (triton.cdiv(M, BLOCK_M), S, H * B)
         N_SPLIT_SIZE = triton.cdiv(triton.cdiv(N, BLOCK_N), S) * BLOCK_N
         _fwd_split_kv_kernel[grid](

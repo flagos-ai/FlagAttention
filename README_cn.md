@@ -121,6 +121,21 @@ pip install dist/flag_attn-xxx.whl
 
 FlagAttention 提供了自定义的 attention 算子。当一个算子的功能和 torch 函数等价的时候，就可以用它替换对应的 torch 函数。
 
+设备信息接口与 FlagGems、FlagGems-vllm 保持一致：
+
+```python
+import flag_attn
+
+print(flag_attn.vendor_name)  # NVIDIA GPU 上为 "nvidia"
+print(flag_attn.vendor)       # vendor_name 的别名
+print(flag_attn.device)       # NVIDIA GPU 上为 "cuda"，可直接传给 torch 的 device 参数
+```
+
+`flag_attn.runtime.device` 保存对应的 `name` 和 `vendor_name` 字段。
+默认根据可用的 PyTorch 设备和编译器后端识别厂商；也可在导入前设置
+`FLAG_ATTN_BACKEND` 或 `FLAG_ATTN_VENDOR` 指定厂商，前者优先。
+仅有 CPU 时设备信息返回 `"cpu"`，attention 内核仍需要支持的加速设备。
+
 ## 运行测试
 
 需要较新版本的 `pytest`(>=7.1.0) 以运行 `tests/` 中的测试。FlagAttention 中的运算符以 `flag_attn.testing` 中的 PyTorch [参考实现](src/flag_attn/testing) 为参考进行测试，包括前向和反向。对于支持 `float16` 和 `bfloat16` 数据类型的算子，测试中包含了三种实现用于对比。
@@ -134,6 +149,15 @@ FlagAttention 提供了自定义的 attention 算子。当一个算子的功能�
 ```sh
 pytest .
 ```
+
+按算子运行所有开发阶段的测试，并保存日志及 JUnit/JSON 结果：
+
+```sh
+python tools/run_tests.py --stages all --skip-benchmarks --dump-output
+```
+
+厂商专用测试会在其他设备上注明跳过原因；TLE 测试需要支持 TLE 的 Triton 环境。
+设置 `FLAG_ATTN_RUN_EXTERNAL_BENCHMARKS=1` 可同时运行 pytest 中可选的 GDN 性能用例。
 
 ## 运行性能测试
 

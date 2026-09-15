@@ -83,7 +83,11 @@ class FlashAttention(torch.autograd.Function):
                 divisible_n = N % BLOCK_N == 0
                 # consider using 3d grid to avoid div & rem
                 grid = (triton.cdiv(M, BLOCK_M), H, B)
-                o = torch.empty_like(q)
+                # Backward's softmax row sum is dot(O, dO). Retain the FP32
+                # accumulator for BF16 dropout gradients before returning O.
+                output_dtype = (torch.float32 if is_dropout and q.dtype == torch.bfloat16
+                                and any(ctx.needs_input_grad[:3]) else q.dtype)
+                o = torch.empty_like(q, dtype=output_dtype)
                 L = torch.empty((B, H, M), device=q.device, dtype=torch.float32)
                 _fwd_kernel[grid](
                     q, k, v, sm_scale,
@@ -107,7 +111,8 @@ class FlashAttention(torch.autograd.Function):
                 divisible_n = N % BLOCK_N == 0
                 # consider using 3d grid to avoid div & rem
                 multiple_l = torch.empty((B, H, S, M), dtype=torch.float32, device="cuda")
-                multiple_o = torch.empty((B, H, S, M, D), dtype=torch.float16, device="cuda")
+                # Keep partial results in FP32 until all splits are combined.
+                multiple_o = torch.empty((B, H, S, M, D), dtype=torch.float32, device=q.device)
                 grid = (triton.cdiv(M, BLOCK_M), S, H * B)
                 N_SPLIT_SIZE = triton.cdiv(triton.cdiv(N, BLOCK_N), S) * BLOCK_N
                 _fwd_split_kv_kernel[grid](
@@ -160,6 +165,7 @@ class FlashAttention(torch.autograd.Function):
         ctx.dropout_p = dropout_p
         ctx.seed = seed
         ctx.offset = offset
+        o = o.to(q.dtype)
 
         has_extra_return = True in (return_log_normalizer, return_total_attention, return_seed_offset)
         if has_extra_return:
@@ -497,10 +503,10 @@ def _fwd_kernel(
 
     if DIVISIBLE_M:
         tl.store(l_ptrs, l, cache_modifier=".cg")
-        tl.store(o_ptrs, acc.to(input_dtype), cache_modifier=".cg")
+        tl.store(o_ptrs, acc.to(O.dtype.element_ty), cache_modifier=".cg")
     else:
         tl.store(l_ptrs, l, mask=mask_m, cache_modifier=".cg")
-        tl.store(o_ptrs, acc.to(input_dtype), mask=mask_m[:, None], cache_modifier=".cg")
+        tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=mask_m[:, None], cache_modifier=".cg")
 
 
 # --------------------------- Backward ---------------------------
@@ -852,7 +858,6 @@ def _bwd_q_kernel(
         offs_rng_base += tl.arange(0, BLOCK_M)[:, None] * N
         offs_rng_base += tl.arange(0, BLOCK_N)[None, :]
         rp = 1. / (1. - dropout_p)
-        do *= rp.to(do.dtype)
 
     # loop over a row
     for start_n in range(0, hi, BLOCK_N):
@@ -891,6 +896,9 @@ def _bwd_q_kernel(
         if IS_DROPOUT:
             offs_rng = start_n + offs_rng_base
             pmask = tl.rand(seed, offs_rng, n_rounds=6) > dropout_p
+            # Scale the FP32 dot result, as in the KV backward kernel. Scaling
+            # DO first rounds it to the input dtype and corrupts dQ for BF16.
+            dp *= rp
             dp *= pmask
             # p_dropout = p * pmask.to(tl.float32)
 

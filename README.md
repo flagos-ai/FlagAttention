@@ -106,6 +106,22 @@ pip install dist/flag_attn-xxx.whl
 
 FlagAttention provides customized operators for attention. When an operator is equivalent to a torch function, it can be used as a drop-in replacement.
 
+Device metadata follows the FlagGems and FlagGems-vllm API:
+
+```python
+import flag_attn
+
+print(flag_attn.vendor_name)  # "nvidia" on NVIDIA GPUs
+print(flag_attn.vendor)       # Alias for vendor_name
+print(flag_attn.device)       # "cuda" on NVIDIA GPUs; usable as torch's device argument
+```
+
+`flag_attn.runtime.device` holds the corresponding `name` and `vendor_name` fields.
+Detection uses the available PyTorch device and compiler backend. Set
+`FLAG_ATTN_BACKEND` (or `FLAG_ATTN_VENDOR`) before importing to select a vendor
+explicitly; `FLAG_ATTN_BACKEND` takes precedence. CPU-only hosts report `"cpu"`;
+attention kernels still require a supported accelerator.
+
 ## Run the Tests
 
 A recent version of `pytest`(>=7.1.0) is required to run the tests in `tests/`. Operators in `FlagAttention` are tested against [reference implementations](src/flag_attn/testing) in Pytorch provided by `flag_attn.testing`, both for the forward and backward operators. For operators with support for inputs of `float16` or `bfloat16`, three different implementations are included for numerical accuracy testing.
@@ -119,6 +135,16 @@ The tests for numerical accuracy enforce that the maximum difference between the
 ```sh
 pytest .
 ```
+
+To save per-operator logs and JUnit/JSON results across all development stages:
+
+```sh
+python tools/run_tests.py --stages all --skip-benchmarks --dump-output
+```
+
+Hardware-specific tests report their skip reasons on other devices. TLE tests
+require a Triton runtime with TLE support. Set `FLAG_ATTN_RUN_EXTERNAL_BENCHMARKS=1`
+to also run the optional GDN performance cases in the pytest suite.
 
 ## Run the Benchmark
 
