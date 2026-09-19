@@ -19,6 +19,7 @@ FlagAttention now offers several operators.
 2. **piecewise_attention**: An extension used for NLPE(Non-Linearized position embedding) in both training and inference of the [Aquila-2-34B](https://github.com/FlagAI-Open/Aquila2) model.
 3. **flash_attention_split_kv**: A split-KV flash decoding operator for long KV sequences and grouped-query layouts.
 4. **paged_attention**: A paged KV-cache attention operator for inference.
+5. **chunk_log_linear_attn**: A forward-only TLE implementation of dense Log-Linear Attention with parallel local, tree-merge, and inter-chunk stages.
 
 When further customization is required, FlagAttention serves as an example.
 
@@ -133,6 +134,32 @@ python piecewise_benchmark.py
 ```
 
 ## Operators
+
+### chunk_log_linear_attn
+
+`chunk_log_linear_attn` implements dense Log-Linear Attention as a TLE pipeline:
+chunk-local masked attention and state construction, parallel binary-tree state
+merges, inter-chunk state reads, and an optional reduction across key tiles.
+The current forward-only path targets NVIDIA H100 with BF16 inputs, one shared
+Q/K head, power-of-two sequence lengths divisible by 64, and K/V dimensions in
+`{64, 128, 256}`. It requires a Triton build with `triton.experimental.tle`.
+
+```python
+from flag_attn import chunk_log_linear_attn
+
+output = chunk_log_linear_attn(q, k, v, g, level_scales)
+```
+
+The production implementation is under
+[`src/flag_attn/FLA/log_linear_attn/`](src/flag_attn/FLA/log_linear_attn/).
+The optional TileLang baseline and pytest benchmark use preallocated workspaces,
+seven alternating rounds, and
+`triton.testing.do_bench(warmup=1000, rep=100, return_mode="median")`:
+
+```sh
+FLAG_ATTN_RUN_EXTERNAL_BENCHMARKS=1 pytest \
+  tests/flag_attn/test_log_linear_attn.py -k tilelang_benchmark -q -s
+```
 
 ### flash_attention
 

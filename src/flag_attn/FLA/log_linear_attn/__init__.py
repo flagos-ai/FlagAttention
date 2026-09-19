@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flag_attn.testing.flash import attention as flash_attention # noqa: F401
-from flag_attn.testing.piecewise import attention as piecewise_attention # noqa: F401
-from flag_attn.testing.paged import attention as paged_attention # noqa: F401
-from flag_attn.testing.dropout import recompute_mask # noqa: F401
-from flag_attn.testing.log_linear_attn import log_linear_attn_reference # noqa: F401
+"""TLE Log-Linear Attention operator."""
+
+from flag_attn.FLA.log_linear_attn.chunk_tle import chunk_log_linear_attn
+
+__all__ = ["chunk_log_linear_attn"]

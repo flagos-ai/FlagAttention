@@ -49,6 +49,10 @@ if is_metax_backend():
 from flag_attn import testing # noqa: F401
 
 _FLA_EXPORTS = {
+    "chunk_log_linear_attn": (
+        "flag_attn.FLA.log_linear_attn",
+        "chunk_log_linear_attn",
+    ),
     "chunk_gated_delta_rule": (
         "flag_attn.FLA.gated_delta_rule",
         "chunk_gated_delta_rule",
@@ -76,6 +80,7 @@ __all__ = [
     "flash_attention",
     "flash_attention_split_kv",
     "paged_attention",
+    "chunk_log_linear_attn",
     "chunk_gated_delta_rule",
     "chunk_gla",
     "minimax_m3_index_decode",
