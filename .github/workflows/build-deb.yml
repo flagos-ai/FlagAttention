@@ -20,10 +20,11 @@ on:
       - 'v*'
   pull_request:
     branches: [main]
+    # Only what changes the package. A .deb or .rpm built on a source
+    # PR is published nowhere and downloaded by no one; release tags
+    # above still build, and a build can be requested by hand.
     paths:
       - 'packaging/debian/**'
-      - 'src/**'
-      - 'pyproject.toml'
       - '.github/workflows/build-deb.yml'
   workflow_dispatch:
 
