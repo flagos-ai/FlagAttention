@@ -136,6 +136,17 @@ The tests for numerical accuracy enforce that the maximum difference between the
 pytest .
 ```
 
+Use the FlagGems-compatible JSON recorder to save each selected case's
+parameters, outcome, operator markers, and failure or skip reason:
+
+```sh
+pytest -m "sage_attention" --record json --output accuracy_sage_attention.json -vs
+```
+
+If `--output` is omitted, the report is written to `accuracy_result.json`.
+Existing reports are merged by pytest node ID, with results from the current
+run replacing entries for the same cases.
+
 To save per-operator logs and JUnit/JSON results across all development stages:
 
 ```sh

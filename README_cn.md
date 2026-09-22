@@ -150,6 +150,16 @@ print(flag_attn.device)       # NVIDIA GPU 上为 "cuda"，可直接传给 torch
 pytest .
 ```
 
+可以使用与 FlagGems 兼容的 JSON 记录功能，保存每个选中用例的参数、
+执行结果、算子 marker，以及失败或跳过原因：
+
+```sh
+pytest -m "sage_attention" --record json --output accuracy_sage_attention.json -vs
+```
+
+省略 `--output` 时，结果默认写入 `accuracy_result.json`。已有报告按照
+pytest node ID 合并，相同用例的旧结果会被本次结果替换。
+
 按算子运行所有开发阶段的测试，并保存日志及 JUnit/JSON 结果：
 
 ```sh
