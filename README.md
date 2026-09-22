@@ -163,6 +163,16 @@ Benchmarks are included to quantify the achieved `TFLOP/s`, which serves as a me
 
 The benchmarking process involves comparing the Triton implementations with counterparts in Pytorch. When the input size is large, resulting in memory exhaustion in the Pytorch implementation, the FLOP/s is considered zero.
 
+Pytest-driven benchmarks can write FlagGems-compatible structured results,
+including baseline latency, FlagAttention latency, and speedup:
+
+```sh
+cd benchmark/
+pytest -m "sage_attention" --record json --output benchmark_sage_attention.json -vs
+```
+
+Without `--output`, benchmark runs use `benchmark_result.json`.
+
 ```sh
 cd benchmark/
 python flash_benchmark.py

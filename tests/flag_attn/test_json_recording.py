@@ -15,8 +15,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def _run_pytest(tmp_path, test_name, source, *extra_args):
     test_file = tmp_path / test_name
+    test_file.parent.mkdir(parents=True, exist_ok=True)
     test_file.write_text(source, encoding="utf-8")
-    return _invoke_pytest(tmp_path, [test_file.name], *extra_args)
+    return _invoke_pytest(
+        tmp_path, [str(test_file.relative_to(tmp_path))], *extra_args
+    )
 
 
 def _invoke_pytest(tmp_path, test_names, *extra_args):
@@ -180,3 +183,104 @@ def test_output_alone_does_not_enable_recording(tmp_path):
     default_report = tmp_path / "accuracy_result.json"
     data = json.loads(default_report.read_text(encoding="utf-8"))
     assert data["test_default_output.py::test_default_output"]["result"] == "passed"
+
+
+def test_benchmark_record_uses_flaggems_schema(tmp_path):
+    report = tmp_path / "benchmark_custom.json"
+    completed = _run_pytest(
+        tmp_path,
+        "benchmark/test_perf.py",
+        """
+import pytest
+
+from benchmark.recording import benchmark_metric, record_benchmark_result
+
+@pytest.mark.demo_benchmark
+def test_perf(record_property):
+    metrics = [
+        benchmark_metric(
+            shape_detail=(1, 128),
+            latency_base=2.5,
+            latency=1.25,
+            speedup=2.0,
+        ),
+        benchmark_metric(
+            shape_detail=(2, 256),
+            latency_base=4.5,
+            latency=1.5,
+            speedup=3.0,
+        ),
+    ]
+    record_benchmark_result(
+        record_property,
+        op_name="demo_benchmark",
+        dtype="torch.float16",
+        result=metrics,
+        baseline="torch",
+        phase="forward",
+    )
+
+@pytest.mark.partial_benchmark
+def test_partial_failure(record_property):
+    record_benchmark_result(
+        record_property,
+        op_name="partial_benchmark",
+        dtype="torch.bfloat16",
+        result=[benchmark_metric(shape_detail=(4,), latency=0.5)],
+    )
+    assert False, "benchmark failed after one result"
+
+@pytest.mark.skipped_benchmark
+@pytest.mark.skip(reason="benchmark accelerator unavailable")
+def test_skipped():
+    pass
+""",
+        "--record",
+        "json",
+        "--output",
+        str(report),
+    )
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+
+    data = json.loads(report.read_text(encoding="utf-8"))
+    benchmark = data["demo_benchmark"]
+    assert benchmark["result"] == "passed"
+    assert benchmark["reason"] is None
+    assert benchmark["test_case"] == "benchmark/test_perf.py::test_perf"
+    assert len(benchmark["details"]) == 1
+    detail = benchmark["details"][0]
+    assert detail["op_name"] == "demo_benchmark"
+    assert detail["dtype"] == "torch.float16"
+    assert detail["baseline"] == "torch"
+    assert detail["phase"] == "forward"
+    assert detail["result"][0]["shape_detail"] == [1, 128]
+    assert detail["result"][0]["latency_base"] == 2.5
+    assert detail["result"][0]["latency"] == 1.25
+    assert detail["result"][0]["speedup"] == 2.0
+
+    partial = data["partial_benchmark"]
+    assert partial["result"] == "failed"
+    assert "benchmark failed after one result" in partial["reason"]
+    assert len(partial["details"]) == 1
+    skipped = data["skipped_benchmark"]
+    assert skipped["details"] == []
+    assert skipped["result"] == "skipped"
+    assert "benchmark accelerator unavailable" in skipped["reason"]
+
+    default_run = _run_pytest(
+        tmp_path,
+        "benchmark/test_default_report.py",
+        """
+import pytest
+
+@pytest.mark.default_benchmark
+def test_default_report():
+    pass
+""",
+        "--record",
+        "json",
+    )
+    assert default_run.returncode == 0, default_run.stdout + default_run.stderr
+    default_report = tmp_path / "benchmark_result.json"
+    default_data = json.loads(default_report.read_text(encoding="utf-8"))
+    assert default_data["default_benchmark"]["result"] == "passed"

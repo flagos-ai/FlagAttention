@@ -175,6 +175,16 @@ python tools/run_tests.py --stages all --skip-benchmarks --dump-output
 
 我们对比了算子的 Triton 实现和 PyTorch 实现的性能。当输入规模较大时，PyTorch 参考实现会遇到内存不足的问题，这种情况下，FLOPs/s 记为 0.
 
+pytest 驱动的 benchmark 可以生成与 FlagGems 兼容的结构化结果，其中包含
+基线延迟、FlagAttention 延迟和加速比：
+
+```sh
+cd benchmark/
+pytest -m "sage_attention" --record json --output benchmark_sage_attention.json -vs
+```
+
+省略 `--output` 时，benchmark 结果默认写入 `benchmark_result.json`。
+
 ```sh
 cd benchmark/
 python flash_benchmark.py

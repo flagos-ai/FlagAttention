@@ -12,10 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+
 import pytest
 import torch
 import torch.nn.functional as F
 import triton
+
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:  # Direct script execution.
+    from recording import benchmark_metric, record_benchmark_result
 
 from flag_attn.FLA.gated_linear_attention import chunk_gla as flag_attn_chunk_gla
 
@@ -169,7 +176,11 @@ def _print_row(B, T, H, D, dtype, ms_fla, ms_flag_attn) -> None:
             f"{ms_flag_attn:>14.3f}"
         )
 
-def run_benchmark(warmup: int = DEFAULT_WARMUP, rep: int = DEFAULT_REP) -> None:
+def run_benchmark(
+    warmup: int = DEFAULT_WARMUP,
+    rep: int = DEFAULT_REP,
+    record_property: Callable[[str, object], None] | None = None,
+) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("chunk_gla benchmark requires CUDA")
 
@@ -184,6 +195,7 @@ def run_benchmark(warmup: int = DEFAULT_WARMUP, rep: int = DEFAULT_REP) -> None:
     )
 
     for dtype in _DTYPES:
+        metrics = []
         print("\ndtype:", dtype)
         for B, T, H, D in _SHAPES:
             q, k, v, g, kwargs = _build_inputs(B, T, H, D, dtype)
@@ -197,6 +209,26 @@ def run_benchmark(warmup: int = DEFAULT_WARMUP, rep: int = DEFAULT_REP) -> None:
                 lambda: flag_attn_chunk_gla(q, k, v, g, **kwargs), warmup, rep
             )
             _print_row(B, T, H, D, dtype, ms_fla, ms_flag_attn)
+            metrics.append(
+                benchmark_metric(
+                    shape_detail=(B, T, H, D),
+                    latency_base=ms_fla,
+                    latency=ms_flag_attn,
+                    speedup=(
+                        ms_fla / ms_flag_attn
+                        if ms_fla is not None and ms_flag_attn > 0
+                        else None
+                    ),
+                )
+            )
+        record_benchmark_result(
+            record_property,
+            op_name="chunk_gla",
+            dtype=str(dtype),
+            result=metrics,
+            baseline="FLA" if _HAS_FLA_CHUNK else None,
+            phase="forward",
+        )
 
     # ============================================================
     # Part 2: forward + backward
@@ -209,6 +241,7 @@ def run_benchmark(warmup: int = DEFAULT_WARMUP, rep: int = DEFAULT_REP) -> None:
     )
 
     for dtype in _DTYPES:
+        metrics = []
         print("\ndtype:", dtype)
         for B, T, H, D in _SHAPES:
             q, k, v, g_logit, kwargs = _build_inputs(
@@ -238,6 +271,26 @@ def run_benchmark(warmup: int = DEFAULT_WARMUP, rep: int = DEFAULT_REP) -> None:
                 rep,
             )
             _print_row(B, T, H, D, dtype, ms_fla, ms_flag_attn)
+            metrics.append(
+                benchmark_metric(
+                    shape_detail=(B, T, H, D),
+                    latency_base=ms_fla,
+                    latency=ms_flag_attn,
+                    speedup=(
+                        ms_fla / ms_flag_attn
+                        if ms_fla is not None and ms_flag_attn > 0
+                        else None
+                    ),
+                )
+            )
+        record_benchmark_result(
+            record_property,
+            op_name="chunk_gla",
+            dtype=str(dtype),
+            result=metrics,
+            baseline="FLA" if _HAS_FLA_CHUNK else None,
+            phase="forward_backward",
+        )
 
     print(f"\n{'=' * 70}")
     print("  All done. ")
@@ -248,8 +301,8 @@ def run_benchmark(warmup: int = DEFAULT_WARMUP, rep: int = DEFAULT_REP) -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="chunk_gla benchmark requires CUDA"
 )
-def test_chunk_gla_benchmark() -> None:
-    run_benchmark()
+def test_chunk_gla_benchmark(record_property) -> None:
+    run_benchmark(record_property=record_property)
 
 
 if __name__ == "__main__":

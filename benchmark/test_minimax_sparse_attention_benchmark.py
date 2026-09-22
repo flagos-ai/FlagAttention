@@ -33,6 +33,11 @@ import triton
 import triton.knobs
 import triton.testing as triton_testing
 
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:  # Direct script execution.
+    from recording import benchmark_metric, record_benchmark_result
+
 from flag_attn.minimax_sparse_attention import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode,
@@ -585,7 +590,11 @@ def _format_columns(columns: list[tuple[str, int]]) -> str:
     return "  ".join(f"{value:>{width}s}" for value, width in columns)
 
 
-def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
+def _run_dtype(
+    args: MSABenchmarkArgs,
+    dtype_name: str,
+    record_property: Callable[[str, object], None] | None = None,
+) -> None:
     run_vllm = VLLM_AVAILABLE and not args.no_vllm
     if dtype_name == "fp8" and run_vllm and not _supports_fp8_scales():
         print("[baseline] vLLM FP8 skipped: k_scale/v_scale are unavailable")
@@ -621,6 +630,7 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
     print(separator)
 
     device = torch.device("cuda")
+    metrics = []
     for shape_index, shape in enumerate(_get_shapes(args)):
         batch, seq_len, num_kv_heads, num_heads = shape
         if num_heads % num_kv_heads != 0:
@@ -707,6 +717,7 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
                     vllm_output,
                 )
 
+        vllm_ms = None
         if run_vllm:
             providers = (
                 (("flag_attn", flag_attn_run), ("vllm", vllm_run))
@@ -751,9 +762,36 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
                 )
         print(_format_columns(row))
         sys.stdout.flush()
+        metrics.append(
+            benchmark_metric(
+                shape_detail=shape,
+                latency_base=vllm_ms,
+                latency=flag_attn_ms,
+                speedup=(
+                    vllm_ms / flag_attn_ms
+                    if vllm_ms is not None and flag_attn_ms > 0
+                    else None
+                ),
+                steps=steps,
+            )
+        )
+
+    record_benchmark_result(
+        record_property,
+        op_name="minimax_m3_sparse_attn",
+        dtype=str(torch.bfloat16 if dtype_name == "bf16" else FP8_DTYPE),
+        result=metrics,
+        baseline="vLLM" if run_vllm else None,
+        phase="decode" if args.decode else "prefill",
+        topk=args.topk,
+        decode_qlen=args.decode_qlen if args.decode else None,
+    )
 
 
-def run_benchmark(args: MSABenchmarkArgs) -> None:
+def run_benchmark(
+    args: MSABenchmarkArgs,
+    record_property: Callable[[str, object], None] | None = None,
+) -> None:
     _require_cuda()
     if args.topk < 1:
         raise ValueError("--topk must be positive")
@@ -794,21 +832,21 @@ def run_benchmark(args: MSABenchmarkArgs) -> None:
         if mode_index:
             print()
         for dtype_name in dtypes:
-            _run_dtype(args, dtype_name)
+            _run_dtype(args, dtype_name, record_property)
 
 
 @pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="MiniMax M3 benchmark requires CUDA"
 )
-def test_msa_benchmark(request) -> None:
+def test_msa_benchmark(request, record_property) -> None:
     """Run the MSA benchmark through pytest using benchmark CLI timing options."""
     args = MSABenchmarkArgs(
         topk=int(request.config.getoption("--topk", default=16)),
         warmup=int(request.config.getoption("--warmup", default=DEFAULT_WARMUP)),
         rep=int(request.config.getoption("--iter", default=DEFAULT_REP)),
     )
-    run_benchmark(args)
+    run_benchmark(args, record_property)
 
 
 if __name__ == "__main__":

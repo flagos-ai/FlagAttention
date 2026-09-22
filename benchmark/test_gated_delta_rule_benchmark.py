@@ -22,6 +22,11 @@ import pytest
 import torch
 import triton
 
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:  # Direct script execution.
+    from recording import benchmark_metric, record_benchmark_result
+
 from flag_attn import chunk_gated_delta_rule
 from flag_attn.utils import has_triton_tle
 
@@ -267,10 +272,19 @@ def run_benchmark(
 
     _print_header()
     for dtype in DTYPES:
+        metrics = []
         print("\ndtype:", dtype)
         for shape in SHAPES:
             fla_ms, flag_attn_ms = _benchmark_case(dtype, shape)
             _print_row(dtype, shape, fla_ms, flag_attn_ms)
+            metrics.append(
+                benchmark_metric(
+                    shape_detail=shape,
+                    latency_base=fla_ms,
+                    latency=flag_attn_ms,
+                    speedup=_speedup(fla_ms, flag_attn_ms),
+                )
+            )
             _record_result(
                 record_property,
                 dtype,
@@ -279,6 +293,14 @@ def run_benchmark(
                 flag_attn_ms,
             )
             torch.cuda.empty_cache()
+        record_benchmark_result(
+            record_property,
+            op_name="chunk_gated_delta_rule",
+            dtype=str(dtype),
+            result=metrics,
+            baseline="FLA",
+            phase="forward",
+        )
     _print_footer()
 
 

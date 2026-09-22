@@ -24,6 +24,11 @@ import pytest
 import torch
 import triton
 
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:  # Direct execution from the benchmark directory.
+    from recording import benchmark_metric, record_benchmark_result
+
 
 class Benchmark:
     """Measure a reference callable and an injected FlagAttention callable."""
@@ -100,12 +105,13 @@ class Benchmark:
             return_mode="median",
         )
 
-    def run(self) -> None:
+    def run(self, record_property=None) -> None:
         if self.gems_op is None:
             raise RuntimeError("FlagAttention benchmark callable has not been set")
 
         self.init_user_config()
         for dtype in self.to_bench_dtypes:
+            metrics = []
             for input_tuple in self.get_input_iter(dtype):
                 args, kwargs = self.unpack_to_args_kwargs(input_tuple)
                 try:
@@ -116,6 +122,14 @@ class Benchmark:
 
                 speedup = latency_base / latency
                 shape_detail = self.record_shapes(*args, **kwargs)
+                metrics.append(
+                    benchmark_metric(
+                        shape_detail=shape_detail,
+                        latency_base=latency_base,
+                        latency=latency,
+                        speedup=speedup,
+                    )
+                )
                 print(
                     f"Operator={self.op_name} dtype={dtype} "
                     f"latency_base={latency_base:.6f} ms "
@@ -129,3 +143,11 @@ class Benchmark:
                 gc.collect()
                 if hasattr(torch, "gcu"):
                     torch.gcu.empty_cache()
+
+            record_benchmark_result(
+                record_property,
+                op_name=self.op_name,
+                dtype=str(dtype),
+                result=metrics,
+                baseline="torch_reference",
+            )

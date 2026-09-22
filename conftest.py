@@ -25,7 +25,9 @@ _BUILTIN_MARKS = {
     "usefixtures",
     "xfail",
 }
-_DEFAULT_REPORT_FILE = "accuracy_result.json"
+_BENCHMARK_RESULT_PROPERTY = "flag_attn_benchmark_result"
+_DEFAULT_ACCURACY_REPORT_FILE = "accuracy_result.json"
+_DEFAULT_BENCHMARK_REPORT_FILE = "benchmark_result.json"
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -43,7 +45,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store",
         dest="flag_attn_output",
         metavar="PATH",
-        help=f"JSON result path (default: {_DEFAULT_REPORT_FILE})",
+        help=(
+            "JSON result path (defaults: accuracy_result.json for tests, "
+            "benchmark_result.json for benchmarks)"
+        ),
     )
 
 
@@ -51,17 +56,26 @@ def pytest_configure(config: pytest.Config) -> None:
     if config.getoption("flag_attn_record") != "json":
         return
 
-    output = config.getoption("flag_attn_output") or _DEFAULT_REPORT_FILE
-    recorder = _JsonResultRecorder(Path(output))
+    output = config.getoption("flag_attn_output")
+    if output is None:
+        output = (
+            _DEFAULT_BENCHMARK_REPORT_FILE
+            if _is_benchmark_invocation(config)
+            else _DEFAULT_ACCURACY_REPORT_FILE
+        )
+    recorder = _JsonResultRecorder(Path(output), config.rootpath)
     config.pluginmanager.register(recorder, "flag-attention-json-result-recorder")
 
 
 class _JsonResultRecorder:
     """Collect pytest outcomes using the JSON schema consumed by FlagGems."""
 
-    def __init__(self, output: Path) -> None:
+    def __init__(self, output: Path, rootpath: Path) -> None:
         self.output = output
+        self.rootpath = rootpath
         self.results: dict[str, dict[str, Any]] = {}
+        self.item_keys: dict[str, str] = {}
+        self.benchmark_items: set[str] = set()
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtest_protocol(self, item: pytest.Item, nextitem: pytest.Item | None):
@@ -72,19 +86,49 @@ class _JsonResultRecorder:
             for mark in item.iter_markers()
             if mark.name not in _BUILTIN_MARKS
         ]
-        self.results[item.nodeid] = {
-            "params": params,
-            "result": None,
-            "opname": operator_marks,
-            "reason": None,
-        }
+        if _is_benchmark_path(Path(str(item.path)), self.rootpath):
+            key = operator_marks[0] if operator_marks else item.nodeid
+            self.item_keys[item.nodeid] = key
+            self.benchmark_items.add(item.nodeid)
+            result = self.results.setdefault(key, {"details": []})
+            result.update(
+                {
+                    "result": None,
+                    "test_case": item.nodeid,
+                    "reason": None,
+                }
+            )
+        else:
+            self.item_keys[item.nodeid] = item.nodeid
+            self.results[item.nodeid] = {
+                "params": params,
+                "result": None,
+                "opname": operator_marks,
+                "reason": None,
+            }
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
-        result = self.results.setdefault(
-            report.nodeid,
-            {"params": {}, "result": None, "opname": [], "reason": None},
-        )
+        key = self.item_keys.get(report.nodeid, report.nodeid)
+        if report.nodeid in self.benchmark_items:
+            result = self.results.setdefault(
+                key,
+                {
+                    "details": [],
+                    "result": None,
+                    "test_case": report.nodeid,
+                    "reason": None,
+                },
+            )
+            if report.when == "call":
+                for name, value in report.user_properties:
+                    if name == _BENCHMARK_RESULT_PROPERTY:
+                        result["details"].append(value)
+        else:
+            result = self.results.setdefault(
+                key,
+                {"params": {}, "result": None, "opname": [], "reason": None},
+            )
 
         # Keep the first failure because a call-phase assertion normally gives
         # a more useful reason than a later teardown failure.
@@ -132,6 +176,29 @@ def _report_reason(report: pytest.TestReport | pytest.CollectReport) -> str:
     if longrepr:
         return str(longrepr)
     return report.outcome
+
+
+def _is_benchmark_path(path: Path, rootpath: Path) -> bool:
+    try:
+        relative = path.resolve().relative_to(rootpath.resolve())
+    except ValueError:
+        return False
+    return bool(relative.parts) and relative.parts[0] == "benchmark"
+
+
+def _is_benchmark_invocation(config: pytest.Config) -> bool:
+    invocation_dir = Path(str(config.invocation_params.dir))
+    if _is_benchmark_path(invocation_dir, config.rootpath):
+        return True
+
+    for argument in config.args:
+        candidate = str(argument).split("::", 1)[0]
+        path = Path(candidate)
+        if not path.is_absolute():
+            path = invocation_dir / path
+        if _is_benchmark_path(path, config.rootpath):
+            return True
+    return False
 
 
 def _merge_json_report(

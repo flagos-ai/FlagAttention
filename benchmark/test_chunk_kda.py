@@ -271,10 +271,10 @@ class ChunkKDABenchmark(Benchmark):
     reason="chunk_kda benchmark requires an available Enflame GCU",
 )
 @pytest.mark.chunk_kda
-def test_chunk_kda():
+def test_chunk_kda(record_property):
     bench = ChunkKDABenchmark(
         op_name="chunk_kda",
         torch_op=_chunk_kda_torch_reference_op,
     )
     bench.set_gems(_chunk_kda_inference_op)
-    bench.run()
+    bench.run(record_property)
