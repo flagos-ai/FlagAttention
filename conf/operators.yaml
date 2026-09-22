@@ -33,8 +33,10 @@ ops:
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_two_kernel_configs
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_hybrid_matches_two_kernel
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_hybrid_matches_fla
-      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_hybrid_benchmark
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_public_api_uses_two_kernel
+    benchmark: benchmark/test_gated_delta_rule_benchmark.py
+    benchmark_requires:
+      - fla
   - id: chunk_gdn2
     description: Compare native and TLE chunked GDN2 implementations and resource controls.
     for:
@@ -49,7 +51,7 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/flag_attn/test_gdn2.py
-    benchmark: benchmark/gdn2_benchmark.py
+    benchmark: benchmark/test_gdn2_benchmark.py
   - id: chunk_gla
     description: Run fixed-length, state-v-first, and variable-length chunked gated linear attention.
     for:
@@ -66,7 +68,7 @@ ops:
       - tests/flag_attn/test_chunk_gla.py::test_chunk
       - tests/flag_attn/test_chunk_gla.py::test_chunk_state_v_first
       - tests/flag_attn/test_chunk_gla.py::test_chunk_varlen
-    benchmark: benchmark/chunk_gla_benchmark.py
+    benchmark: benchmark/test_chunk_gla_benchmark.py
   - id: chunk_kda
     description: Compare CUDA TLE Kimi Delta Attention against its recurrent reference.
     for:
@@ -204,7 +206,7 @@ ops:
       - tests/flag_attn/test_minimax_sparse_attention.py::test_metax_public_exports
       - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_fp8
-    benchmark: benchmark/minimax_sparse_attention_benchmark.py
+    benchmark: benchmark/test_minimax_sparse_attention_benchmark.py
   - id: minimax_m3_sparse_attn_decode
     description: Run the MiniMax M3 sparse-attention decode and decode top-k paths.
     for:
@@ -333,7 +335,7 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/flag_attn/test_sage_attention.py
-    benchmark: benchmark/sage_attention_benchmark.py
+    benchmark: benchmark/test_sage_attention_benchmark.py
   - id: sage_attention_ascend
     description: Run the Ascend SageAttention backend tests and benchmark.
     for:

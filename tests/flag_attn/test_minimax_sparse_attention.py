@@ -639,6 +639,7 @@ def _run_decode(case: tuple, mode: str) -> None:
     _assert_attention_match(output, ref_output, data)
 
 
+@pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.minimax_sparse_attention_topk
 def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
     """Invalid lanes must lose even when every valid score is negative infinity."""
@@ -676,6 +677,7 @@ def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
     not index_topk_module._HAS_TLE_RADIX,
     reason="requires a backend with TLE radix top-k support",
 )
+@pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.minimax_sparse_attention_topk
 def test_prefill_topk_radix_path() -> None:
     """Exercise the actual wide-row TLE path instead of accepting fallback."""
@@ -748,6 +750,7 @@ DECODE_K16_CASES = [
     "case", PREFILL_CASES, ids=("boundary", "selection", "long_ragged")
 )
 @pytest.mark.minimax_sparse_attention_prefill
+@pytest.mark.minimax_m3_sparse_attn
 def test_prefill_bf16(case: tuple) -> None:
     _run_prefill(case, "bf16")
 
@@ -755,6 +758,7 @@ def test_prefill_bf16(case: tuple) -> None:
 @pytest.mark.parametrize(
     "case", DECODE_CASES, ids=("boundary", "selection", "long_gqa")
 )
+@pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.minimax_sparse_attention_decode
 def test_decode_bf16(case: tuple) -> None:
     _run_decode(case, "bf16")
@@ -763,6 +767,7 @@ def test_decode_bf16(case: tuple) -> None:
 @pytest.mark.parametrize(
     "case", DECODE_SELECTION_CASES, ids=("split_k", "single_chunk")
 )
+@pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.minimax_sparse_attention_decode
 def test_decode_topk_selection_bf16(case: tuple) -> None:
     """Cover N > K for both multi-chunk and single-chunk selection."""
@@ -772,12 +777,14 @@ def test_decode_topk_selection_bf16(case: tuple) -> None:
 @pytest.mark.parametrize(
     "case", DECODE_K16_CASES, ids=("identity_ragged", "spec_causal")
 )
+@pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.minimax_sparse_attention_decode
 def test_decode_topk_k16_bf16(case: tuple) -> None:
     """Cover the configured K=16 Identity and causal selection paths."""
     _run_decode(case, "bf16")
 
 
+@pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.minimax_sparse_attention_decode
 def test_decode_topk_identity_out_and_score_out_bf16() -> None:
     """Identity must preserve out aliasing and populate an explicit score buffer."""
@@ -843,6 +850,7 @@ def test_decode_topk_identity_out_and_score_out_bf16() -> None:
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
 @pytest.mark.parametrize("case", PREFILL_CASES[:2], ids=("boundary", "selection"))
+@pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.minimax_sparse_attention_prefill
 def test_prefill_fp8(mode: str, case: tuple) -> None:
     _run_prefill(case, mode)
@@ -854,6 +862,7 @@ def test_prefill_fp8(mode: str, case: tuple) -> None:
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
 @pytest.mark.parametrize("case", DECODE_CASES[:2], ids=("boundary", "selection"))
+@pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.minimax_sparse_attention_decode
 def test_decode_fp8(mode: str, case: tuple) -> None:
     _run_decode(case, mode)

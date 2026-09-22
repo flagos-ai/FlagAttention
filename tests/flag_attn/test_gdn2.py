@@ -155,6 +155,7 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
     )
 
 
+@pytest.mark.chunk_gdn2
 @pytest.mark.parametrize(
     "impl",
     [pytest.param("tle", id="tle"), pytest.param("native", id="native")],
@@ -234,6 +235,7 @@ def output_composition_case(request):
     return q, v, g, h, A, scale, expected
 
 
+@pytest.mark.chunk_gdn2
 @pytest.mark.parametrize(
     "config",
     chunk_gla_fwd_kernel_o.fn.configs,

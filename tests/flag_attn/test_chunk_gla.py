@@ -931,6 +931,7 @@ def _assert_close(name, actual, expected, ratio, err_atol=1e-6):
     assert error_rate < ratio, f"{name}: diff: {abs_atol:.6f} ratio: {error_rate:.6f}"
 
 
+@pytest.mark.chunk_gla
 @pytest.mark.chunk_gla_chunk
 @pytest.mark.parametrize(
     ("B", "T", "H", "D", "gate_logit_normalizer", "dtype"),
@@ -998,6 +999,7 @@ def test_chunk(B, T, H, D, dtype, gate_logit_normalizer):
     _assert_close("dh0", ref_dh0, tri_dh0, 0.005)
 
 
+@pytest.mark.chunk_gla
 @pytest.mark.chunk_gla_state_v_first
 @pytest.mark.parametrize(
     ("B", "T", "H", "D", "dtype"),
@@ -1055,6 +1057,7 @@ def test_chunk_state_v_first(B, T, H, D, dtype):
     _assert_close("dh0", ref_dh0, tri_dh0.transpose(-1, -2), 0.005)
 
 
+@pytest.mark.chunk_gla
 @pytest.mark.chunk_gla_varlen
 @pytest.mark.parametrize(
     ("H", "D", "cu_seqlens", "dtype"),

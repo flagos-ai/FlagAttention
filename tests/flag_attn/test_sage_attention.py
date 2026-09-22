@@ -62,6 +62,7 @@ def _reference(q, k, v, q_scale, k_scale, tensor_layout, attn_mask=None):
     return output, lse
 
 
+@pytest.mark.sage_attention
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
 def test_forward_matches_dequantized_reference(tensor_layout, num_kv_heads):
@@ -110,6 +111,7 @@ def test_forward_rejects_non_positive_maxnreg():
         forward(q, k, v, q_scale, k_scale, maxnreg=0)
 
 
+@pytest.mark.sage_attention
 @pytest.mark.parametrize("mask_kind", ["bool", "additive"])
 def test_forward_supports_masks_and_partial_blocks(mask_kind):
     torch.manual_seed(7)

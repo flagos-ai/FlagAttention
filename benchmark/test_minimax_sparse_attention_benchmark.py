@@ -27,6 +27,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Callable
 
+import pytest
 import torch
 import triton
 import triton.knobs
@@ -796,6 +797,10 @@ def run_benchmark(args: MSABenchmarkArgs) -> None:
             _run_dtype(args, dtype_name)
 
 
+@pytest.mark.minimax_m3_sparse_attn
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="MiniMax M3 benchmark requires CUDA"
+)
 def test_msa_benchmark(request) -> None:
     """Run the MSA benchmark through pytest using benchmark CLI timing options."""
     args = MSABenchmarkArgs(

@@ -41,16 +41,6 @@ GDN_EXTERNAL_TEST_SHAPES = [
     (8, 2048, 32, 256, 256),
 ]
 
-GDN_EXTERNAL_BENCHMARK_SHAPES = [
-    (1, 8192, 96, 128, 128),
-    (2, 16384, 16, 128, 128),
-    (4, 2048, 16, 128, 128),
-    (4, 4096, 64, 128, 128),
-    (8, 1024, 8, 64, 64),
-    (8, 2048, 32, 256, 256),
-]
-
-
 def _load_fla_reference():
     try:
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_chunk_gdn
@@ -205,6 +195,7 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
     )
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN recompute TLE tests require CUDA/TLE"
 )
@@ -224,6 +215,7 @@ def test_chunk_gated_delta_rule_fwd_recompute_tle_matches_native(dtype, shape):
     _assert_close("final_state", actual[3], baseline[3])
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN fused TLE tests require CUDA/TLE"
 )
@@ -243,6 +235,7 @@ def test_chunk_gated_delta_rule_fwd_full_tle_matches_native(dtype, shape):
     _assert_close("final_state", actual[3], baseline[3])
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(not _cuda_tle_available(), reason="GDN public API test requires CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
@@ -272,6 +265,7 @@ def test_chunk_gated_delta_rule_public_api_matches_native(dtype):
     _assert_close("final_state", final_state, baseline[3])
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN two-kernel tests require CUDA/TLE"
 )
@@ -312,6 +306,7 @@ def _two_kernel_configs():
     ]
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN autotune configurations require CUDA/TLE"
 )
@@ -341,6 +336,7 @@ def test_chunk_gated_delta_rule_two_kernel_configs(dtype, config):
     _assert_close("final_state", final_state, baseline[3])
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN hybrid tests require CUDA/TLE"
 )
@@ -370,6 +366,7 @@ def test_chunk_gated_delta_rule_fwd_hybrid_matches_two_kernel(dtype):
     _assert_close("final_state", actual[3], expected[3])
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN external comparison requires CUDA/TLE"
 )
@@ -387,45 +384,7 @@ def test_chunk_gated_delta_rule_hybrid_matches_fla(dtype, shape):
     _assert_close("final_state", actual_final_state, expected_final_state)
 
 
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN external benchmark requires CUDA/TLE"
-)
-@pytest.mark.skipif(
-    os.environ.get("FLAG_ATTN_RUN_EXTERNAL_BENCHMARKS", "0") != "1",
-    reason="set FLAG_ATTN_RUN_EXTERNAL_BENCHMARKS=1 to run GDN benchmarks",
-)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shape", GDN_EXTERNAL_BENCHMARK_SHAPES)
-@torch.inference_mode()
-def test_chunk_gated_delta_rule_hybrid_benchmark(dtype, shape, record_property):
-    torch.manual_seed(42)
-    args = _make_inputs(*shape, dtype=dtype, use_initial_state=False)
-
-    expected_o, expected_final_state = _call_fla_reference(args)
-    actual_o, actual_final_state = _call_public_hybrid(args)
-    _assert_close("o", actual_o, expected_o)
-    _assert_close("final_state", actual_final_state, expected_final_state)
-
-    fla_ms = triton.testing.do_bench(
-        lambda: _call_fla_reference(args), warmup=10, rep=50
-    )
-    flag_attn_ms = triton.testing.do_bench(
-        lambda: _call_public_hybrid(args), warmup=10, rep=50
-    )
-    speedup = fla_ms / flag_attn_ms
-    shape_name = f"B{shape[0]}_T{shape[1]}_H{shape[2]}_K{shape[3]}_V{shape[4]}"
-
-    record_property("shape", shape_name)
-    record_property("dtype", str(dtype))
-    record_property("fla_ms", fla_ms)
-    record_property("flag_attn_ms", flag_attn_ms)
-    record_property("speedup_vs_fla", speedup)
-    print(
-        f"\n{dtype} {shape_name}: FLA={fla_ms:.6f} ms, "
-        f"FlagAttention={flag_attn_ms:.6f} ms, speedup={speedup:.3f}x"
-    )
-
-
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN public two-kernel test requires CUDA/TLE"
 )

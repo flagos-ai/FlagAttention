@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 import torch.nn.functional as F
 import triton
@@ -242,4 +243,14 @@ def run_benchmark(warmup: int = DEFAULT_WARMUP, rep: int = DEFAULT_REP) -> None:
     print("  All done. ")
     print(f"{'=' * 70}\n")
 
-run_benchmark()
+
+@pytest.mark.chunk_gla
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="chunk_gla benchmark requires CUDA"
+)
+def test_chunk_gla_benchmark() -> None:
+    run_benchmark()
+
+
+if __name__ == "__main__":
+    run_benchmark()
