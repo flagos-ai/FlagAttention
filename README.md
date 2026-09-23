@@ -89,7 +89,7 @@ pip install PyYAML pytest
 pip install dist/flag_attn-*.whl
 ```
 
-There is no `setup.py`; packaging uses PEP 517 and setuptools-scm. Debian/RPM runtime notes are in [`packaging/INSTALL.md`](./packaging/INSTALL.md).
+There is no `setup.py`; packaging uses PEP 517 and setuptools-scm. Debian/RPM runtime notes are in [`packaging/INSTALL.md`](./packaging/INSTALL.md). The current distribution-package metadata and install notes may not supply both PyYAML and pytest, so ensure they are available in the Python environment used to import `flag_attn`.
 
 ## Quick start
 
@@ -146,11 +146,19 @@ Dropout is not supported when the occupancy heuristic selects the split-KV path.
 ### Piecewise Attention
 
 ```python
+import torch
 from flag_attn import piecewise_attention
+
+B, H, M, N, D = 1, 2, 128, 128, 64
+q1 = torch.randn(B, H, M, D, device="cuda", dtype=torch.float16)
+q2 = torch.randn_like(q1)
+k1 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+k2 = torch.randn_like(k1)
+v = torch.randn_like(k1)
 
 out = piecewise_attention(
     q1, k1, q2, k2, v,
-    dist_threshold=2048,
+    dist_threshold=32,
     causal=True,
 )
 ```
@@ -159,7 +167,7 @@ For query row `m` and key column `n`, the operator uses `q2 @ k2` when the signe
 
 Piecewise Attention was introduced for NLPE (Non-Linearized Position Embedding), used by [Aquila-2-34B](https://github.com/FlagAI-Open/Aquila2) to switch positional representations beyond a distance threshold.
 
-Additional CUDA-oriented scripts are available in [`examples`](./examples), but some are historical and may lag the current return contract. The tests are the authoritative usage examples. PyTorch reference implementations used for validation are exposed as `flag_attn.testing`.
+Additional CUDA-oriented scripts are available in [`examples`](./examples), but some are historical. In particular, [`examples/flash_attention_with_aux_outputs.py`](./examples/flash_attention_with_aux_outputs.py) still unpacks three values although the current auxiliary-output API returns five; use the five-value example above until that script is updated. The tests are the authoritative usage examples. PyTorch reference implementations used for validation are exposed as `flag_attn.testing`.
 
 ## Inference and sparse APIs
 
@@ -169,7 +177,7 @@ Additional CUDA-oriented scripts are available in [`examples`](./examples), but 
 from flag_attn import flash_attention_split_kv, paged_attention
 ```
 
-`flash_attention_split_kv` is an explicit forward-only API for long-KV workloads. It accepts `q: [B,Hq,M,D]` and `k/v: [B,Hkv,N,D]`, requires `Hq % Hkv == 0`, and supports `D` in `{16,32,64,128}`. Each split computes a partial output and log-normalizer; a second kernel combines them with a global logsumexp.
+`flash_attention_split_kv` is an explicit forward-only API for long-KV workloads. It accepts `q: [B,Hq,M,D]` and `k/v: [B,Hkv,N,D]`, requires `Hq % Hkv == 0`, and supports `D` in `{16,32,64,128}`. When multiple splits are selected, each computes a partial output and log-normalizer; a second kernel combines them with a global logsumexp. A single split returns its output directly.
 
 `paged_attention` accepts:
 
@@ -181,7 +189,9 @@ context_lens: [num_sequences]
 block_tables: [num_sequences, max_blocks_per_sequence]
 ```
 
-It selects a one-pass or partitioned/reduced implementation automatically; `num_splits` can override that choice. K and V caches must have the same shape and strides. Supported head sizes are `{16,32,64,128,256,512}`; grouped-query layouts require at least 16 tokens per cache block after group padding. See [`examples/paged_example.py`](./examples/paged_example.py).
+It selects a one-pass or partitioned/reduced implementation automatically; `num_splits` can override that choice. K and V caches must have the same shape and strides. Supported head sizes are `{16,32,64,128,256,512}`; when `num_query_heads > num_kv_heads`, the cache block size must be at least 16 tokens. Explicit `num_splits > 1` also requires the resulting partition size to be at least the cache block size and divisible by it. See [`examples/paged_example.py`](./examples/paged_example.py).
+
+Call `paged_attention(query, key_cache, value_cache, context_lens, block_tables, attn_scale, max_context_len, num_splits=0)`; it returns an output with the same shape as `query`. `attn_scale` is the softmax scale (typically `head_size**-0.5`), and `max_context_len` is the largest context length represented by the batch.
 
 ### MiniMax M3 sparse attention
 
@@ -198,13 +208,19 @@ Decode: minimax_m3_index_decode (score + top-k)
 Score-only decode API: minimax_m3_index_decode_score
 ```
 
-The sparse attention kernels support GQA and BF16 KV caches, with FP8 cache scaling on supported hardware. These functions are inference-only and use caller-provided paged caches, sequence metadata, block tables, and output buffers. The exact contracts are documented in [`src/flag_attn/minimax_sparse_attention`](./src/flag_attn/minimax_sparse_attention) and exercised end to end in [`tests/flag_attn/test_minimax_sparse_attention.py`](./tests/flag_attn/test_minimax_sparse_attention.py).
+The sparse attention kernels support GQA and BF16 KV caches, with FP8 cache scaling on supported hardware. These functions are inference-only and use caller-provided paged caches, sequence metadata, and block tables. Sparse prefill/decode require an `output` buffer and write into it, returning `None`; index-scoring/top-k functions return tensors, and some accept optional reusable output buffers. See the function signatures in [`src/flag_attn/minimax_sparse_attention`](./src/flag_attn/minimax_sparse_attention) and the end-to-end tests in [`tests/flag_attn/test_minimax_sparse_attention.py`](./tests/flag_attn/test_minimax_sparse_attention.py).
 
 ### SageAttention
 
 ```python
+import torch
 from flag_attn.sage_attention import forward as sage_attention
 from flag_attn.sage_attention import per_block_int8
+
+B, H, N, D = 1, 2, 128, 64
+q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+k = torch.randn_like(q)
+v = torch.randn_like(q)
 
 q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k, tensor_layout="HND")
 out, lse = sage_attention(
@@ -226,7 +242,7 @@ GLA, GDN2, and KDA use sequence-first `[B,T,H,D]`. Gated Delta Rule defaults to 
 - [`chunk_gated_delta_rule`](./src/flag_attn/FLA/gated_delta_rule/api.py) provides a forward-only delta-rule implementation. `head_first=True` uses `[B,H,T,D]`; `BT` is currently fixed at 64.
 - [`chunk_gdn2`](./src/flag_attn/gdn2/chunk.py) dispatches between native Triton, TLE, and vendor-specific GDN2 forward paths.
 - [`chunk_kda`](./src/flag_attn/FLA/chunk_kda.py) is an inference API. The generic CUDA path requires Triton TLE 3.6 or newer, inference mode, BF16 inputs, `K=V=128`, chunk size 16, V-first state, and gate parameters; vendor implementations may differ.
-- [`parallel_nsa`](./src/flag_attn/parallel_nsa) contains Native Sparse Attention selection and compression operators with fixed-length and packed-variable-length support. `parallel_nsa` needs either precomputed `block_indices` or `g_cmp`, and `Hq/Hkv` must be a multiple of 16. Sliding-window composition additionally needs `g_swa` and the external `flash-attn` package. For fixed-length input, the compression API consumes full-length Q and K/V with time dimension `ceil(T / block_size)`, then returns `(output, lse)`; packed input stores the per-sequence compressed blocks consecutively. Its registered test/benchmark coverage currently targets Enflame.
+- [`parallel_nsa`](./src/flag_attn/parallel_nsa) contains Native Sparse Attention selection and compression operators with fixed-length and packed-variable-length support. `parallel_nsa` needs either precomputed `block_indices` or `g_cmp`, and `Hq/Hkv` must be a power of two and at least 16. Sliding-window composition additionally needs `g_swa` and the external `flash-attn` package. For fixed-length input, the compression API consumes full-length Q and K/V with time dimension `ceil(T / block_size)`, then returns `(output, lse)`; packed input stores the per-sequence compressed blocks consecutively. The registered NSA tests import the Enflame-specific modules, so they do not establish coverage for the public `flag_attn.parallel_nsa` submodule on other backends.
 
 These alpha APIs are optimized for specific model layouts. Read their docstrings and tests before integrating them; arguments and backend constraints may change.
 
@@ -277,7 +293,7 @@ cd benchmark
 pytest -m "sage_attention" --record json --output benchmark_sage_attention.json -vs
 ```
 
-The benchmarks report latency and, where meaningful, matmul-based throughput. Historical v0.2 plots remain under [`assets/v0.2`](./assets/v0.2); rerun the current benchmark for conclusions about current code, Triton, and hardware.
+The scheduler command runs accuracy tests before benchmarks; it is not benchmark-only. Benchmarks report latency and, where meaningful, matmul-based throughput. Note that `flash_decoding_benchmark.py` currently returns milliseconds despite a `tflop/s` plot-axis label, so interpret that script's values as latency. Historical v0.2 plots remain under [`assets/v0.2`](./assets/v0.2); rerun the current benchmark for conclusions about current code, Triton, and hardware.
 
 ## Repository layout
 

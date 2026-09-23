@@ -105,7 +105,7 @@ pip install PyYAML pytest
 pip install dist/flag_attn-*.whl
 ```
 
-项目没有 `setup.py`，构建使用 PEP 517 和 setuptools-scm。Debian/RPM 运行时说明见 [`packaging/INSTALL.md`](./packaging/INSTALL.md)。
+项目没有 `setup.py`，构建使用 PEP 517 和 setuptools-scm。Debian/RPM 运行时说明见 [`packaging/INSTALL.md`](./packaging/INSTALL.md)。当前发行包的依赖声明与安装说明不一定会同时提供 PyYAML 和 pytest，请确保运行 `import flag_attn` 的 Python 环境中已安装这两个包。
 
 ## 快速开始
 
@@ -162,11 +162,19 @@ out, lse, total, seed, offset = flash_attention(
 ### Piecewise Attention
 
 ```python
+import torch
 from flag_attn import piecewise_attention
+
+B, H, M, N, D = 1, 2, 128, 128, 64
+q1 = torch.randn(B, H, M, D, device="cuda", dtype=torch.float16)
+q2 = torch.randn_like(q1)
+k1 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+k2 = torch.randn_like(k1)
+v = torch.randn_like(k1)
 
 out = piecewise_attention(
     q1, k1, q2, k2, v,
-    dist_threshold=2048,
+    dist_threshold=32,
     causal=True,
 )
 ```
@@ -175,7 +183,7 @@ out = piecewise_attention(
 
 Piecewise Attention 最初用于 NLPE（Non-Linearized Position Embedding），[Aquila-2-34B](https://github.com/FlagAI-Open/Aquila2) 使用它在距离超过阈值时切换位置表示。
 
-[`examples`](./examples) 中还包含面向 CUDA 的脚本，但其中部分属于历史示例，可能滞后于当前返回值约定；测试代码是更权威的调用示例。用于验证的 PyTorch 参考实现通过 `flag_attn.testing` 暴露。
+[`examples`](./examples) 中还包含面向 CUDA 的脚本，但其中部分属于历史示例。例如，[`examples/flash_attention_with_aux_outputs.py`](./examples/flash_attention_with_aux_outputs.py) 仍只解包三个返回值，而当前辅助输出 API 固定返回五个值；在该脚本更新前请使用上面的五值示例。测试代码是更权威的调用示例。用于验证的 PyTorch 参考实现通过 `flag_attn.testing` 暴露。
 
 ## 推理与稀疏 API
 
@@ -185,7 +193,7 @@ Piecewise Attention 最初用于 NLPE（Non-Linearized Position Embedding），[
 from flag_attn import flash_attention_split_kv, paged_attention
 ```
 
-`flash_attention_split_kv` 是面向长 KV 任务的显式纯前向 API。它接收 `q: [B,Hq,M,D]` 和 `k/v: [B,Hkv,N,D]`，要求 `Hq % Hkv == 0`，并支持 `D` 属于 `{16,32,64,128}`。每个 split 分别计算局部输出和 log-normalizer，第二个 kernel 再通过全局 logsumexp 合并。
+`flash_attention_split_kv` 是面向长 KV 任务的显式纯前向 API。它接收 `q: [B,Hq,M,D]` 和 `k/v: [B,Hkv,N,D]`，要求 `Hq % Hkv == 0`，并支持 `D` 属于 `{16,32,64,128}`。当实际选择多个 split 时，每个 split 分别计算局部输出和 log-normalizer，第二个 kernel 再通过全局 logsumexp 合并；只有一个 split 时直接返回结果。
 
 `paged_attention` 的输入为：
 
@@ -197,7 +205,9 @@ context_lens: [num_sequences]
 block_tables: [num_sequences, max_blocks_per_sequence]
 ```
 
-算子会自动选择单次计算或 partition + reduce 实现，也可用 `num_splits` 覆盖选择。K/V cache 必须具有相同的 shape 和 stride；支持的 head size 为 `{16,32,64,128,256,512}`，group padding 后的 grouped-query 布局要求每个 cache block 至少包含 16 个 token。完整示例见 [`examples/paged_example.py`](./examples/paged_example.py)。
+算子会自动选择单次计算或 partition + reduce 实现，也可用 `num_splits` 覆盖选择。K/V cache 必须具有相同的 shape 和 stride；支持的 head size 为 `{16,32,64,128,256,512}`，当 `num_query_heads > num_kv_heads` 时，cache block size 必须至少为 16 个 token。显式设置 `num_splits > 1` 时，计算得到的 partition size 还必须不小于 cache block size，且能被它整除。完整示例见 [`examples/paged_example.py`](./examples/paged_example.py)。
+
+调用方式为 `paged_attention(query, key_cache, value_cache, context_lens, block_tables, attn_scale, max_context_len, num_splits=0)`，返回与 `query` 同形状的输出。`attn_scale` 是 softmax 缩放系数（通常为 `head_size**-0.5`），`max_context_len` 是 batch 内最大的上下文长度。
 
 ### MiniMax M3 稀疏注意力
 
@@ -214,13 +224,19 @@ Decode: minimax_m3_index_decode（score + top-k）
 仅计算 decode score：minimax_m3_index_decode_score
 ```
 
-稀疏 attention kernel 支持 GQA 和 BF16 KV cache，并在支持的硬件上支持带 scale 的 FP8 cache。这些函数仅用于推理，由调用方提供 paged cache、序列元数据、block table 和输出 buffer。精确调用约定见 [`src/flag_attn/minimax_sparse_attention`](./src/flag_attn/minimax_sparse_attention)，端到端用法见 [`tests/flag_attn/test_minimax_sparse_attention.py`](./tests/flag_attn/test_minimax_sparse_attention.py)。
+稀疏 attention kernel 支持 GQA 和 BF16 KV cache，并在支持的硬件上支持带 scale 的 FP8 cache。这些函数仅用于推理，由调用方提供 paged cache、序列元数据和 block table。稀疏 prefill/decode 必须传入 `output` buffer，结果写入该 buffer，函数返回 `None`；索引打分/Top-K 函数返回 tensor，其中部分函数可选择传入复用的输出 buffer。精确参数见 [`src/flag_attn/minimax_sparse_attention`](./src/flag_attn/minimax_sparse_attention) 中的函数签名，端到端用法见 [`tests/flag_attn/test_minimax_sparse_attention.py`](./tests/flag_attn/test_minimax_sparse_attention.py)。
 
 ### SageAttention
 
 ```python
+import torch
 from flag_attn.sage_attention import forward as sage_attention
 from flag_attn.sage_attention import per_block_int8
+
+B, H, N, D = 1, 2, 128, 64
+q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+k = torch.randn_like(q)
+v = torch.randn_like(q)
 
 q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k, tensor_layout="HND")
 out, lse = sage_attention(
@@ -242,7 +258,7 @@ GLA、GDN2 和 KDA 使用 sequence-first `[B,T,H,D]`。Gated Delta Rule 默认 `
 - [`chunk_gated_delta_rule`](./src/flag_attn/FLA/gated_delta_rule/api.py) 是纯前向 delta-rule 实现；`head_first=True` 时布局为 `[B,H,T,D]`，当前 `BT` 固定为 64。
 - [`chunk_gdn2`](./src/flag_attn/gdn2/chunk.py) 在原生 Triton、TLE 和厂商特化的 GDN2 前向路径之间派发。
 - [`chunk_kda`](./src/flag_attn/FLA/chunk_kda.py) 是推理 API。通用 CUDA 路径要求 Triton TLE 3.6 或更高版本、inference mode、BF16 输入、`K=V=128`、chunk size 16、V-first state 和 gate 参数；厂商实现的约束可能不同。
-- [`parallel_nsa`](./src/flag_attn/parallel_nsa) 包含 Native Sparse Attention 选择及压缩算子，支持定长和 packed varlen。`parallel_nsa` 必须提供预计算的 `block_indices` 或 `g_cmp`，且 `Hq/Hkv` 必须是 16 的倍数；组合 sliding-window 时还需要 `g_swa` 和外部 `flash-attn` 包。对于定长输入，Compression API 接收全长 Q，以及时间维为 `ceil(T / block_size)` 的 K/V，返回 `(output, lse)`；packed 输入会依次存放各序列的压缩块。当前算子清单中登记的测试/benchmark 主要面向 Enflame。
+- [`parallel_nsa`](./src/flag_attn/parallel_nsa) 包含 Native Sparse Attention 选择及压缩算子，支持定长和 packed varlen。`parallel_nsa` 必须提供预计算的 `block_indices` 或 `g_cmp`，且 `Hq/Hkv` 必须是至少 16 的 2 的幂；组合 sliding-window 时还需要 `g_swa` 和外部 `flash-attn` 包。对于定长输入，Compression API 接收全长 Q，以及时间维为 `ceil(T / block_size)` 的 K/V，返回 `(output, lse)`；packed 输入会依次存放各序列的压缩块。登记的 NSA 测试直接导入 Enflame 专用模块，不能据此推断公开的 `flag_attn.parallel_nsa` 子模块已在其他后端得到验证。
 
 这些 alpha API 针对特定模型布局进行了优化。集成前请阅读对应 docstring 和测试，其参数与后端约束仍可能变化。
 
@@ -293,7 +309,7 @@ cd benchmark
 pytest -m "sage_attention" --record json --output benchmark_sage_attention.json -vs
 ```
 
-Benchmark 报告延迟，并在适用时报告基于矩阵乘运算量计算的吞吐率。历史 v0.2 图表仍保存在 [`assets/v0.2`](./assets/v0.2)；评估当前代码、Triton 和硬件时应重新运行当前 benchmark。
+调度器命令会先执行精度测试、再运行 benchmark，并非仅测性能。Benchmark 报告延迟，并在适用时报告基于矩阵乘运算量计算的吞吐率。注意，`flash_decoding_benchmark.py` 当前返回的是毫秒，虽然图表纵轴标为 `tflop/s`，因此应将该脚本数值按延迟解读。历史 v0.2 图表仍保存在 [`assets/v0.2`](./assets/v0.2)；评估当前代码、Triton 和硬件时应重新运行当前 benchmark。
 
 ## 仓库结构
 
