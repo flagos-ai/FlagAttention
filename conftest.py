@@ -50,21 +50,67 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "benchmark_result.json for benchmarks)"
         ),
     )
+    group.addoption(
+        "--quick",
+        action="store_true",
+        default=False,
+        help=(
+            "Compatibility option for the shared FlagOS test runner. "
+            "FlagAttention tests currently keep their declared parameter sets."
+        ),
+    )
+    group.addoption(
+        "--collect-marks",
+        action="store",
+        default=None,
+        metavar="PATH",
+        help="Write collected non-built-in pytest marks to PATH as JSON/YAML data.",
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    if config.getoption("flag_attn_record") != "json":
-        return
+    if config.getoption("flag_attn_record") == "json":
+        output = config.getoption("flag_attn_output")
+        if output is None:
+            output = (
+                _DEFAULT_BENCHMARK_REPORT_FILE
+                if _is_benchmark_invocation(config)
+                else _DEFAULT_ACCURACY_REPORT_FILE
+            )
+        recorder = _JsonResultRecorder(Path(output), config.rootpath)
+        config.pluginmanager.register(recorder, "flag-attention-json-result-recorder")
 
-    output = config.getoption("flag_attn_output")
-    if output is None:
-        output = (
-            _DEFAULT_BENCHMARK_REPORT_FILE
-            if _is_benchmark_invocation(config)
-            else _DEFAULT_ACCURACY_REPORT_FILE
-        )
-    recorder = _JsonResultRecorder(Path(output), config.rootpath)
-    config.pluginmanager.register(recorder, "flag-attention-json-result-recorder")
+    marks_output = config.getoption("collect_marks")
+    if marks_output:
+        collector = _MarkCollector(Path(marks_output))
+        config.pluginmanager.register(collector, "flag-attention-mark-collector")
+
+
+class _MarkCollector:
+    """Collect operator marks for the shared FlagOS runner."""
+
+    def __init__(self, output: Path) -> None:
+        self.output = output
+        self.items: list[dict[str, Any]] = []
+
+    def pytest_collection_modifyitems(
+        self, session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
+    ) -> None:
+        for item in items:
+            marks = [
+                mark.name
+                for mark in item.iter_markers()
+                if mark.name not in _BUILTIN_MARKS
+            ]
+            self.items.append({"nodeid": item.nodeid, "marks": sorted(set(marks))})
+
+    def pytest_sessionfinish(
+        self, session: pytest.Session, exitstatus: pytest.ExitCode
+    ) -> None:
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        with self.output.open("w", encoding="utf-8") as stream:
+            json.dump(self.items, stream, indent=2)
+            stream.write("\n")
 
 
 class _JsonResultRecorder:

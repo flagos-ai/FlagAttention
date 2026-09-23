@@ -310,10 +310,19 @@ def probe_environment() -> dict[str, Any]:
     except (AttributeError, OSError):
         os_release = {}
 
+    try:
+        import distro
+
+        os_name = distro.id()
+        os_version = distro.version()
+    except ImportError:
+        os_name = os_release.get("ID", platform.system())
+        os_version = os_release.get("VERSION_ID", platform.release())
+
     environment: dict[str, Any] = {
         "architecture": platform.machine(),
-        "os_name": os_release.get("ID", platform.system()),
-        "os_release": os_release.get("VERSION_ID", platform.release()),
+        "os_name": os_name,
+        "os_release": os_version,
         "python": platform.python_version(),
     }
 
@@ -356,7 +365,16 @@ def probe_environment() -> dict[str, Any]:
         flag_attn_version = metadata.version("flag_attn")
     except metadata.PackageNotFoundError:
         flag_attn_version = "source tree"
-    environment["flag_attn"] = {"version": flag_attn_version}
+    try:
+        import flag_attn
+
+        environment["flag_attn"] = {
+            "version": getattr(flag_attn, "__version__", flag_attn_version),
+            "vendor": getattr(flag_attn, "vendor_name", "unknown"),
+            "device": getattr(flag_attn, "device", "unknown"),
+        }
+    except Exception as exc:
+        raise RuntimeError(f"FlagAttention cannot be imported: {exc}") from exc
     return environment
 
 
@@ -640,11 +658,18 @@ def run_accuracy(
         "no:cacheprovider",
         "--tb=short",
         "-ra",
+        "--continue-on-collection-errors",
     ]
     if config["dump_output"]:
         # Match the reference runners' -s behavior so prints from passing tests
         # are present in accuracy_stdout.log as well as failure diagnostics.
         command.append("-s")
+    if config["quick"]:
+        command.append("--quick")
+    # The FlagGems runner adds `--ref cpu` for tests that have a CPU reference.
+    # FlagAttention does not implement that pytest option: its tests use the
+    # repository's own `flag_attn.testing` references and are CUDA-oriented.
+    # Keep this intentionally disabled instead of passing an unsupported option.
     exit_code, duration, _ = run_command(
         command,
         cwd=Path(config["root"]),
@@ -1076,6 +1101,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="timeout for each benchmark script",
     )
     parser.add_argument(
+        "--quick",
+        action="store_true",
+        help=(
+            "enable the shared runner's quick-test option; FlagAttention currently "
+            "keeps the test-declared parameter sets"
+        ),
+    )
+    parser.add_argument(
         "--list-ops",
         action="store_true",
         help="list selected inventory entries without probing GPUs",
@@ -1168,6 +1201,7 @@ def main(argv: list[str] | None = None) -> int:
         "skip_benchmarks": args.skip_benchmarks,
         "accuracy_timeout": args.timeout,
         "benchmark_timeout": args.benchmark_timeout,
+        "quick": args.quick,
     }
     write_json(
         output_dir / "run_config.json",
@@ -1179,6 +1213,7 @@ def main(argv: list[str] | None = None) -> int:
             "skip_benchmarks": args.skip_benchmarks,
             "accuracy_timeout": args.timeout,
             "benchmark_timeout": args.benchmark_timeout,
+            "quick": args.quick,
         },
     )
     # Initialize this run's summaries before workers start.  This prevents a
