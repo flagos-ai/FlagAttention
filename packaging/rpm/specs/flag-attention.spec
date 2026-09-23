@@ -103,7 +103,11 @@ echo "OK: all package __init__.py files from src/ present in buildroot"
 %files
 %license LICENSE
 %{python3_sitelib}/flag_attn/
-%{python3_sitelib}/flag_attn-%{version}.dist-info/
+# Globbed, not %%{version}: the dist-info directory is named for the version
+# in pyproject.toml, which need not equal this spec's Version -- a release
+# pipeline may stamp one and not the other. Binding them made the build
+# fail with "Directory not found".
+%{python3_sitelib}/flag_attn-*.dist-info/
 %endif
 
 %changelog
