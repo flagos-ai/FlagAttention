@@ -309,7 +309,9 @@ cd benchmark
 pytest -m "sage_attention" --record json --output benchmark_sage_attention.json -vs
 ```
 
-调度器命令会先执行精度测试、再运行 benchmark，并非仅测性能。每个算子的可读输出保存在 `performance_stdout.log`；各 benchmark 脚本的结构化结果分别保存在同目录的 `performance_records_0.log`、`performance_records_1.log` 等文件中。这些结果使用与 FlagGems 兼容的 `[INFO] {` 单行 JSON 格式，包含输入形状、基线延迟、FlagAttention 延迟和可计算时的加速比。没有基线时，原始记录中的 `speedup` 为 `null`；`--record json` 会略过这些形状，使 FlagGems 将该 dtype 标为 `Unknown`。为兼容旧版调度器，未设置记录路径时直接运行脚本仍会向标准输出打印机器记录；如需干净的直接运行输出，可设置 `FLAG_ATTN_BENCHMARK_LOG_PATH=/path/to/records.log`。Benchmark 同时保留原有的表格、图表和基于矩阵乘运算量计算的吞吐率；`flash_decoding_benchmark.py` 的图表纵轴现在正确标为毫秒。历史 v0.2 图表仍保存在 [`assets/v0.2`](./assets/v0.2)；评估当前代码、Triton 和硬件时应重新运行当前 benchmark。
+调度器命令会先执行精度测试、再运行 benchmark，并非仅测性能。每个算子的输出目录中，可读的 benchmark 输出保存在 `performance_stdout.log`；各 benchmark 脚本的结构化结果分别保存在 `performance_records_0.log`、`performance_records_1.log` 等文件中。这些结果使用与 FlagGems 兼容的 `[INFO] {` 单行 JSON 格式，包含输入形状、基线延迟、FlagAttention 延迟和可计算时的加速比。没有基线时，原始记录中的 `speedup` 为 `null`；与 FlagGems 兼容的 `--record json` 报告会略过这些形状，使 FlagGems 将该 dtype 标为 `Unknown`。
+
+为兼容旧版调度器，未设置记录路径时直接运行脚本仍会向标准输出打印机器记录；如需干净的直接运行输出，可设置 `FLAG_ATTN_BENCHMARK_LOG_PATH=/path/to/records.log`。Benchmark 同时保留原有的表格、图表和基于矩阵乘运算量计算的吞吐率；`flash_decoding_benchmark.py` 的图表纵轴现在正确标为毫秒。历史 v0.2 图表仍保存在 [`assets/v0.2`](./assets/v0.2)；评估当前代码、Triton 和硬件时应重新运行当前 benchmark。
 
 ## 仓库结构
 
