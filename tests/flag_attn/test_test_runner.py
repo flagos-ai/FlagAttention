@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host-only regressions for test outcomes and the scheduler's exit status."""
+"""Regression tests for the FlagGems-compatible FlagAttention runner."""
 
 import importlib
 import json
-import os
-import signal
-import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -27,414 +25,258 @@ import pytest
 
 @pytest.fixture(scope="module")
 def runner():
-    # The environment may contain an unrelated installed package named tools.
-    # Keep the script importable under its own name for spawned workers too.
+    """Import the script as a module without requiring accelerator hardware."""
+
     tools_path = str(Path(__file__).resolve().parents[2] / "tools")
     sys.path.insert(0, tools_path)
+    fake_modules = {}
+    sentinel = object()
+
     try:
+        fake_flag_attn = types.ModuleType("flag_attn")
+        fake_flag_attn.__version__ = "test-version"
+        fake_flag_attn.vendor_name = "nvidia"
+        fake_flag_attn.device = "cuda"
+        fake_modules["flag_attn"] = sys.modules.get("flag_attn", sentinel)
+        sys.modules["flag_attn"] = fake_flag_attn
+
+        fake_distro = types.ModuleType("distro")
+        fake_distro.id = lambda: "test-os"
+        fake_distro.version = lambda: "test-version"
+        fake_modules["distro"] = sys.modules.get("distro", sentinel)
+        sys.modules["distro"] = fake_distro
+
         yield importlib.import_module("run_tests")
     finally:
+        sys.modules.pop("run_tests", None)
         sys.path.remove(tools_path)
+        for name, previous in fake_modules.items():
+            if previous is sentinel:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
 
 
-@pytest.mark.parametrize(
-    "source,exit_code,status,counts",
-    [
-        (
-            'import pytest\npytest.importorskip("flagattention_missing_test_accelerator")\n',
-            5,
-            "Skipped",
-            {"passed": 0, "failed": 0, "errors": 0, "skipped": 1},
+def test_parse_perf_data_emits_upload_shape_and_dtype_tree(tmp_path, runner):
+    report = tmp_path / "benchmark.json"
+    report.write_text(
+        json.dumps(
+            {
+                "sample": {
+                    "result": "passed",
+                    "test_case": "benchmark/test_sample.py::test_sample",
+                    "details": [
+                        {
+                            "dtype": "torch.float16",
+                            "result": [
+                                {
+                                    "shape_detail": [1, 64],
+                                    "latency_base": 2.0,
+                                    "latency": 1.0,
+                                    "speedup": 2.0,
+                                },
+                                {
+                                    "shape_detail": [128, 256],
+                                    "latency_base": 4.0,
+                                    "latency": 2.0,
+                                    "speedup": 2.0,
+                                },
+                            ],
+                        },
+                        {
+                            "dtype": "torch.float32",
+                            "result": [
+                                {
+                                    "shape_detail": [1, 64],
+                                    "latency_base": 3.0,
+                                    "latency": 2.0,
+                                    "speedup": 1.5,
+                                }
+                            ],
+                        },
+                    ],
+                }
+            }
         ),
-        (
-            "VALUE = 1\n",
-            5,
-            "NotFound",
-            {"passed": 0, "failed": 0, "errors": 0, "skipped": 0},
-        ),
-        (
-            'raise RuntimeError("collection failed")\n',
-            2,
-            "Error",
-            {"passed": 0, "failed": 0, "errors": 1, "skipped": 0},
-        ),
-        (
-            "def test_failure():\n    assert False\n",
-            1,
-            "Failed",
-            {"passed": 0, "failed": 1, "errors": 0, "skipped": 0},
-        ),
-    ],
-    ids=["module-skip", "no-tests", "collection-error", "test-failure"],
-)
-def test_pytest_junit_outcomes(tmp_path, runner, source, exit_code, status, counts):
-    test_file = tmp_path / "test_outcome.py"
-    test_file.write_text(source)
-    junit = tmp_path / "results.xml"
-    environment = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            str(test_file),
-            f"--junitxml={junit}",
-            "-p",
-            "no:cacheprovider",
-            "-q",
-        ],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
-        timeout=30,
+        encoding="utf-8",
     )
-    assert completed.returncode == exit_code, completed.stdout + completed.stderr
-    result = runner.parse_junit(junit, completed.returncode)
-    assert result["status"] == status
-    assert {key: result[key] for key in counts} == counts
-    if status == "Skipped":
-        assert "flagattention_missing_test_accelerator" in result["details"]["skipped"][0]["reason"]
 
-
-@pytest.mark.parametrize("case", ["accuracy", "performance", "no-tests", "no-benchmark"])
-def test_run_summary_and_exit_code(tmp_path, monkeypatch, runner, case):
-    test_file = tmp_path / "test_operator.py"
-    test_file.write_text(
-        "VALUE = 1\n" if case == "no-tests" else f"def test_operator():\n    assert {case != 'accuracy'}\n"
-    )
-    benchmark = tmp_path / "benchmark.py"
-    benchmark.write_text(f"raise SystemExit({int(case == 'performance')})\n")
-    operator = {
-        "id": "host_regression",
-        "current_stage": "alpha",
-        "tests": [str(test_file)],
-        "benchmarks": [] if case == "no-benchmark" else [str(benchmark)],
-        "benchmark_requires": [],
-    }
-    monkeypatch.setattr(runner, "load_inventory", lambda: [operator])
-    monkeypatch.setattr(runner, "probe_environment", lambda: {"torch": {"device_count": 1}})
-    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
-    output_dir = tmp_path / "results"
-    previous_handler = signal.getsignal(signal.SIGTERM)
-    previous_workers = list(runner.WORKER_PROCESSES)
-    try:
-        exit_code = runner.main(
-            ["--stages", "all", "--output", str(output_dir), "--color", "never"]
-        )
-    finally:
-        signal.signal(signal.SIGTERM, previous_handler)
-        runner.WORKER_PROCESSES[:] = previous_workers
-
-    summary = json.loads((output_dir / "summary.json").read_text())
-    assert exit_code == (0 if case == "no-benchmark" else 1)
-    assert summary["status"] == ("passed" if case == "no-benchmark" else "failed")
-    phase = "performance" if case in {"performance", "no-benchmark"} else "accuracy"
-    status = "NotFound" if case in {"no-tests", "no-benchmark"} else "Failed"
-    assert summary["result"]["host_regression"][phase]["status"] == status
-
-
-def test_incomplete_worker_results_are_failures(tmp_path, runner):
-    results = runner.aggregate_results([{"id": "unfinished"}], [0], tmp_path)
-    assert results["unfinished"]["accuracy"]["status"] == "Error"
-    assert results["unfinished"]["performance"]["status"] == "Error"
-    assert runner.has_failures(results)
-
-
-def test_standalone_benchmark_records_sidecar_without_console_json(tmp_path, runner):
-    benchmark = tmp_path / "synthetic_benchmark.py"
-    benchmark.write_text(
-        "from benchmark.recording import benchmark_metric, record_benchmark_result\n"
-        "record_benchmark_result(None, op_name='synthetic', dtype='torch.float16', "
-        "result=[benchmark_metric(shape_detail=(2, 128), latency_base=2.0, "
-        "latency=1.0, speedup=2.0)])\n"
-    )
-    output_dir = tmp_path / "results"
-    result = runner.run_performance(
-        {
-            "id": "synthetic",
-            "benchmarks": [str(benchmark)],
-            "benchmark_requires": [],
-        },
-        0,
-        {
-            "root": str(Path(__file__).resolve().parents[2]),
-            "output_dir": str(output_dir),
-            "python": sys.executable,
-            "benchmark_timeout": 30,
-            "dump_output": False,
-            "skip_benchmarks": False,
-        },
-    )
+    result = runner.parse_perf_data("sample", report)
 
     assert result["status"] == "Passed"
-    stdout = (output_dir / "synthetic" / "performance_stdout.log").read_text()
-    assert "[INFO] {" not in stdout
-    records_path = output_dir / "synthetic" / "performance_records_0.log"
-    records = [
-        json.loads(line[len("[INFO] ") :])
-        for line in records_path.read_text().splitlines()
-        if line.startswith("[INFO] {")
-    ]
-    assert len(records) == 1
-    assert records[0]["op_name"] == "synthetic"
-    assert records[0]["result"][0]["speedup"] == 2.0
-    assert result["details"][0]["record_count"] == 1
-    assert result["details"][0]["record_file"] == "synthetic/performance_records_0.log"
-    assert result["details"][0]["measurement"] == "records"
+    assert result["test_case"].endswith("test_sample")
+    assert result["data"]["fp16"]["speedup"] == 2.0
+    assert result["data"]["fp16"]["details"]["[1,64]"] == {
+        "base": 2.0,
+        "gems": 1.0,
+        "speedup": 2.0,
+    }
+    assert result["data"]["fp32"]["speedup"] == 1.5
 
 
-def test_direct_benchmark_retains_stdout_records_for_older_runners(tmp_path, runner):
-    benchmark = tmp_path / "direct_benchmark.py"
-    benchmark.write_text(
-        "from benchmark.recording import benchmark_metric, record_benchmark_result\n"
-        "record_benchmark_result(None, op_name='synthetic', dtype='torch.float16', "
-        "result=[benchmark_metric(shape_detail=(2, 128), latency_base=2.0, "
-        "latency=1.0, speedup=2.0)])\n"
-    )
-    repo_root = Path(__file__).resolve().parents[2]
-    environment = os.environ.copy()
-    environment.pop("FLAG_ATTN_BENCHMARK_LOG_PATH", None)
-    environment["PYTHONPATH"] = os.pathsep.join(
-        [str(repo_root), environment.get("PYTHONPATH", "")]
-    )
-    completed = subprocess.run(
-        [sys.executable, "-u", str(benchmark)],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    stdout_path = tmp_path / "performance_stdout.log"
-    stdout_path.write_text(completed.stdout)
-    assert runner.count_flaggems_records(stdout_path) == 1
-    record = json.loads(completed.stdout.removeprefix("[INFO] "))
-    assert record["result"][0]["speedup"] == 2.0
-
-
-@pytest.mark.parametrize(
-    "output",
-    [
-        "plain benchmark table",
-        "[INFO] {malformed json}",
-        "[INFO] " + json.dumps({"op_name": "synthetic", "result": [{"speedup": 2.0}]}),
-        "[INFO] "
-        + json.dumps(
+def test_parse_perf_data_keeps_missing_speedup_as_null(tmp_path, runner):
+    report = tmp_path / "benchmark.json"
+    report.write_text(
+        json.dumps(
             {
-                "op_name": "synthetic",
-                "dtype": "float16",
-                "mode": "kernel",
-                "level": "comprehensive",
-                "result": [],
+                "sample": {
+                    "result": "passed",
+                    "details": [
+                        {
+                            "dtype": "torch.float8_e5m2",
+                            "native_baseline_skip_reason": "baseline unavailable",
+                            "result": [
+                                {
+                                    "shape_detail": [1],
+                                    "latency_base": None,
+                                    "latency": 1.0,
+                                    "speedup": None,
+                                }
+                            ],
+                        }
+                    ],
+                }
             }
         ),
-        "[INFO] "
-        + json.dumps(
-            {
-                "op_name": "synthetic",
-                "dtype": "float16",
-                "mode": "kernel",
-                "level": "comprehensive",
-                "result": [{"shape_detail": [1]}],
-            }
-        ),
-        None,
-    ],
-    ids=[
-        "no-record",
-        "invalid-json",
-        "missing-header",
-        "empty-result",
-        "missing-metric",
-        "silent",
-    ],
-)
-def test_standalone_benchmark_requires_parseable_record(tmp_path, runner, output):
-    benchmark = tmp_path / "synthetic_benchmark.py"
-    benchmark.write_text("pass\n" if output is None else f"print({output!r})\n")
-    output_dir = tmp_path / "results"
-    result = runner.run_performance(
-        {
-            "id": "synthetic",
-            "benchmarks": [str(benchmark)],
-            "benchmark_requires": [],
-        },
-        0,
-        {
-            "root": str(Path(__file__).resolve().parents[2]),
-            "output_dir": str(output_dir),
-            "python": sys.executable,
-            "benchmark_timeout": 30,
-            "dump_output": False,
-            "skip_benchmarks": False,
-        },
+        encoding="utf-8",
     )
 
-    assert result["status"] == "Failed"
-    assert result["details"][0]["exit_code"] == 0
-    assert result["details"][0]["record_count"] == 0
-    assert "valid [INFO] JSON result record" in result["details"][0]["error"]
+    result = runner.parse_perf_data("sample", report)
 
-
-def test_standalone_benchmark_validates_each_appended_script(tmp_path, runner):
-    first = tmp_path / "first.py"
-    first.write_text(
-        "from benchmark.recording import benchmark_metric, record_benchmark_result\n"
-        "record_benchmark_result(None, op_name='synthetic', dtype='torch.float16', "
-        "result=[benchmark_metric(shape_detail=(2, 128), latency_base=2.0, "
-        "latency=1.0, speedup=2.0)])\n"
-    )
-    second = tmp_path / "second.py"
-    second.write_text("print('human-readable table only')\n")
-    output_dir = tmp_path / "results"
-    result = runner.run_performance(
-        {
-            "id": "synthetic",
-            "benchmarks": [str(first), str(second)],
-            "benchmark_requires": [],
-        },
-        0,
-        {
-            "root": str(Path(__file__).resolve().parents[2]),
-            "output_dir": str(output_dir),
-            "python": sys.executable,
-            "benchmark_timeout": 30,
-            "dump_output": False,
-            "skip_benchmarks": False,
-        },
-    )
-
-    assert result["status"] == "Failed"
-    assert [item["status"] for item in result["details"]] == ["Passed", "Failed"]
-    assert [item["record_count"] for item in result["details"]] == [1, 0]
-    assert not (output_dir / "synthetic" / "performance_records_1.log").exists()
-
-
-def test_standalone_benchmark_does_not_reuse_stale_records(tmp_path, runner):
-    benchmark = tmp_path / "synthetic_benchmark.py"
-    benchmark.write_text(
-        "from benchmark.recording import benchmark_metric, record_benchmark_result\n"
-        "record_benchmark_result(None, op_name='synthetic', dtype='torch.float16', "
-        "result=[benchmark_metric(shape_detail=(2, 128), latency=1.0)])\n"
-    )
-    output_dir = tmp_path / "results"
-    operator = {
-        "id": "synthetic",
-        "benchmarks": [str(benchmark)],
-        "benchmark_requires": [],
-    }
-    config = {
-        "root": str(Path(__file__).resolve().parents[2]),
-        "output_dir": str(output_dir),
-        "python": sys.executable,
-        "benchmark_timeout": 30,
-        "dump_output": False,
-        "skip_benchmarks": False,
-    }
-
-    assert runner.run_performance(operator, 0, config)["status"] == "Passed"
-    benchmark.write_text("print('human-readable table only')\n")
-    result = runner.run_performance(operator, 0, config)
-    assert result["status"] == "Failed"
-    assert result["details"][0]["record_count"] == 0
-    assert not (output_dir / "synthetic" / "performance_records_0.log").exists()
-
-
-def test_standalone_benchmark_rejects_invalid_sidecar(tmp_path, runner):
-    benchmark = tmp_path / "invalid_benchmark.py"
-    benchmark.write_text(
-        "import os\n"
-        "from pathlib import Path\n"
-        "Path(os.environ['FLAG_ATTN_BENCHMARK_LOG_PATH']).write_text("
-        "'[INFO] {malformed json}\\n')\n"
-    )
-    output_dir = tmp_path / "results"
-    result = runner.run_performance(
-        {
-            "id": "invalid",
-            "benchmarks": [str(benchmark)],
-            "benchmark_requires": [],
-        },
-        0,
-        {
-            "root": str(Path(__file__).resolve().parents[2]),
-            "output_dir": str(output_dir),
-            "python": sys.executable,
-            "benchmark_timeout": 30,
-            "dump_output": False,
-            "skip_benchmarks": False,
-        },
-    )
-    assert result["status"] == "Failed"
-    assert result["details"][0]["record_count"] == 0
-    assert (output_dir / "invalid" / "performance_records_0.log").exists()
-
-
-def test_standalone_benchmark_accepts_legacy_stdout_records(tmp_path, runner):
-    benchmark = tmp_path / "legacy_benchmark.py"
-    benchmark.write_text(
-        "import json\n"
-        "print('[INFO] ' + json.dumps({"
-        "'op_name': 'legacy', 'dtype': 'torch.float16', "
-        "'mode': 'kernel', 'level': 'comprehensive', "
-        "'result': [{'shape_detail': [2, 128], 'latency_base': 2.0, "
-        "'latency': 1.0, 'speedup': 2.0}]}))\n"
-    )
-    output_dir = tmp_path / "results"
-    result = runner.run_performance(
-        {
-            "id": "legacy",
-            "benchmarks": [str(benchmark)],
-            "benchmark_requires": [],
-        },
-        0,
-        {
-            "root": str(Path(__file__).resolve().parents[2]),
-            "output_dir": str(output_dir),
-            "python": sys.executable,
-            "benchmark_timeout": 30,
-            "dump_output": False,
-            "skip_benchmarks": False,
-        },
-    )
     assert result["status"] == "Passed"
-    assert result["details"][0]["record_count"] == 1
-    assert result["details"][0]["record_file"] == "legacy/performance_stdout.log"
+    assert result["data"]["float8_e5m2"]["result"] == "OK"
+    assert result["data"]["float8_e5m2"]["speedup"] is None
 
 
-def test_flaggems_record_requires_numeric_timing(tmp_path, runner):
-    def log_record(**metric_overrides):
-        metric = {
-            "shape_detail": [1, 128],
-            "latency_base": 2.0,
-            "latency": 1.0,
-            "speedup": 2.0,
-        }
-        metric.update(metric_overrides)
-        return "[INFO] " + json.dumps(
-            {
-                "op_name": "synthetic",
-                "dtype": "torch.float16",
-                "mode": "kernel",
-                "level": "comprehensive",
-                "result": [metric],
-            }
-        )
+def test_probe_flag_attn_records_library_metadata(runner):
+    runner.ENV_INFO.clear()
+    runner._probe_flagattn()
 
-    stdout = tmp_path / "performance_stdout.log"
-    stdout.write_text(
-        "\n".join(
-            [
-                log_record(speedup="2x"),
-                log_record(latency=float("nan")),
-                log_record(latency=None),
-                log_record(latency=0),
-                log_record(speedup=True),
-                log_record(latency_base=None, speedup=None),
-            ]
-        )
-        + "\n"
+    assert runner.ENV_INFO["flag_attn"] == {
+        "version": "test-version",
+        "vendor": "nvidia",
+        "device": "cuda",
+    }
+
+
+def test_probe_env_preserves_all_shared_environment_sections(monkeypatch, runner):
+    runner.ENV_INFO.clear()
+
+    monkeypatch.setattr(runner.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(runner.platform, "python_version", lambda: "3.12.0")
+    monkeypatch.setattr(runner.distro, "id", lambda: "ubuntu")
+    monkeypatch.setattr(runner.distro, "version", lambda: "24.04")
+
+    def probe_torch():
+        runner.ENV_INFO["torch"] = {"version": "test-torch"}
+
+    def probe_triton():
+        runner.ENV_INFO["flagtree"] = "test-flagtree"
+        runner.ENV_INFO["triton"] = {"version": "test-triton"}
+
+    def probe_flag_attn():
+        runner.ENV_INFO["flag_attn"] = {"version": "test-flag-attn"}
+
+    def probe_vllm():
+        runner.ENV_INFO["vllm"] = {"version": "test-vllm"}
+
+    monkeypatch.setattr(runner, "_probe_torch", probe_torch)
+    monkeypatch.setattr(runner, "_probe_triton", probe_triton)
+    monkeypatch.setattr(runner, "_probe_flagattn", probe_flag_attn)
+    monkeypatch.setattr(runner, "_probe_vllm", probe_vllm)
+
+    runner.probe_env()
+
+    assert runner.ENV_INFO == {
+        "architecture": "x86_64",
+        "os_name": "ubuntu",
+        "os_release": "24.04",
+        "python": "3.12.0",
+        "torch": {"version": "test-torch"},
+        "flagtree": "test-flagtree",
+        "triton": {"version": "test-triton"},
+        "flag_attn": {"version": "test-flag-attn"},
+        "vllm": {"version": "test-vllm"},
+    }
+
+
+def test_get_env_matches_shared_vendor_masking_without_path_injection(
+    monkeypatch, runner
+):
+    runner.ENV_INFO.clear()
+    runner.ENV_INFO["flag_attn"] = {"vendor": "nvidia"}
+    monkeypatch.setenv("PYTHONPATH", "caller-controlled-path")
+
+    env = runner.get_env("2")
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert env["PYTHONPATH"] == "caller-controlled-path"
+
+
+def test_runner_commands_and_summary_processing_match_shared_flow(
+    monkeypatch, tmp_path, runner
+):
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    runner.ENV_INFO.clear()
+    runner.ENV_INFO["flag_attn"] = {"vendor": "nvidia"}
+    runner.CFG.output_dir = tmp_path / "results"
+    runner.CFG.dump_output = False
+    runner.CFG.quick = False
+    runner.CFG.all_op_ids = {"sample"}
+    runner.CFG.customized_ops = {"sample"}
+    runner.CFG.output_dir.mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "benchmark").mkdir()
+
+    commands = []
+
+    def fake_run_cmd(op, cmd, cwd=None, env=None, timeout=1800, flavor=None):
+        commands.append((cmd, flavor, cwd, env))
+        if flavor == "accuracy":
+            (Path(cwd) / "accuracy_sample.json").write_text(
+                json.dumps({"sample[case]": {"result": "passed", "params": {}}}),
+                encoding="utf-8",
+            )
+        else:
+            (Path(cwd) / "benchmark_sample.json").write_text(
+                json.dumps(
+                    {
+                        "sample": {
+                            "result": "passed",
+                            "details": [
+                                {
+                                    "dtype": "torch.float16",
+                                    "result": [
+                                        {
+                                            "shape_detail": [1],
+                                            "latency_base": 2.0,
+                                            "latency": 1.0,
+                                            "speedup": 2.0,
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return 0
+
+    monkeypatch.setattr(runner, "run_cmd", fake_run_cmd)
+
+    accuracy = runner.run_accuracy_q(0, "sample")
+    performance = runner.run_benchmark_q(0, "sample")
+
+    assert commands[0][0] == (
+        'pytest -m "sample" --record json --output accuracy_sample.json '
+        "--continue-on-collection-errors -vs"
     )
-    assert runner.count_flaggems_records(stdout) == 1
+    assert commands[1][0] == (
+        'pytest -m "sample" --level core --record json '
+        "--output benchmark_sample.json --continue-on-collection-errors"
+    )
+    assert accuracy["status"] == "Passed"
+    assert performance["data"]["fp16"]["details"]["[1]"]["speedup"] == 2.0
+    assert (runner.CFG.output_dir / "sample" / "accuracy_result.json").exists()
+    assert (runner.CFG.output_dir / "sample" / "performance_result.json").exists()

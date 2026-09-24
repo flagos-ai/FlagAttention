@@ -83,6 +83,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         ),
     )
     group.addoption(
+        "--level",
+        action="store",
+        default=None,
+        help="Compatibility option accepted by the shared FlagOS benchmark runner.",
+    )
+    group.addoption(
         "--collect-marks",
         action="store",
         default=None,
