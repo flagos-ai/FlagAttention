@@ -100,6 +100,7 @@ def test_forward_matches_dequantized_reference(tensor_layout, num_kv_heads):
     torch.testing.assert_close(actual_lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.sage_attention
 def test_forward_rejects_non_positive_maxnreg():
     q = torch.zeros((1, 1, 128, 64), device="cuda", dtype=torch.int8)
     k = torch.zeros_like(q)

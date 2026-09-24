@@ -9,6 +9,8 @@ from flag_attn import chunk_gated_delta_rule
 from flag_attn.FLA.gated_delta_rule import chunk_gated_delta_rule_fwd
 from flag_attn.utils import has_triton_tle
 
+pytestmark = pytest.mark.chunk_gated_delta_rule_fwd
+
 ASSERT_RATIO = 0.01
 RECOMPUTE_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_RECOMPUTE_TLE"
 FULL_TLE_ENV = "FLAG_ATTN_CHUNK_GATED_DELTA_RULE_TLE"

@@ -205,6 +205,7 @@ def test_chunk_gdn2_matches_native_triton(impl, dtype, shape):
     _assert_close("ht", actual_final, expected_final)
 
 
+@pytest.mark.chunk_gdn2
 def test_k1_tle_resource_controls_are_enabled():
     module = importlib.import_module("flag_attn.gdn2.chunk")
     if not module.HAS_TLE_GDN2:

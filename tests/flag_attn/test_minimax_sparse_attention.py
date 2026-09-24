@@ -61,6 +61,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.minimax_m3_sparse_attn
 def test_public_exports_use_active_backend() -> None:
     from flag_attn.runtime.backend import is_metax_backend
 
@@ -73,6 +74,7 @@ def test_public_exports_use_active_backend() -> None:
         assert module_name.startswith("flag_attn.minimax_sparse_attention")
 
 
+@pytest.mark.minimax_m3_sparse_attn
 def test_metax_public_exports() -> None:
     from flag_attn.runtime.backend import is_metax_backend
 

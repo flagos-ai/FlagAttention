@@ -244,6 +244,7 @@ def _record_result(
 
 
 @pytest.mark.chunk_gated_delta_rule
+@pytest.mark.chunk_gated_delta_rule_fwd
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN external benchmark requires CUDA/TLE"
 )

@@ -30,6 +30,7 @@ def _accelerator_available() -> bool:
 
 pytestmark = [
     pytest.mark.chunk_kda,
+    pytest.mark.chunk_kda_enflame,
     pytest.mark.skipif(
         not _accelerator_available(),
         reason="chunk_kda tests require an available Enflame GCU",
