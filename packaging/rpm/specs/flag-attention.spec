@@ -18,7 +18,7 @@
 # user-side pip install incantation.
 %global __requires_exclude ^python3(\.[0-9]+)?dist\((triton)\)$
 Name:           python3-flag-attention
-# NOTE: version is duplicated across 4 places — keep them in sync when bumping:
+# NOTE: version is duplicated across 3 packaging locations — keep them in sync:
 #   1. this Version: line
 #   2. packaging/debian/changelog (latest entry)
 #   3. packaging/debian/rules SETUPTOOLS_SCM_PRETEND_VERSION
@@ -26,7 +26,7 @@ Name:           python3-flag-attention
 #  they self-update with the Version: line above. %% escaped: openEuler's
 #  rpm expands macros even in comments and a bare %%install here would
 #  terminate the preamble.)
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        FlagAttention — memory-efficient attention operators (Triton)
 
@@ -107,6 +107,9 @@ echo "OK: all package __init__.py files from src/ present in buildroot"
 %endif
 
 %changelog
+* Thu Sep 24 2026 FlagOS Contributors <contact@flagos.io> - 0.4.0-1
+- Update the package version to 0.4.0.
+
 * Mon Jul 13 2026 FlagOS Contributors <contact@flagos.io> - 0.3.0-1
 - Add pip-based fallback for distros without pyproject-rpm-macros
   (openEuler 24.03); Fedora build path unchanged.
