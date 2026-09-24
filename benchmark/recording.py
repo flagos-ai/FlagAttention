@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import json
+import math
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 
 BENCHMARK_RESULT_PROPERTY = "flag_attn_benchmark_result"
 RecordProperty = Callable[[str, object], None]
+_MULTIPHASE_LOG_OPERATORS = {"chunk_gla", "minimax_m3_sparse_attn"}
 
 _METRIC_DEFAULTS = {
     "legacy_shape": None,
@@ -31,7 +34,7 @@ _METRIC_DEFAULTS = {
 def benchmark_metric(
     *,
     shape_detail: Any,
-    latency: float,
+    latency: float | None,
     latency_base: float | None = None,
     speedup: float | None = None,
     **extra: Any,
@@ -59,10 +62,8 @@ def record_benchmark_result(
     level: str = "comprehensive",
     **metadata: Any,
 ) -> None:
-    """Submit one dtype/phase result to the repository pytest recorder."""
+    """Write a FlagGems log record and submit it to the pytest JSON recorder."""
 
-    if record_property is None:
-        return
     detail = {
         "level": level,
         "op_name": op_name,
@@ -71,4 +72,107 @@ def record_benchmark_result(
         "result": [dict(metric) for metric in result],
     }
     detail.update(metadata)
-    record_property(BENCHMARK_RESULT_PROPERTY, detail)
+    log_detail = detail.copy()
+    if op_name in _MULTIPHASE_LOG_OPERATORS and metadata.get("phase"):
+        # FlagGems' summary groups by op_name and dtype but ignores phase.
+        # Distinct names retain every phase when one log contains both.
+        log_detail["op_name"] = f"{op_name}_{metadata['phase']}"
+    # FlagGems' summary_for_plot.parse_log reads only single-line JSON records
+    # prefixed by "[INFO] ". Direct script execution has no pytest recorder,
+    # so the console record is the common output for both entry points.
+    print(f"[INFO] {json.dumps(_json_safe(log_detail), default=str)}", flush=True)
+    if record_property is not None:
+        record_property(BENCHMARK_RESULT_PROPERTY, detail)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Mapping):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def record_triton_report(
+    report: Any,
+    dataframes: Any,
+    *,
+    op_name: str,
+    provider: str,
+    baseline: str,
+    latency_from_value: Callable[[float, Mapping[str, Any]], float],
+) -> None:
+    """Record the provider columns returned by a Triton perf_report run.
+
+    Triton prints throughput or latency tables, but FlagGems' parser needs
+    per-shape latency and speedup fields. The caller supplies the inverse of
+    its benchmark's return-value formula so these fields retain their units.
+    """
+
+    configs = report.benchmarks
+    if not isinstance(configs, (list, tuple)):
+        configs = [configs]
+        dataframes = [dataframes]
+    if len(configs) != len(dataframes):
+        raise ValueError("Triton benchmark configuration/result count mismatch")
+
+    by_dtype: dict[str, list[dict[str, Any]]] = {}
+    baseline_present: dict[str, bool] = {}
+    for config, dataframe in zip(configs, dataframes):
+        if provider not in config.line_vals:
+            raise ValueError(f"{op_name}: missing provider {provider!r}")
+        provider_name = config.line_names[config.line_vals.index(provider)]
+        provider_column = f"{provider_name} ({config.ylabel})"
+        baseline_column = None
+        if baseline in config.line_vals:
+            baseline_name = config.line_names[config.line_vals.index(baseline)]
+            baseline_column = f"{baseline_name} ({config.ylabel})"
+
+        dtype = str(config.args.get("dtype", "unknown"))
+        metrics = by_dtype.setdefault(dtype, [])
+        baseline_present[dtype] = baseline_present.get(dtype, False) or baseline_column is not None
+        for _, row in dataframe.iterrows():
+            shape_detail = {**config.args}
+            for name in config.x_names:
+                value = row[name]
+                shape_detail[name] = int(value) if float(value).is_integer() else float(value)
+
+            measured = float(row[provider_column])
+            latency = latency_from_value(measured, shape_detail)
+            baseline_latency = None
+            if baseline_column is not None:
+                baseline_measured = float(row[baseline_column])
+                baseline_latency = latency_from_value(baseline_measured, shape_detail)
+
+            valid = math.isfinite(latency) and latency > 0
+            baseline_valid = (
+                baseline_latency is not None
+                and math.isfinite(baseline_latency)
+                and baseline_latency > 0
+            )
+            error_msg = None
+            if not valid:
+                error_msg = "provider latency is unavailable"
+            elif baseline_column is not None and not baseline_valid:
+                error_msg = f"{baseline} baseline latency is unavailable"
+
+            metrics.append(
+                benchmark_metric(
+                    shape_detail=shape_detail,
+                    latency=latency if valid else None,
+                    latency_base=baseline_latency if baseline_valid else None,
+                    speedup=(baseline_latency / latency if valid and baseline_valid else None),
+                    error_msg=error_msg,
+                )
+            )
+
+    for dtype, metrics in by_dtype.items():
+        record_benchmark_result(
+            None,
+            op_name=op_name,
+            dtype=dtype,
+            result=metrics,
+            baseline=baseline if baseline_present[dtype] else None,
+        )

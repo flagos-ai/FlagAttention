@@ -295,7 +295,7 @@ def run_benchmark(
             torch.cuda.empty_cache()
         record_benchmark_result(
             record_property,
-            op_name="chunk_gated_delta_rule",
+            op_name="chunk_gated_delta_rule_fwd",
             dtype=str(dtype),
             result=metrics,
             baseline="FLA",

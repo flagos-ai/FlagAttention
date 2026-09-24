@@ -293,7 +293,7 @@ cd benchmark
 pytest -m "sage_attention" --record json --output benchmark_sage_attention.json -vs
 ```
 
-The scheduler command runs accuracy tests before benchmarks; it is not benchmark-only. Benchmarks report latency and, where meaningful, matmul-based throughput. Note that `flash_decoding_benchmark.py` currently returns milliseconds despite a `tflop/s` plot-axis label, so interpret that script's values as latency. Historical v0.2 plots remain under [`assets/v0.2`](./assets/v0.2); rerun the current benchmark for conclusions about current code, Triton, and hardware.
+The scheduler runs accuracy tests before benchmarks. Each operator's `performance_stdout.log` is retained under its output directory. Single-line JSON records beginning with `[INFO] {` follow the FlagGems benchmark log format and contain shapes, baseline latency, FlagAttention latency, and speedup when a baseline is available. Benchmarks without a baseline record `speedup` as `null`. Existing tables, plots, and matmul-based throughput remain available; the `flash_decoding_benchmark.py` plot axis now correctly says milliseconds. Historical v0.2 plots remain under [`assets/v0.2`](./assets/v0.2); rerun the current benchmark for conclusions about current code, Triton, and hardware.
 
 ## Repository layout
 

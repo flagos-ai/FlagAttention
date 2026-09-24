@@ -14,12 +14,20 @@
 
 import argparse
 import math
+import sys
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 import triton
 
 from flag_attn.FLA.chunk_kda import chunk_kda_fwd_infer
+
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:  # Direct execution from benchmark/test_FLA.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from recording import benchmark_metric, record_benchmark_result
 
 try:
     import flash_kda
@@ -158,8 +166,37 @@ def main() -> None:
 
     torch.manual_seed(42)
     print(f"GPU: {torch.cuda.get_device_name()} | dtype=bfloat16 | D={D_HEAD}")
+    metrics = []
     for name, seq_lens in cases:
-        benchmark_case(name, seq_lens, args.heads, args.warmup, args.rep, providers)
+        results = benchmark_case(name, seq_lens, args.heads, args.warmup, args.rep, providers)
+        if "tle" in results:
+            latency = results["tle"][0]
+            baseline = results.get("flash-kda")
+            baseline_ms = baseline[0] if baseline is not None else None
+            metrics.append(
+                benchmark_metric(
+                    shape_detail={
+                        "case": name,
+                        "seq_lens": seq_lens,
+                        "H": args.heads,
+                        "D": D_HEAD,
+                    },
+                    latency_base=baseline_ms,
+                    latency=latency,
+                    speedup=baseline_ms / latency if baseline_ms is not None else None,
+                )
+            )
+
+    if metrics:
+        record_benchmark_result(
+            None,
+            op_name="chunk_kda",
+            dtype=str(torch.bfloat16),
+            result=metrics,
+            baseline="FlashKDA" if "flash-kda" in providers else None,
+        )
+    else:
+        print("[benchmark] FlagAttention TLE provider not selected; no speedup record")
 
 
 if __name__ == "__main__":

@@ -309,7 +309,7 @@ cd benchmark
 pytest -m "sage_attention" --record json --output benchmark_sage_attention.json -vs
 ```
 
-调度器命令会先执行精度测试、再运行 benchmark，并非仅测性能。Benchmark 报告延迟，并在适用时报告基于矩阵乘运算量计算的吞吐率。注意，`flash_decoding_benchmark.py` 当前返回的是毫秒，虽然图表纵轴标为 `tflop/s`，因此应将该脚本数值按延迟解读。历史 v0.2 图表仍保存在 [`assets/v0.2`](./assets/v0.2)；评估当前代码、Triton 和硬件时应重新运行当前 benchmark。
+调度器命令会先执行精度测试、再运行 benchmark，并非仅测性能。每个 benchmark 的 `performance_stdout.log` 会保存在输出目录的算子子目录；以 `[INFO] {` 开头的单行 JSON 与 FlagGems benchmark log 格式一致，包含输入形状、基线延迟、FlagAttention 延迟和可计算时的加速比。没有基线的测试会把 `speedup` 记为 `null`。Benchmark 同时保留原有的表格、图表和基于矩阵乘运算量计算的吞吐率；`flash_decoding_benchmark.py` 的图表纵轴现在正确标为毫秒。历史 v0.2 图表仍保存在 [`assets/v0.2`](./assets/v0.2)；评估当前代码、Triton 和硬件时应重新运行当前 benchmark。
 
 ## 仓库结构
 

@@ -27,6 +27,11 @@ from flag_attn.runtime.backend._enflame.FLA.nsa.parallel_nsa_compression import 
     parallel_nsa_compression,
 )
 
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:  # Direct execution from the benchmark directory.
+    from recording import benchmark_metric, record_benchmark_result
+
 
 @dataclass(frozen=True)
 class BenchmarkCase:
@@ -427,6 +432,29 @@ def main() -> None:
         f"min_ms={min(samples):.6f}",
         f"max_ms={max(samples):.6f}",
         flush=True,
+    )
+    record_benchmark_result(
+        None,
+        op_name="parallel_nsa_compression" if args.mode == "compression" else "parallel_nsa",
+        dtype=str(dtype),
+        result=[
+            benchmark_metric(
+                shape_detail={
+                    "case": args.case,
+                    "mode": args.mode,
+                    "batch": case.batch,
+                    "tokens": case.tokens,
+                    "kv_heads": case.kv_heads,
+                    "query_heads": case.query_heads,
+                    "head_dim": case.head_dim,
+                    "selected_blocks": args.selected_blocks,
+                    "block_size": args.block_size,
+                },
+                latency=median,
+            )
+        ],
+        phase="forward",
+        baseline=None,
     )
     print(
         "S60 NSA FORMAL BENCHMARK PASS",

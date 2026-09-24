@@ -12,9 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import torch
 import triton
 import flag_attn
+
+try:
+    from benchmark.recording import record_triton_report
+except ModuleNotFoundError:  # Direct execution from the benchmark directory.
+    from recording import record_triton_report
 
 NUM_BLOCKS = 1000
 warmup = 200
@@ -202,4 +208,25 @@ def paged_attention_benchmark_with_vllm(
 
 if not HAS_VLLM:
     print(f"[baseline] vLLM 0.3 paged attention unavailable: {VLLM_IMPORT_ERROR}")
-paged_attention_benchmark_with_vllm.run(print_data=True)
+def _latency_from_tflops(tflops, shape):
+    if not math.isfinite(tflops) or tflops <= 0:
+        return math.inf
+    flops = (
+        4.0
+        * shape['num_seqs']
+        * shape['num_query_heads']
+        * shape['context_len']
+        * shape['head_size']
+    )
+    return flops / tflops * 1e-9
+
+
+results = paged_attention_benchmark_with_vllm.run(print_data=True, return_df=True)
+record_triton_report(
+    paged_attention_benchmark_with_vllm,
+    results,
+    op_name='paged_attention',
+    provider='triton',
+    baseline='vllm',
+    latency_from_value=_latency_from_tflops,
+)

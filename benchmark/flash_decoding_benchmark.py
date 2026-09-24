@@ -14,11 +14,17 @@
 
 import datetime
 import logging
+import math
 import pathlib
 import torch
 import triton
 
 import flag_attn
+
+try:
+    from benchmark.recording import record_triton_report
+except ModuleNotFoundError:  # Direct execution from the benchmark directory.
+    from recording import record_triton_report
 
 
 try:
@@ -40,7 +46,7 @@ configs = [triton.testing.Benchmark(
     line_vals=['flag_attn', 'torch', ] + (['flash'] if HAS_FLASH else []),
     line_names=['flag_attn', 'torch', ] + ([f'flash-{FLASH_VER}'] if HAS_FLASH else []),
     styles=[('red', '-'), ('green', '-'), ('blue', '-'), ('cyan', '-')],
-    ylabel='tflop/s',
+    ylabel='ms',
     plot_name=f'attention_d-{D_HEAD}_dtype-{dtype} (ms)',
     args={'D_HEAD': D_HEAD, 'dtype': dtype}
 ) for D_HEAD in [64, 128]
@@ -84,4 +90,12 @@ def bench_flash_attention(N_CTX, D_HEAD, provider, dtype=torch.float16):
 today = datetime.date.today().strftime(format("%Y%m%d"))
 output_dir = pathlib.Path(f"results_flash_attention_with_split_kv_{today}")
 output_dir.mkdir(exist_ok=True)
-bench_flash_attention.run(save_path=output_dir, print_data=True)
+results = bench_flash_attention.run(save_path=output_dir, print_data=True, return_df=True)
+record_triton_report(
+    bench_flash_attention,
+    results,
+    op_name='flash_attention_split_kv',
+    provider='flag_attn',
+    baseline='torch',
+    latency_from_value=lambda value, shape: value if math.isfinite(value) else math.inf,
+)

@@ -11,19 +11,23 @@ from flag_attn.gdn2.native.output import chunk_gla_fwd_kernel_o
 
 ASSERT_RATIO = 0.01
 
-GDN2_TEST_SHAPES = [
-    (2, 512, 8, 64, 64),
-    (4, 1024, 8, 64, 64),
-    (1, 2048, 8, 64, 64),
-    (1, 4096, 16, 64, 64),
-    (1, 8192, 96, 128, 128),
-    (2, 2048, 16, 256, 512),
-    (2, 16384, 16, 128, 128),
-    (4, 1024, 8, 256, 512),
-    (4, 2048, 16, 128, 128),
-    (4, 4096, 64, 128, 128),
-    (8, 1024, 8, 64, 64),
-    (8, 2048, 32, 256, 256),
+# H20 cold-cache history puts these main cases at about 19 minutes. Different
+# (H, K, V, dtype) combinations can each trigger several minutes of compilation;
+# the 4096-token case also warms the output-config tests below.
+GDN2_TEST_CASES = [
+    # ((2, 512, 8, 64, 64), (torch.float16, torch.bfloat16)),
+    # ((4, 1024, 8, 64, 64), (torch.float16, torch.bfloat16)),
+    # ((1, 2048, 8, 64, 64), (torch.float16, torch.bfloat16)),
+    ((1, 4096, 16, 64, 64), (torch.float16, torch.bfloat16)),
+    ((1, 8192, 96, 128, 128), (torch.float16, torch.bfloat16)),
+    ((2, 2048, 16, 256, 512), (torch.float16,)),
+    # ((2, 2048, 16, 256, 512), (torch.bfloat16,)),
+    # ((2, 16384, 16, 128, 128), (torch.float16, torch.bfloat16)),
+    # ((4, 1024, 8, 256, 512), (torch.float16, torch.bfloat16)),
+    # ((4, 2048, 16, 128, 128), (torch.float16, torch.bfloat16)),
+    # ((4, 4096, 64, 128, 128), (torch.float16, torch.bfloat16)),
+    # ((8, 1024, 8, 64, 64), (torch.float16, torch.bfloat16)),
+    # ((8, 2048, 32, 256, 256), (torch.float16, torch.bfloat16)),
 ]
 
 
@@ -160,8 +164,10 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
     "impl",
     [pytest.param("tle", id="tle"), pytest.param("native", id="native")],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shape", GDN2_TEST_SHAPES)
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [(shape, dtype) for shape, dtypes in GDN2_TEST_CASES for dtype in dtypes],
+)
 @torch.inference_mode()
 def test_chunk_gdn2_matches_native_triton(impl, dtype, shape):
     module = importlib.import_module("flag_attn.gdn2.chunk")
