@@ -21,10 +21,12 @@ with scalar K/V dequantization scales passed to both implementations.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import sys
+import textwrap
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import pytest
@@ -108,6 +110,8 @@ FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 DEFAULT_WARMUP = 200
 DEFAULT_REP = 300
 KV_SCALE = 0.5
+BF16_ATOL = BF16_RTOL = 2e-2
+FP8_ATOL, FP8_RTOL = 6e-2, 8e-2
 
 PREFILL_SHAPES = [
     (1, 8192, 16, 96),
@@ -464,6 +468,121 @@ def _supports_fp8_scales() -> bool:
     )
 
 
+def _sparse_kv_layout(fn: Callable) -> str:
+    """Infer the cache contract from the actual vLLM wrapper's stride accesses."""
+    try:
+        source = inspect.getsource(inspect.unwrap(fn))
+        tree = ast.parse(textwrap.dedent(source))
+    except (OSError, TypeError, SyntaxError) as exc:
+        raise RuntimeError(
+            f"Cannot inspect vLLM {fn.__name__} KV cache layout; refusing to "
+            "report an unverified speedup."
+        ) from exc
+
+    indices: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if not (
+            isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "kv_cache"
+            and node.func.attr == "stride"
+        ):
+            continue
+        if (
+            len(node.args) != 1
+            or node.keywords
+            or not isinstance(node.args[0], ast.Constant)
+            or type(node.args[0].value) is not int
+        ):
+            raise RuntimeError(
+                f"Ambiguous vLLM {fn.__name__} KV cache stride access; "
+                "cannot select a safe cache layout."
+            )
+        indices.add(node.args[0].value)
+
+    layouts = {
+        frozenset(range(4)): "packed4d",
+        frozenset(range(5)): "split5d",
+    }
+    layout = layouts.get(frozenset(indices))
+    if layout is None:
+        raise RuntimeError(
+            f"Unknown vLLM {fn.__name__} KV cache stride indices "
+            f"{sorted(indices)}; cannot select a safe cache layout."
+        )
+    return layout
+
+
+def _vllm_kv_layout(prefill: Callable, decode: Callable) -> str:
+    prefill_layout = _sparse_kv_layout(prefill)
+    decode_layout = _sparse_kv_layout(decode)
+    if prefill_layout != decode_layout:
+        raise RuntimeError(
+            "vLLM prefill/decode KV cache layouts differ: "
+            f"{prefill_layout} vs {decode_layout}."
+        )
+    return prefill_layout
+
+
+def _vllm_data(data: MSAData, layout: str) -> MSAData:
+    if layout == "packed4d":
+        return data
+    if layout != "split5d":
+        raise ValueError(f"Unsupported vLLM KV cache layout: {layout}")
+    cache = data.kv_cache
+    if cache.ndim != 4 or cache.shape[-1] != 2 * HEAD_DIM:
+        raise ValueError(f"Unexpected FlagAttention KV cache shape: {tuple(cache.shape)}")
+    blocks, heads, tokens, _ = cache.shape
+    # 4D: [block, head, token, K|V] -> 5D: [block, K/V, token, head, dim].
+    # Convert after physical pages are randomized, preserving block_table indices.
+    legacy_cache = (
+        cache.reshape(blocks, heads, tokens, 2, HEAD_DIM)
+        .permute(0, 3, 2, 1, 4)
+        .contiguous()
+    )
+    return replace(data, kv_cache=legacy_cache)
+
+
+def _check_outputs(
+    flag_output: torch.Tensor,
+    vllm_output: torch.Tensor,
+    *,
+    shape: tuple[int, int, int, int],
+    dtype_name: str,
+    mode: str,
+    layout: str,
+) -> float:
+    context = f"{mode}, {dtype_name}, shape={shape}, vLLM layout={layout}"
+    for provider, output in (("FlagAttention", flag_output), ("vLLM", vllm_output)):
+        if not torch.isfinite(output).all().item():
+            raise AssertionError(f"{provider} produced NaN or Inf ({context})")
+
+    atol, rtol = (
+        (FP8_ATOL, FP8_RTOL) if dtype_name == "fp8" else (BF16_ATOL, BF16_RTOL)
+    )
+    try:
+        torch.testing.assert_close(flag_output, vllm_output, atol=atol, rtol=rtol)
+    except AssertionError as exc:
+        diff = (flag_output.float() - vllm_output.float()).abs()
+        raise AssertionError(
+            f"FlagAttention/vLLM output mismatch ({context}); "
+            f"max_abs_diff={diff.max().item():.6g}, atol={atol}, rtol={rtol}"
+        ) from exc
+
+    flag_flat = flag_output.float().flatten()
+    vllm_flat = vllm_output.float().flatten()
+    flag_norm = torch.linalg.vector_norm(flag_flat)
+    vllm_norm = torch.linalg.vector_norm(vllm_flat)
+    cosine = torch.where(
+        (flag_norm == 0) & (vllm_norm == 0),
+        torch.ones_like(flag_norm),
+        torch.dot(flag_flat, vllm_flat)
+        / (flag_norm * vllm_norm).clamp_min(torch.finfo(torch.float32).tiny),
+    )
+    return cosine.clamp(-1.0, 1.0).item()
+
+
 def _bench_steps(
     data: MSAData,
     decode: bool,
@@ -599,6 +718,11 @@ def _run_dtype(
     if dtype_name == "fp8" and run_vllm and not _supports_fp8_scales():
         print("[baseline] vLLM FP8 skipped: k_scale/v_scale are unavailable")
         run_vllm = False
+    vllm_layout = (
+        _vllm_kv_layout(vllm_sparse_attn, vllm_sparse_attn_decode)
+        if run_vllm
+        else None
+    )
 
     mode = f"decode qlen={args.decode_qlen}" if args.decode else "prefill"
     use_identity_pages = args.identity_pages or dtype_name == "fp8"
@@ -612,13 +736,16 @@ def _run_dtype(
     )
     print("Timing: eager execution with CUDA events")
     if run_vllm:
+        print(f"vLLM KV cache layout: {vllm_layout}; outputs checked before timing")
         print("Provider order: alternates by shape")
     else:
         print("vLLM baseline: unavailable; FlagAttn only")
 
     headers = [("Shape [B,S,KVH,H]", 22), ("FlagAttn(ms)", 13)]
     if run_vllm:
-        headers.extend([("vLLM(ms)", 10), ("vLLM/ours", 10)])
+        headers.extend(
+            [("vLLM(ms)", 10), ("vLLM/ours", 10), ("Cosine", 9), ("Match", 6)]
+        )
     if args.per_step:
         if args.decode:
             headers.extend([("IdxDec(ms)", 11), ("AttnDec(ms)", 11)])
@@ -657,6 +784,7 @@ def _run_dtype(
             randomize_pages=not use_identity_pages,
             generator=generator,
         )
+        vllm_data = _vllm_data(data, vllm_layout) if vllm_layout else None
         flag_attn_output = torch.empty_like(data.q)
         vllm_output = torch.empty_like(data.q) if run_vllm else None
 
@@ -690,11 +818,12 @@ def _run_dtype(
 
         def vllm_run() -> None:
             assert vllm_output is not None
+            assert vllm_data is not None
             if args.decode:
                 run_decode(
                     vllm_index_decode,
                     vllm_sparse_attn_decode,
-                    data,
+                    vllm_data,
                     seq_len,
                     num_kv_heads,
                     args.topk,
@@ -708,7 +837,7 @@ def _run_dtype(
                     vllm_index_score,
                     vllm_index_topk,
                     vllm_sparse_attn,
-                    data,
+                    vllm_data,
                     seq_len,
                     num_kv_heads,
                     args.topk,
@@ -718,7 +847,20 @@ def _run_dtype(
                 )
 
         vllm_ms = None
+        accuracy = None
         if run_vllm:
+            flag_attn_run()
+            vllm_run()
+            torch.cuda.synchronize()
+            assert vllm_output is not None and vllm_layout is not None
+            accuracy = _check_outputs(
+                flag_attn_output,
+                vllm_output,
+                shape=shape,
+                dtype_name=dtype_name,
+                mode=mode,
+                layout=vllm_layout,
+            )
             providers = (
                 (("flag_attn", flag_attn_run), ("vllm", vllm_run))
                 if shape_index % 2 == 0
@@ -742,6 +884,8 @@ def _run_dtype(
                 [
                     (f"{vllm_ms:.4f}", 10),
                     (f"{vllm_ms / flag_attn_ms:.2f}x", 10),
+                    (f"{accuracy:.6f}", 9),
+                    ("pass", 6),
                 ]
             )
         if args.per_step:
@@ -772,6 +916,7 @@ def _run_dtype(
                     if vllm_ms is not None and flag_attn_ms > 0
                     else None
                 ),
+                accuracy=accuracy,
                 steps=steps,
             )
         )
@@ -782,6 +927,7 @@ def _run_dtype(
         dtype=str(torch.bfloat16 if dtype_name == "bf16" else FP8_DTYPE),
         result=metrics,
         baseline="vLLM" if run_vllm else None,
+        vllm_kv_layout=vllm_layout,
         phase="decode" if args.decode else "prefill",
         topk=args.topk,
         decode_qlen=args.decode_qlen if args.decode else None,
