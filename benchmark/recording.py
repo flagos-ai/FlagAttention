@@ -5,13 +5,17 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
+import os
 from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 from typing import Any
 
 
 BENCHMARK_RESULT_PROPERTY = "flag_attn_benchmark_result"
+BENCHMARK_LOG_PATH_ENV = "FLAG_ATTN_BENCHMARK_LOG_PATH"
 RecordProperty = Callable[[str, object], None]
 _MULTIPHASE_LOG_OPERATORS = {"chunk_gla", "minimax_m3_sparse_attn"}
 
@@ -62,7 +66,7 @@ def record_benchmark_result(
     level: str = "comprehensive",
     **metadata: Any,
 ) -> None:
-    """Write a FlagGems log record and submit it to the pytest JSON recorder."""
+    """Write a FlagGems record to the configured sink or pytest recorder."""
 
     detail = {
         "level": level,
@@ -77,10 +81,24 @@ def record_benchmark_result(
         # FlagGems' summary groups by op_name and dtype but ignores phase.
         # Distinct names retain every phase when one log contains both.
         log_detail["op_name"] = f"{op_name}_{metadata['phase']}"
-    # FlagGems' summary_for_plot.parse_log reads only single-line JSON records
-    # prefixed by "[INFO] ". Direct script execution has no pytest recorder,
-    # so the console record is the common output for both entry points.
-    print(f"[INFO] {json.dumps(_json_safe(log_detail), default=str)}", flush=True)
+    # The updated runner provides a per-script log path, keeping JSON out of
+    # its human-readable stdout. Older runners launch scripts without that
+    # variable and parse stdout, so preserve their record stream. Pytest has
+    # its own recorder and needs neither stdout records nor a sidecar.
+    log_path = os.environ.get(BENCHMARK_LOG_PATH_ENV)
+    log_line = f"[INFO] {json.dumps(_json_safe(log_detail), default=str)}"
+    if log_path:
+        path = Path(log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                stream.write(log_line + "\n")
+                stream.flush()
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    elif record_property is None:
+        print(log_line, flush=True)
     if record_property is not None:
         record_property(BENCHMARK_RESULT_PROPERTY, detail)
 

@@ -11,6 +11,65 @@ import torch
 from benchmark import test_minimax_sparse_attention_benchmark as benchmark
 
 
+class _PlatformWithRocm:
+    device_type = "cuda"
+
+    def __init__(self, *, is_rocm: bool = False):
+        self.pdl_checks = 0
+        self.rocm_checks = 0
+        self._is_rocm = is_rocm
+
+    def is_arch_support_pdl(self):
+        self.pdl_checks += 1
+        return True
+
+    def is_rocm(self):
+        self.rocm_checks += 1
+        return self._is_rocm
+
+    def describe(self, device_name):
+        return f"{self.device_type}:{device_name}"
+
+
+def test_cached_platform_caches_pdl_and_delegates_other_platform_features():
+    original = _PlatformWithRocm()
+    cached = benchmark._CachedPlatform(original)
+
+    assert cached.is_arch_support_pdl() is True
+    assert cached.is_arch_support_pdl() is True
+    assert original.pdl_checks == 1
+    assert cached.is_rocm() is False
+    assert original.rocm_checks == 1
+    assert cached.device_type == "cuda"
+    assert cached.describe("H800") == "cuda:H800"
+    with pytest.raises(AttributeError):
+        cached.unknown_platform_feature
+
+
+@pytest.mark.parametrize(
+    "is_rocm,is_gfx942,expected_kwargs",
+    [
+        (False, False, {}),
+        (True, False, {}),
+        (True, True, {"num_stages": 1}),
+    ],
+)
+def test_cached_platform_supports_legacy_vllm_stage_selection(is_rocm, is_gfx942, expected_kwargs):
+    # Older vLLM sparse_attn.py calls current_platform.is_rocm() when
+    # choosing Triton num_stages, after the benchmark has wrapped that object.
+    original = _PlatformWithRocm(is_rocm=is_rocm)
+    cached = benchmark._CachedPlatform(original)
+
+    def legacy_sparse_attn_num_stages_kwarg():
+        kwarg = {}
+        if cached.is_rocm() and is_gfx942:
+            kwarg = {"num_stages": 1}
+        return kwarg
+
+    assert legacy_sparse_attn_num_stages_kwarg() == expected_kwargs
+    assert original.rocm_checks == 1
+
+
 def _packed_prefill(kv_cache):
     return (
         kv_cache.stride(0),

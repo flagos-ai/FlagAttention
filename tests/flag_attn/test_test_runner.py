@@ -141,7 +141,7 @@ def test_incomplete_worker_results_are_failures(tmp_path, runner):
     assert runner.has_failures(results)
 
 
-def test_standalone_benchmark_keeps_flaggems_compatible_log(tmp_path, runner):
+def test_standalone_benchmark_records_sidecar_without_console_json(tmp_path, runner):
     benchmark = tmp_path / "synthetic_benchmark.py"
     benchmark.write_text(
         "from benchmark.recording import benchmark_metric, record_benchmark_result\n"
@@ -169,15 +169,49 @@ def test_standalone_benchmark_keeps_flaggems_compatible_log(tmp_path, runner):
 
     assert result["status"] == "Passed"
     stdout = (output_dir / "synthetic" / "performance_stdout.log").read_text()
+    assert "[INFO] {" not in stdout
+    records_path = output_dir / "synthetic" / "performance_records_0.log"
     records = [
         json.loads(line[len("[INFO] ") :])
-        for line in stdout.splitlines()
+        for line in records_path.read_text().splitlines()
         if line.startswith("[INFO] {")
     ]
     assert len(records) == 1
     assert records[0]["op_name"] == "synthetic"
     assert records[0]["result"][0]["speedup"] == 2.0
     assert result["details"][0]["record_count"] == 1
+    assert result["details"][0]["record_file"] == "synthetic/performance_records_0.log"
+    assert result["details"][0]["measurement"] == "records"
+
+
+def test_direct_benchmark_retains_stdout_records_for_older_runners(tmp_path, runner):
+    benchmark = tmp_path / "direct_benchmark.py"
+    benchmark.write_text(
+        "from benchmark.recording import benchmark_metric, record_benchmark_result\n"
+        "record_benchmark_result(None, op_name='synthetic', dtype='torch.float16', "
+        "result=[benchmark_metric(shape_detail=(2, 128), latency_base=2.0, "
+        "latency=1.0, speedup=2.0)])\n"
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    environment.pop("FLAG_ATTN_BENCHMARK_LOG_PATH", None)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(repo_root), environment.get("PYTHONPATH", "")]
+    )
+    completed = subprocess.run(
+        [sys.executable, "-u", str(benchmark)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    stdout_path = tmp_path / "performance_stdout.log"
+    stdout_path.write_text(completed.stdout)
+    assert runner.count_flaggems_records(stdout_path) == 1
+    record = json.loads(completed.stdout.removeprefix("[INFO] "))
+    assert record["result"][0]["speedup"] == 2.0
 
 
 @pytest.mark.parametrize(
@@ -275,6 +309,99 @@ def test_standalone_benchmark_validates_each_appended_script(tmp_path, runner):
     assert result["status"] == "Failed"
     assert [item["status"] for item in result["details"]] == ["Passed", "Failed"]
     assert [item["record_count"] for item in result["details"]] == [1, 0]
+    assert not (output_dir / "synthetic" / "performance_records_1.log").exists()
+
+
+def test_standalone_benchmark_does_not_reuse_stale_records(tmp_path, runner):
+    benchmark = tmp_path / "synthetic_benchmark.py"
+    benchmark.write_text(
+        "from benchmark.recording import benchmark_metric, record_benchmark_result\n"
+        "record_benchmark_result(None, op_name='synthetic', dtype='torch.float16', "
+        "result=[benchmark_metric(shape_detail=(2, 128), latency=1.0)])\n"
+    )
+    output_dir = tmp_path / "results"
+    operator = {
+        "id": "synthetic",
+        "benchmarks": [str(benchmark)],
+        "benchmark_requires": [],
+    }
+    config = {
+        "root": str(Path(__file__).resolve().parents[2]),
+        "output_dir": str(output_dir),
+        "python": sys.executable,
+        "benchmark_timeout": 30,
+        "dump_output": False,
+        "skip_benchmarks": False,
+    }
+
+    assert runner.run_performance(operator, 0, config)["status"] == "Passed"
+    benchmark.write_text("print('human-readable table only')\n")
+    result = runner.run_performance(operator, 0, config)
+    assert result["status"] == "Failed"
+    assert result["details"][0]["record_count"] == 0
+    assert not (output_dir / "synthetic" / "performance_records_0.log").exists()
+
+
+def test_standalone_benchmark_rejects_invalid_sidecar(tmp_path, runner):
+    benchmark = tmp_path / "invalid_benchmark.py"
+    benchmark.write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['FLAG_ATTN_BENCHMARK_LOG_PATH']).write_text("
+        "'[INFO] {malformed json}\\n')\n"
+    )
+    output_dir = tmp_path / "results"
+    result = runner.run_performance(
+        {
+            "id": "invalid",
+            "benchmarks": [str(benchmark)],
+            "benchmark_requires": [],
+        },
+        0,
+        {
+            "root": str(Path(__file__).resolve().parents[2]),
+            "output_dir": str(output_dir),
+            "python": sys.executable,
+            "benchmark_timeout": 30,
+            "dump_output": False,
+            "skip_benchmarks": False,
+        },
+    )
+    assert result["status"] == "Failed"
+    assert result["details"][0]["record_count"] == 0
+    assert (output_dir / "invalid" / "performance_records_0.log").exists()
+
+
+def test_standalone_benchmark_accepts_legacy_stdout_records(tmp_path, runner):
+    benchmark = tmp_path / "legacy_benchmark.py"
+    benchmark.write_text(
+        "import json\n"
+        "print('[INFO] ' + json.dumps({"
+        "'op_name': 'legacy', 'dtype': 'torch.float16', "
+        "'mode': 'kernel', 'level': 'comprehensive', "
+        "'result': [{'shape_detail': [2, 128], 'latency_base': 2.0, "
+        "'latency': 1.0, 'speedup': 2.0}]}))\n"
+    )
+    output_dir = tmp_path / "results"
+    result = runner.run_performance(
+        {
+            "id": "legacy",
+            "benchmarks": [str(benchmark)],
+            "benchmark_requires": [],
+        },
+        0,
+        {
+            "root": str(Path(__file__).resolve().parents[2]),
+            "output_dir": str(output_dir),
+            "python": sys.executable,
+            "benchmark_timeout": 30,
+            "dump_output": False,
+            "skip_benchmarks": False,
+        },
+    )
+    assert result["status"] == "Passed"
+    assert result["details"][0]["record_count"] == 1
+    assert result["details"][0]["record_file"] == "legacy/performance_stdout.log"
 
 
 def test_flaggems_record_requires_numeric_timing(tmp_path, runner):

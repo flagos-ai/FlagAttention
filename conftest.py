@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
+from collections.abc import Mapping
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +31,21 @@ _BUILTIN_MARKS = {
 _BENCHMARK_RESULT_PROPERTY = "flag_attn_benchmark_result"
 _DEFAULT_ACCURACY_REPORT_FILE = "accuracy_result.json"
 _DEFAULT_BENCHMARK_REPORT_FILE = "benchmark_result.json"
+_BENCHMARK_DETAIL_FIELDS = ("op_name", "dtype", "mode", "level", "result")
+_BENCHMARK_METRIC_FIELDS = (
+    "legacy_shape",
+    "shape_detail",
+    "latency_base",
+    "latency",
+    "gbps_base",
+    "gbps",
+    "speedup",
+    "accuracy",
+    "tflops",
+    "utilization",
+    "compared_speedup",
+    "error_msg",
+)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -169,7 +187,26 @@ class _JsonResultRecorder:
             if report.when == "call":
                 for name, value in report.user_properties:
                     if name == _BENCHMARK_RESULT_PROPERTY:
-                        result["details"].append(value)
+                        detail = _normalize_benchmark_detail(value)
+                        identity = tuple(
+                            detail[field] for field in _BENCHMARK_DETAIL_FIELDS[:-1]
+                        )
+                        existing = next(
+                            (
+                                item
+                                for item in result["details"]
+                                if tuple(
+                                    item[field]
+                                    for field in _BENCHMARK_DETAIL_FIELDS[:-1]
+                                )
+                                == identity
+                            ),
+                            None,
+                        )
+                        if existing is None:
+                            result["details"].append(detail)
+                        else:
+                            existing["result"].extend(detail["result"])
         else:
             result = self.results.setdefault(
                 key,
@@ -209,6 +246,57 @@ class _JsonResultRecorder:
         self, session: pytest.Session, exitstatus: pytest.ExitCode
     ) -> None:
         _merge_json_report(self.output, self.results)
+
+
+def _normalize_benchmark_detail(value: Any) -> dict[str, Any]:
+    """Keep the exact BenchmarkResult/BenchmarkMetrics fields used by FlagGems."""
+
+    if not isinstance(value, Mapping):
+        raise TypeError("benchmark result property must be a mapping")
+    detail = {field: value[field] for field in _BENCHMARK_DETAIL_FIELDS[:-1]}
+    phase = value.get("phase")
+    metrics = []
+    for source in value["result"]:
+        if not isinstance(source, Mapping):
+            raise TypeError("benchmark metric must be a mapping")
+        # FlagGems' performance parser sums every speedup without checking for
+        # null. An operator-only measurement has no baseline and no speedup;
+        # leave its detail empty so the parser reports that dtype as Unknown.
+        if not _has_valid_baseline_speedup(source):
+            continue
+        metric = {field: source.get(field) for field in _BENCHMARK_METRIC_FIELDS}
+        shape = metric["shape_detail"]
+        if isinstance(shape, tuple) and all(
+            isinstance(dimension, int) and not isinstance(dimension, bool)
+            for dimension in shape
+        ):
+            # A single tensor shape is one entry in FlagGems' argument list.
+            shape = [list(shape)]
+        if phase:
+            # FlagGems represents positional inputs plus keyword arguments as
+            # [input_shapes, kwargs]. This keeps equal prefill/decode shapes
+            # distinct after the details for one dtype are merged below.
+            shape = [shape, {"phase": phase}]
+        metric["shape_detail"] = shape
+        metrics.append(metric)
+    detail["result"] = metrics
+    return detail
+
+
+def _has_valid_baseline_speedup(metric: Mapping[str, Any]) -> bool:
+    if metric.get("error_msg") is not None:
+        return False
+    return all(
+        isinstance(value, Real)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+        for value in (
+            metric.get("latency_base"),
+            metric.get("latency"),
+            metric.get("speedup"),
+        )
+    )
 
 
 def _report_reason(report: pytest.TestReport | pytest.CollectReport) -> str:

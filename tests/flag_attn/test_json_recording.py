@@ -11,6 +11,21 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+FLAGGEMS_DETAIL_FIELDS = {"op_name", "dtype", "mode", "level", "result"}
+FLAGGEMS_METRIC_FIELDS = {
+    "legacy_shape",
+    "shape_detail",
+    "latency_base",
+    "latency",
+    "gbps_base",
+    "gbps",
+    "speedup",
+    "accuracy",
+    "tflops",
+    "utilization",
+    "compared_speedup",
+    "error_msg",
+}
 
 
 def _run_pytest(tmp_path, test_name, source, *extra_args):
@@ -226,7 +241,9 @@ def test_partial_failure(record_property):
         record_property,
         op_name="partial_benchmark",
         dtype="torch.bfloat16",
-        result=[benchmark_metric(shape_detail=(4,), latency=0.5)],
+        result=[benchmark_metric(
+            shape_detail=(4,), latency_base=1.0, latency=0.5, speedup=2.0
+        )],
     )
     assert False, "benchmark failed after one result"
 
@@ -249,14 +266,25 @@ def test_skipped():
     assert benchmark["test_case"] == "benchmark/test_perf.py::test_perf"
     assert len(benchmark["details"]) == 1
     detail = benchmark["details"][0]
+    assert set(detail) == FLAGGEMS_DETAIL_FIELDS
     assert detail["op_name"] == "demo_benchmark"
     assert detail["dtype"] == "torch.float16"
-    assert detail["baseline"] == "torch"
-    assert detail["phase"] == "forward"
-    assert detail["result"][0]["shape_detail"] == [1, 128]
+    assert detail["mode"] == "kernel"
+    assert detail["level"] == "comprehensive"
+    assert all(set(metric) == FLAGGEMS_METRIC_FIELDS for metric in detail["result"])
+    assert detail["result"][0]["shape_detail"] == [
+        [[1, 128]],
+        {"phase": "forward"},
+    ]
+    assert detail["result"][1]["shape_detail"] == [
+        [[2, 256]],
+        {"phase": "forward"},
+    ]
     assert detail["result"][0]["latency_base"] == 2.5
     assert detail["result"][0]["latency"] == 1.25
     assert detail["result"][0]["speedup"] == 2.0
+    assert detail["result"][0]["legacy_shape"] is None
+    assert detail["result"][0]["error_msg"] is None
 
     partial = data["partial_benchmark"]
     assert partial["result"] == "failed"
@@ -284,3 +312,129 @@ def test_default_report():
     default_report = tmp_path / "benchmark_result.json"
     default_data = json.loads(default_report.read_text(encoding="utf-8"))
     assert default_data["default_benchmark"]["result"] == "passed"
+
+
+def test_benchmark_json_merges_phases_and_discards_non_flaggems_fields(tmp_path):
+    report = tmp_path / "benchmark_phases.json"
+    completed = _run_pytest(
+        tmp_path,
+        "benchmark/test_multiphase.py",
+        """
+import pytest
+
+from benchmark.recording import benchmark_metric, record_benchmark_result
+
+@pytest.mark.multiphase
+def test_multiphase(record_property):
+    for phase, latency in (("prefill", 1.0), ("decode", 2.0)):
+        record_benchmark_result(
+            record_property,
+            op_name="multiphase",
+            dtype="torch.bfloat16",
+            result=[benchmark_metric(
+                shape_detail=(1, 128),
+                latency_base=3.0,
+                latency=latency,
+                speedup=3.0 / latency,
+                steps={"attention": 0.5},
+            )],
+            baseline="vLLM",
+            phase=phase,
+            topk=16,
+        )
+    record_benchmark_result(
+        record_property,
+        op_name="multiphase",
+        dtype="torch.float16",
+        result=[benchmark_metric(
+            shape_detail=[[64, 64]],
+            latency_base=4.0,
+            latency=2.0,
+            speedup=2.0,
+        )],
+    )
+""",
+        "--record",
+        "json",
+        "--output",
+        str(report),
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    data = json.loads(report.read_text(encoding="utf-8"))["multiphase"]
+    assert set(data) == {"details", "result", "test_case", "reason"}
+    assert data["result"] == "passed"
+    assert len(data["details"]) == 2
+    bf16, fp16 = data["details"]
+    assert bf16["dtype"] == "torch.bfloat16"
+    assert set(bf16) == FLAGGEMS_DETAIL_FIELDS
+    assert len(bf16["result"]) == 2
+    assert [metric["shape_detail"] for metric in bf16["result"]] == [
+        [[[1, 128]], {"phase": "prefill"}],
+        [[[1, 128]], {"phase": "decode"}],
+    ]
+    assert all(set(metric) == FLAGGEMS_METRIC_FIELDS for metric in bf16["result"])
+    assert [metric["speedup"] for metric in bf16["result"]] == [3.0, 1.5]
+    assert fp16["result"][0]["shape_detail"] == [[64, 64]]
+
+
+def test_benchmark_json_omits_rows_without_baseline_speedup(tmp_path):
+    report = tmp_path / "benchmark_missing_baseline.json"
+    completed = _run_pytest(
+        tmp_path,
+        "benchmark/test_missing_baseline.py",
+        """
+import pytest
+
+from benchmark.recording import benchmark_metric, record_benchmark_result
+
+@pytest.mark.missing_baseline
+def test_missing_baseline(record_property):
+    record_benchmark_result(
+        record_property,
+        op_name="missing_baseline",
+        dtype="torch.bfloat16",
+        result=[
+            benchmark_metric(
+                shape_detail=(1, 128),
+                latency_base=2.0,
+                latency=1.0,
+                speedup=2.0,
+            ),
+            benchmark_metric(shape_detail=(2, 256), latency=0.5),
+        ],
+    )
+    record_benchmark_result(
+        record_property,
+        op_name="missing_baseline",
+        dtype="torch.float8_e4m3fn",
+        result=[benchmark_metric(shape_detail=(1, 128), latency=0.25)],
+    )
+""",
+        "--record",
+        "json",
+        "--output",
+        str(report),
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    result = json.loads(report.read_text(encoding="utf-8"))["missing_baseline"]
+    records = {item["dtype"]: item["result"] for item in result["details"]}
+    assert [row["speedup"] for row in records["torch.bfloat16"]] == [2.0]
+    assert records["torch.float8_e4m3fn"] == []
+
+    # This is FlagGems/tools/run_tests.py:parse_perf_data's speedup loop.
+    # A null speedup would raise TypeError during total += speedup.
+    parsed = {}
+    for dtype, rows in records.items():
+        total = 0.0
+        count = 0
+        for row in rows:
+            speedup = row.get("speedup", 0.0)
+            total += speedup
+            count += 1
+        parsed[dtype] = (
+            ("OK", total / count) if count else ("Unknown", 0)
+        )
+    assert parsed["torch.bfloat16"] == ("OK", 2.0)
+    assert parsed["torch.float8_e4m3fn"] == ("Unknown", 0)

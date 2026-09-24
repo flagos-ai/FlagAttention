@@ -37,8 +37,9 @@ Output layout::
         |-- performance_result.json
         |-- accuracy_stdout.log       # with --dump-output
         |-- accuracy_stderr.log       # with --dump-output
-        |-- performance_stdout.log    # FlagGems-compatible benchmark records
+        |-- performance_stdout.log    # human-readable benchmark output
         |-- performance_stderr.log
+        |-- performance_records_0.log # FlagGems-compatible benchmark records
         `-- performance_artifacts/
 """
 
@@ -722,7 +723,7 @@ def _valid_benchmark_metric(metric: Any) -> bool:
 
 
 def count_flaggems_records(path: Path, start_offset: int = 0) -> int:
-    """Count parseable FlagGems benchmark records in one script's stdout."""
+    """Count parseable FlagGems benchmark records in a log file."""
 
     if not path.is_file():
         return 0
@@ -811,9 +812,14 @@ def run_performance(
     for index, benchmark in enumerate(benchmarks):
         script = (Path(config["root"]) / benchmark).resolve()
         command = [config["python"], "-u", str(script)]
-        # run_command truncates the first log and appends subsequent scripts.
-        # Keep each script's start offset so an earlier record cannot make a
-        # later script with no measurements appear to have passed.
+        # Keep independent records for each script. Remove records from an
+        # earlier run so a script without measurements cannot appear to pass.
+        records_path = op_dir / f"performance_records_{index}.log"
+        records_path.unlink(missing_ok=True)
+        environment = subprocess_environment(Path(config["root"]), gpu_id)
+        environment["FLAG_ATTN_BENCHMARK_LOG_PATH"] = str(records_path.resolve())
+        # Legacy scripts may still write FlagGems rows to stdout. Only count
+        # lines added by the current script when using that compatibility path.
         stdout_start = stdout_path.stat().st_size if index and stdout_path.exists() else 0
         artifacts_before = {
             path.relative_to(artifacts_dir): (path.stat().st_mtime_ns, path.stat().st_size)
@@ -823,12 +829,12 @@ def run_performance(
         exit_code, duration, output_bytes = run_command(
             command,
             cwd=artifacts_dir,
-            environment=subprocess_environment(Path(config["root"]), gpu_id),
+            environment=environment,
             timeout=config["benchmark_timeout"],
             output_dir=op_dir,
             flavor="performance",
-            # These logs contain the FlagGems-compatible [INFO] JSON rows.
-            # Keep them even when accuracy output dumping is disabled.
+            # Keep human-readable benchmark tables and diagnostics even when
+            # accuracy output dumping is disabled.
             dump_output=True,
             append=index > 0,
         )
@@ -842,8 +848,13 @@ def run_performance(
             for path, signature in artifacts_after.items()
             if artifacts_before.get(path) != signature
         )
-        record_count = (
+        sidecar_count = count_flaggems_records(records_path) if exit_code == 0 else 0
+        legacy_count = (
             count_flaggems_records(stdout_path, stdout_start) if exit_code == 0 else 0
+        )
+        record_count = sidecar_count or legacy_count
+        record_file = (
+            records_path if sidecar_count else stdout_path if legacy_count else None
         )
         if exit_code == TIMEOUT:
             status = "Timeout"
@@ -862,16 +873,21 @@ def run_performance(
             "output_bytes": output_bytes,
             "artifacts_changed": artifacts_changed,
             "record_count": record_count,
+            "record_file": (
+                str(record_file.relative_to(output_root)) if record_file else None
+            ),
             "measurement": (
                 "artifacts"
                 if artifacts_changed
+                else "records"
+                if sidecar_count
                 else "console"
                 if output_bytes
                 else "none"
             ),
         }
         if status == "Failed" and exit_code == 0:
-            record["error"] = "benchmark did not emit a valid [INFO] JSON result record"
+            record["error"] = "benchmark did not write a valid [INFO] JSON result record"
         records.append(record)
 
     statuses = {record["status"] for record in records}
