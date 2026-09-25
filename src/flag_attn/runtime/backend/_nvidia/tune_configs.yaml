@@ -1,6 +1,16 @@
-# Curated NVIDIA configs for the GLA kernels.
-# Cover common K/V tile sizes and model dimensions without the original
-# Cartesian search over every warp/stage combination.
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 chunk_fwd_kernel_h:
   - META: {BK: 32, BV: 32}
@@ -85,3 +95,462 @@ chunk_gla_bwd_kernel_inter:
   - META: {BK: 64, BV: 64}
     num_warps: 4
     num_stages: 3
+
+attention_blocksparse_prefill_fp8_hopper:
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: false
+      CONSUMER_NUM_REGS: 192
+      CONSUMER_PINGPONG: false
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: false
+      CONSUMER_NUM_REGS: 192
+      CONSUMER_PINGPONG: true
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: false
+      CONSUMER_NUM_REGS: 208
+      CONSUMER_PINGPONG: false
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: false
+      CONSUMER_NUM_REGS: 208
+      CONSUMER_PINGPONG: true
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: false
+      CONSUMER_NUM_REGS: 224
+      CONSUMER_PINGPONG: false
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: false
+      CONSUMER_NUM_REGS: 224
+      CONSUMER_PINGPONG: true
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: false
+      CONSUMER_NUM_REGS: 232
+      CONSUMER_PINGPONG: false
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: false
+      CONSUMER_NUM_REGS: 232
+      CONSUMER_PINGPONG: true
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: true
+      CONSUMER_NUM_REGS: 192
+      CONSUMER_PINGPONG: false
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: true
+      CONSUMER_NUM_REGS: 192
+      CONSUMER_PINGPONG: true
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: true
+      CONSUMER_NUM_REGS: 208
+      CONSUMER_PINGPONG: false
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: true
+      CONSUMER_NUM_REGS: 208
+      CONSUMER_PINGPONG: true
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: true
+      CONSUMER_NUM_REGS: 224
+      CONSUMER_PINGPONG: false
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: true
+      CONSUMER_NUM_REGS: 224
+      CONSUMER_PINGPONG: true
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: true
+      CONSUMER_NUM_REGS: 232
+      CONSUMER_PINGPONG: false
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      KV_PIPELINE_STAGES: 2
+      PERSISTENT: true
+      CONSUMER_NUM_REGS: 232
+      CONSUMER_PINGPONG: true
+      SINGLE_VT_WRITER: false
+      HOIST_QSCALE: false
+      EARLY_V_RELEASE: false
+      FUSE_SCORE_SCALE: false
+    num_warps: 4
+    num_stages: 2
+attention_blocksparse_prefill_fp8:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+  - META: {}
+    num_warps: 8
+    num_stages: 2
+  - META: {}
+    num_warps: 4
+    num_stages: 3
+  - META: {}
+    num_warps: 8
+    num_stages: 3
+  - META: {}
+    num_warps: 4
+    num_stages: 4
+  - META: {}
+    num_warps: 8
+    num_stages: 4
+attention:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        PRE_LOAD_V: pre_load_v
+      num_warps: warps
+      num_stages: stages
+    block_m:
+      - 32
+      - 64
+      - 128
+    block_n:
+      - 32
+      - 64
+      - 128
+    pre_load_v:
+      - true
+      - false
+    warps:
+      - 4
+      - 8
+    stages:
+      - 2
+      - 3
+      - 4
+attention_bwd:
+  - gen: true
+    param_map:
+      META: metas
+      num_warps: warps
+      num_stages: stages
+    metas:
+      - {BLOCK_M1: 32, BLOCK_N1: 128, BLOCK_M2: 128, BLOCK_N2: 32}
+      - {BLOCK_M1: 64, BLOCK_N1: 128, BLOCK_M2: 64, BLOCK_N2: 64}
+      - {BLOCK_M1: 64, BLOCK_N1: 128, BLOCK_M2: 64, BLOCK_N2: 32}
+    warps:
+      - 4
+      - 8
+    stages:
+      - 2
+      - 3
+      - 4
+cross_entropy_loss:
+  - META:
+      BLOCK_C: 256
+      BLOCK_D: 1
+    num_warps: 4
+  - META:
+      BLOCK_C: 256
+      BLOCK_D: 4
+    num_warps: 4
+  - META:
+      BLOCK_C: 256
+      BLOCK_D: 16
+    num_warps: 4
+  - META:
+      BLOCK_C: 512
+      BLOCK_D: 1
+    num_warps: 4
+  - META:
+      BLOCK_C: 512
+      BLOCK_D: 4
+    num_warps: 4
+  - META:
+      BLOCK_C: 512
+      BLOCK_D: 16
+    num_warps: 4
+  - META:
+      BLOCK_C: 1024
+      BLOCK_D: 1
+    num_warps: 4
+  - META:
+      BLOCK_C: 1024
+      BLOCK_D: 4
+    num_warps: 4
+  - META:
+      BLOCK_C: 1024
+      BLOCK_D: 16
+    num_warps: 4
+instancenorm:
+  - gen: true
+    param_map:
+      META: {}
+      num_warps: warps
+    warps:
+      - 4
+      - 8
+      - 16
+instance_norm_loop:
+  - gen: true
+    param_map:
+      META:
+        TILE_N: tile_n
+      num_warps: warps
+    warps:
+      - 4
+      - 8
+      - 16
+    tile_n:
+      - 1024
+      - 2048
+      - 4096
+      - 8192
+instance_norm_backward:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_ROW_SIZE: block_m
+        BLOCK_COL_SIZE: 2048
+      num_warps: warps
+    warps:
+      - 4
+      - 8
+      - 16
+    block_m:
+      - 1
+      - 2
+      - 4
+      - 8
+instance_norm_weight_bias_backward:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_BATCH_SIZE: block_m
+        BLOCK_COL_SIZE: 2048
+      num_warps: warps
+    warps:
+      - 4
+      - 8
+      - 16
+    block_m:
+      - 1
+      - 2
+      - 4
+      - 8
+cross_entropy_loss_sum_and_scale:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_N: block_n
+    block_n:
+      - 64
+      - 256
+      - 1024
+mv:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+      num_warps: warps
+      num_stages: stages
+    warps:
+      - 4
+      - 8
+    block_m:
+      - 32
+      - 64
+      - 128
+    block_n:
+      - 1
+      - 2
+      - 4
+      - 8
+    stages:
+      - 3
+      - 4
+weight_norm_kernel_last:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_ROW_SIZE: block_m
+        BLOCK_COL_SIZE: block_n
+      num_warps: warps
+    warps:
+      - 4
+      - 8
+      - 16
+    block_m:
+      - 512
+      - 1024
+      - 2048
+    block_n:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 32
+weight_norm_kernel_first:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_ROW_SIZE: block_m
+        BLOCK_COL_SIZE: block_n
+      num_warps: warps
+    warps:
+      - 4
+      - 8
+      - 16
+    block_m:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 32
+    block_n:
+      - 512
+      - 1024
+      - 2048
+weight_norm_kernel:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_ROW_SIZE: block_m
+        BLOCK_COL_SIZE: block_n
+      num_warps: warps
+    warps:
+      - 4
+      - 8
+      - 16
+    block_m:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 32
+    block_n:
+      - 256
+      - 512
+      - 1024
+      - 2048
+add_rms_norm_loop:
+  - gen: true
+    param_map:
+      META:
+        TILE_N: tile_n
+      num_warps: warps
+    warps:
+      - 4
+      - 8
+      - 16
+    tile_n:
+      - 1024
+      - 2048
+      - 4096
+      - 8192
+gated_activation:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+      num_warps: 4
+    block_m:
+      - 1
+      - 2
+      - 4
+      - 8
+    block_n:
+      - 1024
