@@ -84,6 +84,7 @@ markers = [
     "minimax_sparse_attention_decode: MiniMax sparse attention decoding",
     "minimax_sparse_attention_prefill: MiniMax sparse attention prefill",
     "minimax_sparse_attention_topk: MiniMax sparse attention top-k selection",
+    "parallel_moba: parallel MoBA tests and benchmarks",
     "parallel_nsa: native sparse attention",
     "parallel_nsa_compression: native sparse attention compression",
     "sage_attention: SageAttention tests and benchmarks",

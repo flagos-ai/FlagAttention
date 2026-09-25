@@ -228,6 +228,24 @@ ops:
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_k16_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_identity_out_and_score_out_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_fp8
+  - id: parallel_moba
+    description: Run variable-length parallel MoBA attention.
+    for:
+      - parallel_moba
+    labels:
+      - fused
+      - FLA
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_moba.py
+    benchmark: benchmark/test_moba_perf.py
+    benchmark_requires:
+      - flash_moba
   - id: paged_attention
     description: Run paged KV-cache attention with automatic, explicit, and targeted split selection.
     for:
