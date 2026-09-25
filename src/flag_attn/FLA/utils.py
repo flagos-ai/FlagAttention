@@ -6,6 +6,7 @@
 
 import inspect
 import os
+from functools import lru_cache
 
 import torch
 import triton
@@ -13,12 +14,63 @@ import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
 
-
-
-
 # ---------------------------------------------------------------------------
 # FLA hardware capability helpers
 # ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=None)
+def get_device_capability(device_index: int | None = None) -> tuple[int, int] | None:
+    """Return a CUDA device capability, or None when CUDA is unavailable."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        return torch.cuda.get_device_capability(device_index)
+    except (AssertionError, RuntimeError):
+        return None
+
+
+def is_nvidia_hopper_device(device_index: int | None = None) -> bool:
+    """Return whether the selected device is an NVIDIA Hopper GPU."""
+    capability = get_device_capability(device_index)
+    return capability is not None and capability[0] == 9
+
+
+def is_nvidia_blackwell_device(device_index: int | None = None) -> bool:
+    """Return whether the selected device is an NVIDIA Blackwell GPU."""
+    capability = get_device_capability(device_index)
+    return capability is not None and capability[0] in (10, 12)
+
+
+def is_cuda_graph_capturing() -> bool:
+    """Return whether the active CUDA stream is being captured."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except RuntimeError:
+        return False
+
+
+@lru_cache(maxsize=None)
+def get_num_sms(device_index: int | None = None) -> int:
+    """Return the selected CUDA device's multiprocessor count."""
+    if not torch.cuda.is_available():
+        return 0
+    try:
+        return torch.cuda.get_device_properties(device_index).multi_processor_count
+    except (AssertionError, RuntimeError):
+        return 0
+
+
+@lru_cache(maxsize=None)
+def has_shared_memory(required_bytes: int, device_index: int | None = None) -> bool:
+    """Return whether the selected device exposes enough shared memory."""
+    try:
+        properties = triton.runtime.driver.active.utils.get_device_properties(device_index)
+        return properties["max_shared_mem"] >= required_bytes
+    except (AttributeError, KeyError, RuntimeError, TypeError):
+        return False
 
 
 def _detect_nvidia_hopper() -> bool:
@@ -46,11 +98,7 @@ is_tma_supported = is_nvidia_hopper and (
 
 def get_exp():
     """Select the FLA fast exponential implementation when requested."""
-    return (
-        tldevice.fast_expf
-        if os.environ.get("FLAG_ATTN_USE_FAST_OPS", "0") == "1"
-        else tl.exp
-    )
+    return tldevice.fast_expf if os.environ.get("FLAG_ATTN_USE_FAST_OPS", "0") == "1" else tl.exp
 
 
 exp = get_exp()
@@ -79,9 +127,11 @@ if hasattr(triton.language, "_experimental_make_tensor_descriptor"):
 elif hasattr(triton.language, "make_tensor_descriptor"):
     make_tensor_descriptor = triton.language.make_tensor_descriptor
 else:
+
     @triton.jit
     def make_tensor_descriptor(base, shape, strides, block_shape, _builder=None):
         return None
+
 
 # Environment settings
 SUPPRESS_LEVEL = int(os.getenv("FLAG_ATTN_GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
@@ -131,9 +181,7 @@ def _compare_and_swap(x, ids, flip, i: tl.constexpr, n_dims: tl.constexpr):
 
 
 @triton.jit
-def _bitonic_merge(
-    x, ids, stage: tl.constexpr, order: tl.constexpr, n_dims: tl.constexpr
-):
+def _bitonic_merge(x, ids, stage: tl.constexpr, order: tl.constexpr, n_dims: tl.constexpr):
     n_outer: tl.constexpr = x.numel >> n_dims
     tl.static_assert(stage <= n_dims)
     # flip denotes whether to re-arrange sub-sequences of elements in ascending or
@@ -143,9 +191,7 @@ def _bitonic_merge(
     # a stride of 2) at this stage
     if order == 2:
         shape: tl.constexpr = [n_outer * 2 ** (n_dims - 1 - stage), 2, 2**stage]
-        flip = tl.reshape(
-            tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape
-        )
+        flip = tl.reshape(tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape)
     else:
         flip = order
     # perform `stage` rounds of `compare-and-swap`
@@ -155,14 +201,10 @@ def _bitonic_merge(
 
 
 @triton.jit
-def argsort(
-    x, ids, dim: tl.constexpr = None, descending: tl.constexpr = tl.core.CONSTEXPR_0
-):
+def argsort(x, ids, dim: tl.constexpr = None, descending: tl.constexpr = tl.core.CONSTEXPR_0):
     # handle default dimension or check that it is the most minor dim
     _dim: tl.constexpr = len(x.shape) - 1 if dim is None else dim
-    tl.static_assert(
-        _dim == len(x.shape) - 1, "only minor dimension is currently supported"
-    )
+    tl.static_assert(_dim == len(x.shape) - 1, "only minor dimension is currently supported")
     # iteratively run bitonic merge-sort steps
     n_dims: tl.constexpr = _log2(x.shape[_dim])
 
