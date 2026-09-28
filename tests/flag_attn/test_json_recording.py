@@ -14,6 +14,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FLAGGEMS_DETAIL_FIELDS = {"op_name", "dtype", "mode", "level", "result"}
 FLAGGEMS_METRIC_FIELDS = {
+    "case_id",
+    "candidate_source",
     "legacy_shape",
     "shape_detail",
     "latency_base",
@@ -27,6 +29,24 @@ FLAGGEMS_METRIC_FIELDS = {
     "compared_speedup",
     "error_msg",
 }
+UPLOAD_SUMMARY_FIELDS = {"timestamp", "env", "result"}
+
+
+def _load_strict_json(path):
+    def reject_nonfinite(value):
+        raise ValueError(f"non-finite JSON number: {value}")
+
+    return json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_nonfinite)
+
+
+def _load_summary(output):
+    return _load_strict_json(output.with_name("summary.json"))
+
+
+def _assert_flaggems_raw(document):
+    assert isinstance(document, dict)
+    assert UPLOAD_SUMMARY_FIELDS.isdisjoint(document)
+    assert all(isinstance(value, dict) for value in document.values())
 
 
 def _run_pytest(tmp_path, test_name, source, *extra_args):
@@ -112,7 +132,8 @@ def test_teardown_error(broken_teardown):
     )
     assert first_run.returncode == 1, first_run.stdout + first_run.stderr
 
-    data = json.loads(report.read_text(encoding="utf-8"))
+    data = _load_strict_json(report)
+    _assert_flaggems_raw(data)
     passed = data["test_outcomes.py::test_pass[3]"]
     assert passed == {
         "params": {"value": 3},
@@ -141,9 +162,13 @@ def test_teardown_error(broken_teardown):
         str(report),
     )
     assert second_run.returncode == 0, second_run.stdout + second_run.stderr
-    merged = json.loads(report.read_text(encoding="utf-8"))
+    merged = _load_strict_json(report)
+    _assert_flaggems_raw(merged)
     assert "test_outcomes.py::test_pass[3]" in merged
     assert merged["test_more.py::test_more"]["result"] == "passed"
+    summary = _load_summary(report)
+    assert set(summary) == UPLOAD_SUMMARY_FIELDS
+    assert set(summary["result"]) == {"test_more.py::test_more"}
 
     bad_collection = tmp_path / "test_bad_collection.py"
     bad_collection.write_text(
@@ -168,7 +193,8 @@ def test_teardown_error(broken_teardown):
         str(report),
     )
     assert collection_run.returncode == 1, collection_run.stdout + collection_run.stderr
-    collected = json.loads(report.read_text(encoding="utf-8"))
+    collected = _load_strict_json(report)
+    _assert_flaggems_raw(collected)
     assert collected["test_bad_collection.py"]["result"] == "failed"
     assert "collection failed" in collected["test_bad_collection.py"]["reason"]
     assert collected["test_good_collection.py::test_still_runs"]["result"] == "passed"
@@ -197,7 +223,8 @@ def test_output_alone_does_not_enable_recording(tmp_path):
     )
     assert default_output.returncode == 0, default_output.stdout + default_output.stderr
     default_report = tmp_path / "accuracy_result.json"
-    data = json.loads(default_report.read_text(encoding="utf-8"))
+    data = _load_strict_json(default_report)
+    _assert_flaggems_raw(data)
     assert data["test_default_output.py::test_default_output"]["result"] == "passed"
 
 
@@ -260,7 +287,13 @@ def test_skipped():
     )
     assert completed.returncode == 1, completed.stdout + completed.stderr
 
-    data = json.loads(report.read_text(encoding="utf-8"))
+    data = _load_strict_json(report)
+    _assert_flaggems_raw(data)
+    assert set(data) == {
+        "demo_benchmark",
+        "partial_benchmark",
+        "skipped_benchmark",
+    }
     benchmark = data["demo_benchmark"]
     assert benchmark["result"] == "passed"
     assert benchmark["reason"] is None
@@ -284,6 +317,13 @@ def test_skipped():
     assert detail["result"][0]["latency_base"] == 2.5
     assert detail["result"][0]["latency"] == 1.25
     assert detail["result"][0]["speedup"] == 2.0
+    assert detail["result"][0]["case_id"] == (
+        "benchmark/test_perf.py::test_perf::comprehensive::float16::0"
+    )
+    assert detail["result"][1]["case_id"] == (
+        "benchmark/test_perf.py::test_perf::comprehensive::float16::1"
+    )
+    assert detail["result"][0]["candidate_source"] is None
     assert detail["result"][0]["legacy_shape"] is None
     assert detail["result"][0]["error_msg"] is None
 
@@ -311,7 +351,8 @@ def test_default_report():
     )
     assert default_run.returncode == 0, default_run.stdout + default_run.stderr
     default_report = tmp_path / "benchmark_result.json"
-    default_data = json.loads(default_report.read_text(encoding="utf-8"))
+    default_data = _load_strict_json(default_report)
+    _assert_flaggems_raw(default_data)
     assert default_data["default_benchmark"]["result"] == "passed"
 
 
@@ -362,7 +403,9 @@ def test_multiphase(record_property):
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
-    data = json.loads(report.read_text(encoding="utf-8"))["multiphase"]
+    document = _load_strict_json(report)
+    _assert_flaggems_raw(document)
+    data = document["multiphase"]
     assert set(data) == {"details", "result", "test_case", "reason"}
     assert data["result"] == "passed"
     assert len(data["details"]) == 2
@@ -376,6 +419,10 @@ def test_multiphase(record_property):
     ]
     assert all(set(metric) == FLAGGEMS_METRIC_FIELDS for metric in bf16["result"])
     assert [metric["speedup"] for metric in bf16["result"]] == [3.0, 1.5]
+    assert [metric["case_id"] for metric in bf16["result"]] == [
+        "benchmark/test_multiphase.py::test_multiphase::comprehensive::bfloat16::0",
+        "benchmark/test_multiphase.py::test_multiphase::comprehensive::bfloat16::1",
+    ]
     assert fp16["result"][0]["shape_detail"] == [[64, 64]]
 
 
@@ -419,7 +466,9 @@ def test_missing_baseline(record_property):
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
-    result = json.loads(report.read_text(encoding="utf-8"))["missing_baseline"]
+    document = _load_strict_json(report)
+    _assert_flaggems_raw(document)
+    result = document["missing_baseline"]
     records = {item["dtype"]: item["result"] for item in result["details"]}
     assert [row["speedup"] for row in records["torch.bfloat16"]] == [2.0]
     assert records["torch.float8_e4m3fn"] == []
@@ -513,9 +562,12 @@ def test_upload_demo_benchmark(record_property):
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
-    document = json.loads(output.read_text(encoding="utf-8"))
+    raw = _load_strict_json(output)
+    _assert_flaggems_raw(raw)
     # The original FlagGems-compatible entry remains available to its clients.
-    assert document["upload_demo"]["result"] == "passed"
+    assert raw["upload_demo"]["result"] == "passed"
+    document = _load_summary(output)
+    assert set(document) == UPLOAD_SUMMARY_FIELDS
     assert datetime.fromisoformat(document["timestamp"])
     assert isinstance(document["env"], dict)
     operator = document["result"]["upload_demo"]
@@ -579,7 +631,10 @@ def test_no_baseline(record_property):
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
-    operator = json.loads(output.read_text(encoding="utf-8"))["result"]["no_baseline"]
+    raw = _load_strict_json(output)
+    _assert_flaggems_raw(raw)
+    assert raw["no_baseline"]["result"] == "passed"
+    operator = _load_summary(output)["result"]["no_baseline"]
     accuracy = operator["accuracy"]
     assert accuracy["status"] != "Passed"
     assert accuracy["passed"] == 0
@@ -624,7 +679,10 @@ def test_benchmark(record_property):
         )
         assert completed.returncode == 0, completed.stdout + completed.stderr
 
-    document = json.loads(output.read_text(encoding="utf-8"))
+    raw = _load_strict_json(output)
+    _assert_flaggems_raw(raw)
+    assert set(raw) == {"old_operator", "new_operator"}
+    document = _load_summary(output)
     assert set(document["result"]) == {"new_operator"}
     accuracy = document["result"]["new_operator"]["accuracy"]
     assert accuracy["status"] != "Passed"
@@ -680,7 +738,9 @@ def test_benchmark(record_property):
     )
     assert completed.returncode == 1, completed.stdout + completed.stderr
 
-    operator = json.loads(output.read_text(encoding="utf-8"))["result"]["upload_fault"]
+    raw = _load_strict_json(output)
+    _assert_flaggems_raw(raw)
+    operator = _load_summary(output)["result"]["upload_fault"]
     accuracy = operator["accuracy"]
     assert accuracy["status"] != "Passed"
     assert accuracy["passed"] == 0
@@ -722,12 +782,9 @@ def test_repeated_shape(record_property):
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
-    def reject_nonfinite(value):
-        raise ValueError(f"non-finite JSON number: {value}")
-
-    document = json.loads(
-        output.read_text(encoding="utf-8"), parse_constant=reject_nonfinite
-    )
+    raw = _load_strict_json(output)
+    _assert_flaggems_raw(raw)
+    document = _load_summary(output)
     performance = document["result"]["repeated_shape"]["performance"]
     assert performance["status"] == "Passed"
     dtype = performance["data"]["float16"]
@@ -767,7 +824,9 @@ def test_modes(record_property):
         str(output),
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    dtype = json.loads(output.read_text())["result"]["modes"]["performance"]["data"]["float16"]
+    dtype = _load_summary(output)["result"]["modes"]["performance"]["data"][
+        "float16"
+    ]
     assert len(dtype["details"]) == 2
     assert sorted(row["speedup"] for row in dtype["details"].values()) == [1.0, 100.0]
     assert any('"mode": "kernel"' in key for key in dtype["details"])
@@ -803,7 +862,9 @@ def test_forward_phase(record_property):
         str(output),
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    dtype = json.loads(output.read_text())["result"]["forward_phase"]["performance"]["data"]["float16"]
+    dtype = _load_summary(output)["result"]["forward_phase"]["performance"][
+        "data"
+    ]["float16"]
     assert len(dtype["details"]) == 2
     assert sorted(row["speedup"] for row in dtype["details"].values()) == [1.0, 100.0]
     assert any('"phase": "forward"' in key for key in dtype["details"])
@@ -840,14 +901,13 @@ def test_nonfinite(record_property):
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
-    def reject_nonfinite(value):
-        raise ValueError(f"non-finite JSON number: {value}")
-
-    document = json.loads(output.read_text(), parse_constant=reject_nonfinite)
-    raw = document["nonfinite"]["details"][0]["result"][0]
-    assert raw["accuracy"] is None
-    assert raw["tflops"] is None
-    assert document["result"]["nonfinite"]["performance"]["status"] == "Passed"
+    document = _load_strict_json(output)
+    _assert_flaggems_raw(document)
+    metric = document["nonfinite"]["details"][0]["result"][0]
+    assert metric["accuracy"] is None
+    assert metric["tflops"] is None
+    summary = _load_summary(output)
+    assert summary["result"]["nonfinite"]["performance"]["status"] == "Passed"
 
 
 def test_upload_summary_attributes_benchmark_collection_error_by_mark(tmp_path):
@@ -877,7 +937,7 @@ def test_benchmark():
         "--continue-on-collection-errors",
     )
     assert completed.returncode != 0
-    operator = json.loads(output.read_text(encoding="utf-8"))["result"]["long_operator_name"]
+    operator = _load_summary(output)["result"]["long_operator_name"]
     assert operator["performance"] == {"status": "Failed", "data": {}}
 
 
@@ -913,7 +973,7 @@ def test_benchmark(record_property):
         "--continue-on-collection-errors",
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    operator = json.loads(output.read_text(encoding="utf-8"))["result"]["selected_operator"]
+    operator = _load_summary(output)["result"]["selected_operator"]
     assert operator["accuracy"]["total"] == 0
     assert operator["accuracy"]["skipped"] == 0
     assert operator["performance"]["status"] == "Passed"
@@ -951,7 +1011,7 @@ def test_benchmark(record_property):
         "--continue-on-collection-errors",
     )
     assert completed.returncode == 1, completed.stdout + completed.stderr
-    operator = json.loads(output.read_text())["result"]["abs"]
+    operator = _load_summary(output)["result"]["abs"]
     assert operator["accuracy"]["status"] == "NotRun"
     assert operator["accuracy"]["errors"] == 0
     assert operator["performance"]["data"]["float16"]["speedup"] == 2.0
@@ -972,7 +1032,7 @@ def test_upload_summary_reports_empty_mark_without_performance(tmp_path):
         "--continue-on-collection-errors",
     )
     assert completed.returncode == 5
-    operator = json.loads(output.read_text(encoding="utf-8"))["result"]["abs"]
+    operator = _load_summary(output)["result"]["abs"]
     assert operator["accuracy"]["status"] == "NotRun"
     assert operator["accuracy"]["total"] == 0
     assert operator["performance"] == {"status": "Skipped", "data": {}}
@@ -1017,7 +1077,7 @@ def test_benchmark(record_property):
         "--continue-on-collection-errors",
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    operator = json.loads(output.read_text(encoding="utf-8"))["result"]["selected"]
+    operator = _load_summary(output)["result"]["selected"]
     assert operator["accuracy"]["passed"] == 1
     assert operator["performance"]["data"]["float16"]["speedup"] == 2.0
 
@@ -1047,7 +1107,12 @@ def test_alias(record_property):
         str(output),
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    document = json.loads(output.read_text())
-    assert set(document["result"]) == {"inventory_name"}
-    assert document["inventory_name"]["result"] == "passed"
-    assert document["result"]["inventory_name"]["performance"]["data"]["float16"]["speedup"] == 2.0
+    raw = _load_strict_json(output)
+    _assert_flaggems_raw(raw)
+    assert set(raw) == {"inventory_name"}
+    assert raw["inventory_name"]["result"] == "passed"
+    summary = _load_summary(output)
+    assert set(summary["result"]) == {"inventory_name"}
+    assert summary["result"]["inventory_name"]["performance"]["data"][
+        "float16"
+    ]["speedup"] == 2.0

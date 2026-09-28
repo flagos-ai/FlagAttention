@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import math
 import sys
 import textwrap
 import warnings
@@ -36,9 +37,9 @@ import triton.knobs
 import triton.testing as triton_testing
 
 try:
-    from benchmark.recording import benchmark_metric, record_benchmark_result
+    from benchmark.recording import BenchmarkRecorder
 except ModuleNotFoundError:  # Direct script execution.
-    from recording import benchmark_metric, record_benchmark_result
+    from recording import BenchmarkRecorder
 
 from flag_attn.minimax_sparse_attention import (
     SPARSE_BLOCK_SIZE,
@@ -112,6 +113,7 @@ DEFAULT_REP = 300
 KV_SCALE = 0.5
 BF16_ATOL = BF16_RTOL = 2e-2
 FP8_ATOL, FP8_RTOL = 6e-2, 8e-2
+OUTPUT_CHECK_CHUNK_ELEMENTS = 1 << 20
 
 PREFILL_SHAPES = [
     (1, 8192, 16, 96),
@@ -554,33 +556,72 @@ def _check_outputs(
     layout: str,
 ) -> float:
     context = f"{mode}, {dtype_name}, shape={shape}, vLLM layout={layout}"
-    for provider, output in (("FlagAttention", flag_output), ("vLLM", vllm_output)):
-        if not torch.isfinite(output).all().item():
-            raise AssertionError(f"{provider} produced NaN or Inf ({context})")
+    # Keep the benchmark outputs on GPU, but do the accuracy work on CPU. A
+    # full-size GPU assert_close can need several times the output's size in
+    # temporary tensors, even when the two outputs match.
+    flag_cpu = flag_output.detach().cpu()
+    vllm_cpu = vllm_output.detach().cpu()
+    for provider, output in (("FlagAttention", flag_cpu), ("vLLM", vllm_cpu)):
+        for chunk in output.reshape(-1).split(OUTPUT_CHECK_CHUNK_ELEMENTS):
+            if not torch.isfinite(chunk).all().item():
+                raise AssertionError(f"{provider} produced NaN or Inf ({context})")
 
     atol, rtol = (
         (FP8_ATOL, FP8_RTOL) if dtype_name == "fp8" else (BF16_ATOL, BF16_RTOL)
     )
-    try:
-        torch.testing.assert_close(flag_output, vllm_output, atol=atol, rtol=rtol)
-    except AssertionError as exc:
-        diff = (flag_output.float() - vllm_output.float()).abs()
+    if (
+        flag_output.shape != vllm_output.shape
+        or flag_output.dtype != vllm_output.dtype
+        or flag_output.device != vllm_output.device
+        or flag_output.layout != vllm_output.layout
+    ):
         raise AssertionError(
             f"FlagAttention/vLLM output mismatch ({context}); "
-            f"max_abs_diff={diff.max().item():.6g}, atol={atol}, rtol={rtol}"
+            f"metadata differs: shape={tuple(flag_output.shape)}/{tuple(vllm_output.shape)}, "
+            f"dtype={flag_output.dtype}/{vllm_output.dtype}, "
+            f"device={flag_output.device}/{vllm_output.device}, "
+            f"layout={flag_output.layout}/{vllm_output.layout}"
+        )
+
+    flag_flat = flag_cpu.reshape(-1)
+    vllm_flat = vllm_cpu.reshape(-1)
+    try:
+        for flag_chunk, vllm_chunk in zip(
+            flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+            vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+        ):
+            torch.testing.assert_close(flag_chunk, vllm_chunk, atol=atol, rtol=rtol)
+    except AssertionError as exc:
+        max_abs_diff = 0.0
+        for flag_chunk, vllm_chunk in zip(
+            flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+            vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+        ):
+            if flag_chunk.numel():
+                diff = (flag_chunk.float() - vllm_chunk.float()).abs()
+                max_abs_diff = max(max_abs_diff, diff.max().item())
+        raise AssertionError(
+            f"FlagAttention/vLLM output mismatch ({context}); "
+            f"max_abs_diff={max_abs_diff:.6g}, atol={atol}, rtol={rtol}"
         ) from exc
 
-    flag_flat = flag_output.float().flatten()
-    vllm_flat = vllm_output.float().flatten()
-    flag_norm = torch.linalg.vector_norm(flag_flat)
-    vllm_norm = torch.linalg.vector_norm(vllm_flat)
-    cosine = torch.where(
-        (flag_norm == 0) & (vllm_norm == 0),
-        torch.ones_like(flag_norm),
-        torch.dot(flag_flat, vllm_flat)
-        / (flag_norm * vllm_norm).clamp_min(torch.finfo(torch.float32).tiny),
+    dot = flag_norm_sq = vllm_norm_sq = 0.0
+    for flag_chunk, vllm_chunk in zip(
+        flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+        vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+    ):
+        flag_values = flag_chunk.float().double()
+        vllm_values = vllm_chunk.float().double()
+        dot += torch.dot(flag_values, vllm_values).item()
+        flag_norm_sq += torch.dot(flag_values, flag_values).item()
+        vllm_norm_sq += torch.dot(vllm_values, vllm_values).item()
+    if flag_norm_sq == 0 and vllm_norm_sq == 0:
+        return 1.0
+    denominator = max(
+        math.sqrt(flag_norm_sq) * math.sqrt(vllm_norm_sq),
+        torch.finfo(torch.float32).tiny,
     )
-    return cosine.clamp(-1.0, 1.0).item()
+    return max(-1.0, min(1.0, dot / denominator))
 
 
 def _bench_steps(
@@ -757,7 +798,16 @@ def _run_dtype(
     print(separator)
 
     device = torch.device("cuda")
-    metrics = []
+    recorder = BenchmarkRecorder(
+        record_property,
+        op_name="minimax_m3_sparse_attn",
+        dtype=str(torch.bfloat16 if dtype_name == "bf16" else FP8_DTYPE),
+        baseline="vLLM" if run_vllm else None,
+        vllm_kv_layout=vllm_layout,
+        phase="decode" if args.decode else "prefill",
+        topk=args.topk,
+        decode_qlen=args.decode_qlen if args.decode else None,
+    )
     for shape_index, shape in enumerate(_get_shapes(args)):
         batch, seq_len, num_kv_heads, num_heads = shape
         if num_heads % num_kv_heads != 0:
@@ -906,32 +956,22 @@ def _run_dtype(
                 )
         print(_format_columns(row))
         sys.stdout.flush()
-        metrics.append(
-            benchmark_metric(
-                shape_detail=shape,
-                latency_base=vllm_ms,
-                latency=flag_attn_ms,
-                speedup=(
-                    vllm_ms / flag_attn_ms
-                    if vllm_ms is not None and flag_attn_ms > 0
-                    else None
-                ),
-                accuracy=accuracy,
-                steps=steps,
-            )
+        recorder.add(
+            shape_detail=shape,
+            latency_base=vllm_ms,
+            latency=flag_attn_ms,
+            accuracy=accuracy,
+            steps=steps,
         )
 
-    record_benchmark_result(
-        record_property,
-        op_name="minimax_m3_sparse_attn",
-        dtype=str(torch.bfloat16 if dtype_name == "bf16" else FP8_DTYPE),
-        result=metrics,
-        baseline="vLLM" if run_vllm else None,
-        vllm_kv_layout=vllm_layout,
-        phase="decode" if args.decode else "prefill",
-        topk=args.topk,
-        decode_qlen=args.decode_qlen if args.decode else None,
-    )
+        # Release this shape before make_data allocates the next one. The
+        # closures and provider tuple also hold references to GPU tensors.
+        if run_vllm:
+            del providers, timings
+        del flag_attn_run, vllm_run, flag_attn_output, vllm_output, vllm_data, data, generator
+        torch.cuda.empty_cache()
+
+    recorder.record()
 
 
 def run_benchmark(

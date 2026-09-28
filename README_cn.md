@@ -286,13 +286,13 @@ python tools/run_tests.py --stages stable --gpus 0 --skip-benchmarks
 python tools/run_tests.py --stages all --gpus all --dump-output
 ```
 
-使用 pytest recorder 在同一个文件中输出用例级 JSON 和算子级上传汇总：
+使用 pytest recorder 输出与 FlagGems 兼容的用例级 JSON；同目录另写算子级上传汇总 `summary.json`：
 
 ```sh
 pytest -m "sage_attention" --record json --output accuracy_sage_attention.json --continue-on-collection-errors -vs
 ```
 
-文件顶层包含 `timestamp`、`env` 和 `result`。每个 `result[算子名]` 分别记录 `accuracy` 与 `performance`；`performance.data` 按 dtype 汇总具有有效基线的各 shape 延迟和加速比。顶层仍保留与 FlagGems 兼容的原始用例记录，供现有解析程序读取。从仓库根目录无路径运行 `--record json -m OP_NAME` 时，也会收集 `benchmark/`。省略 `--output` 时，包含 benchmark 的命令默认写入 `benchmark_result.json`，仅运行精度测试时写入 `accuracy_result.json`。即使复用输出路径，上传汇总也只描述本次运行。
+`--output` 文件只保留与 FlagGems 兼容的原始用例或算子记录；同目录的 `summary.json` 顶层包含 `timestamp`、`env` 和 `result`。每个 `result[算子名]` 分别记录 `accuracy` 与 `performance`；`performance.data` 按 dtype 汇总具有有效基线的各 shape 延迟和加速比。从仓库根目录无路径运行 `--record json -m OP_NAME` 时，也会收集 `benchmark/`。省略 `--output` 时，包含 benchmark 的命令默认写入 `benchmark_result.json`，仅运行精度测试时写入 `accuracy_result.json`。即使复用输出路径，上传汇总也只描述本次运行。
 
 `OP_NAME` 是 pytest marker。算子清单中的 `chunk_gated_delta_rule_fwd` 和 `chunk_kda_enflame` 与原有的短名称 marker 都可使用。没有匹配测试的 marker 会得到 `NotRun` 精度、`Skipped` 性能，且没有加速比数据。
 
@@ -308,10 +308,10 @@ python benchmark/piecewise_benchmark.py
 python benchmark/flash_decoding_benchmark.py
 
 cd benchmark
-pytest -m "sage_attention" --record json --output benchmark_sage_attention.json --continue-on-collection-errors -vs
+pytest -m "sage_attention" --record json --output performance_result.json --continue-on-collection-errors -vs
 ```
 
-只运行 benchmark 时，上传汇总会把精度标为未运行；benchmark 通过不代表精度测试集通过。没有有效基线的 shape 不会在 `performance.data` 中产生加速比，benchmark 完成也不会因此把性能误报为通过。`benchmark_abs.json` 等名称只是 `--output` 指定的本地文件名；放入平台上传 zip 时，应将该 JSON 命名为 `summary.json`，置于压缩包根目录或一级子目录。
+指定的 `performance_result.json` 会在算子键下记录每个 shape 的基线延迟、FlagAttention 延迟及 `speedup = 基线延迟 / FlagAttention 延迟`。只运行 benchmark 时，单独的 `summary.json` 会把精度标为未运行；benchmark 通过不代表精度测试集通过。没有有效基线的 shape 不会在任一文件中虚构加速比。上传平台 zip 时，将生成的 `summary.json` 置于压缩包根目录或一级子目录。
 
 无路径的 pytest 命令只收集 `benchmark/` 下的 pytest 性能测试。独立 benchmark 脚本仍需直接运行，它们的数据不会写入这个 pytest JSON 文件。
 

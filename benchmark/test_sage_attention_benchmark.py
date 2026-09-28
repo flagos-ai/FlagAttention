@@ -26,9 +26,9 @@ import torch.nn.functional as F
 import triton
 
 try:
-    from benchmark.recording import benchmark_metric, record_benchmark_result
+    from benchmark.recording import BenchmarkRecorder
 except ModuleNotFoundError:  # Direct script execution.
-    from recording import benchmark_metric, record_benchmark_result
+    from recording import BenchmarkRecorder
 
 from flag_attn.sage_attention import forward, per_block_int8
 
@@ -288,7 +288,14 @@ def _run_benchmark_cases(
 
     _print_header(output_dtype, warmup, rep)
     print("\ndtype:", output_dtype)
-    metrics = []
+    recorder = BenchmarkRecorder(
+        record_property,
+        op_name="sage_attention",
+        dtype=str(output_dtype),
+        baseline=_baseline_name(output_dtype),
+        phase="forward",
+        scope=BENCHMARK_SCOPE,
+    )
     for shape in shapes:
         result = _benchmark_case(
             shape,
@@ -298,28 +305,17 @@ def _run_benchmark_cases(
             maxnreg=maxnreg,
         )
         _print_row(shape, output_dtype, result)
-        metrics.append(
-            benchmark_metric(
-                shape_detail=shape,
-                latency_base=result.baseline_ms,
-                latency=result.flagattention_ms,
-                speedup=result.speedup,
-                accuracy=result.cosine_similarity,
-                cosine_similarity=result.cosine_similarity,
-                relative_l2=result.relative_l2,
-            )
+        recorder.add(
+            shape_detail=shape,
+            latency_base=result.baseline_ms,
+            latency=result.flagattention_ms,
+            accuracy=result.cosine_similarity,
+            cosine_similarity=result.cosine_similarity,
+            relative_l2=result.relative_l2,
         )
         _record_result(record_property, shape, output_dtype, result)
         torch.cuda.empty_cache()
-    record_benchmark_result(
-        record_property,
-        op_name="sage_attention",
-        dtype=str(output_dtype),
-        result=metrics,
-        baseline=_baseline_name(output_dtype),
-        phase="forward",
-        scope=BENCHMARK_SCOPE,
-    )
+    recorder.record()
     _print_footer()
 
 

@@ -11,9 +11,9 @@ import torch
 import triton
 
 try:
-    from benchmark.recording import benchmark_metric, record_benchmark_result
+    from benchmark.recording import BenchmarkRecorder
 except ModuleNotFoundError:  # Direct script execution.
-    from recording import benchmark_metric, record_benchmark_result
+    from recording import BenchmarkRecorder
 
 from flag_attn import chunk_gdn2
 from flag_attn.gdn2.chunk import HAS_TLE_GDN2
@@ -121,7 +121,13 @@ def main(
     print(f"GPU: {torch.cuda.get_device_name()} | dtype: {args.dtype}")
     print("B,T,H,K,V                     native_ms      tle_ms     speedup")
     print("-" * 66)
-    metrics = []
+    recorder = BenchmarkRecorder(
+        record_property,
+        op_name="chunk_gdn2",
+        dtype=str(dtype),
+        baseline="native",
+        phase="forward",
+    )
     for shape in shapes:
         torch.manual_seed(42)
         inputs = _make_inputs(shape, dtype)
@@ -136,24 +142,10 @@ def main(
         )
         shape_text = ",".join(str(item) for item in shape)
         print(f"{shape_text:<28} {native_ms:>10.4f} {tle_ms:>11.4f} {native_ms / tle_ms:>10.3f}x")
-        metrics.append(
-            benchmark_metric(
-                shape_detail=shape,
-                latency_base=native_ms,
-                latency=tle_ms,
-                speedup=native_ms / tle_ms,
-            )
-        )
+        recorder.add(shape_detail=shape, latency_base=native_ms, latency=tle_ms)
         del inputs
         torch.cuda.empty_cache()
-    record_benchmark_result(
-        record_property,
-        op_name="chunk_gdn2",
-        dtype=str(dtype),
-        result=metrics,
-        baseline="native",
-        phase="forward",
-    )
+    recorder.record()
 
 
 @pytest.mark.chunk_gdn2

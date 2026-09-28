@@ -270,13 +270,13 @@ python tools/run_tests.py --stages stable --gpus 0 --skip-benchmarks
 python tools/run_tests.py --stages all --gpus all --dump-output
 ```
 
-Use the pytest recorder for case-level JSON and an operator-level upload summary in the same file:
+Use the pytest recorder for FlagGems-compatible case-level JSON. It also writes an operator-level upload summary as `summary.json` beside the requested output:
 
 ```sh
 pytest -m "sage_attention" --record json --output accuracy_sage_attention.json --continue-on-collection-errors -vs
 ```
 
-The file contains top-level `timestamp`, `env`, and `result` fields. Each `result[operator]` has separate `accuracy` and `performance` results; `performance.data` groups valid shape-level baseline and FlagAttention latencies and speedups by dtype. The original top-level FlagGems-compatible case records remain available to existing readers. From the repository root, a path-free `--record json -m OP_NAME` command also collects `benchmark/`. If `--output` is omitted, benchmark invocations write `benchmark_result.json`, while accuracy-only invocations write `accuracy_result.json`. The upload summary describes the current run even when an output path is reused.
+The `--output` file keeps only the original FlagGems-compatible case or operator records. Its sibling `summary.json` contains top-level `timestamp`, `env`, and `result` fields. Each `result[operator]` has separate `accuracy` and `performance` results; `performance.data` groups valid shape-level baseline and FlagAttention latencies and speedups by dtype. From the repository root, a path-free `--record json -m OP_NAME` command also collects `benchmark/`. If `--output` is omitted, benchmark invocations write `benchmark_result.json`, while accuracy-only invocations write `accuracy_result.json`. The upload summary describes the current run even when an output path is reused.
 
 `OP_NAME` is a pytest marker. The inventory names `chunk_gated_delta_rule_fwd` and `chunk_kda_enflame` are supported alongside their shorter legacy markers. A marker with no matching tests produces `NotRun` accuracy, `Skipped` performance, and no speedup data.
 
@@ -292,10 +292,10 @@ python benchmark/piecewise_benchmark.py
 python benchmark/flash_decoding_benchmark.py
 
 cd benchmark
-pytest -m "sage_attention" --record json --output benchmark_sage_attention.json --continue-on-collection-errors -vs
+pytest -m "sage_attention" --record json --output performance_result.json --continue-on-collection-errors -vs
 ```
 
-When only benchmark tests run, the upload summary marks accuracy as not run; a passing benchmark does not claim that the accuracy suite passed. Without a valid baseline, `performance.data` contains no speedup for that shape and performance is not marked as passed solely because the benchmark completed. A name such as `benchmark_abs.json` is only a local filename chosen with `--output`. To place this result in a platform upload zip, name the JSON file `summary.json` at the archive root or one directory below it.
+The requested `performance_result.json` contains each measured shape's baseline latency, FlagAttention latency, and `speedup = baseline / FlagAttention` under the operator key. When only benchmark tests run, the separate `summary.json` marks accuracy as not run; a passing benchmark does not claim that the accuracy suite passed. Without a valid baseline, neither file invents a speedup for that shape. For a platform upload zip, place the generated `summary.json` at the archive root or one directory below it.
 
 The path-free pytest command collects the pytest benchmark tests under `benchmark/`. Standalone benchmark scripts are run directly and do not contribute data to this pytest JSON file.
 

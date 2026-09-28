@@ -10,6 +10,7 @@ import json
 import math
 import os
 from collections.abc import Callable, Iterable, Mapping
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,8 @@ RecordProperty = Callable[[str, object], None]
 _MULTIPHASE_LOG_OPERATORS = {"chunk_gla", "minimax_m3_sparse_attn"}
 
 _METRIC_DEFAULTS = {
+    "case_id": None,
+    "candidate_source": None,
     "legacy_shape": None,
     "shape_detail": None,
     "latency_base": None,
@@ -54,6 +57,89 @@ def benchmark_metric(
     )
     metric.update(extra)
     return metric
+
+
+class BenchmarkRecorder:
+    """Collect one dtype/phase's shapes and submit them together to pytest or a log.
+
+    Each ``record`` call submits only shapes added since the last one.
+    """
+
+    def __init__(
+        self,
+        record_property: RecordProperty | None,
+        *,
+        op_name: str,
+        dtype: str,
+        mode: str = "kernel",
+        level: str = "comprehensive",
+        **metadata: Any,
+    ) -> None:
+        self._record_property = record_property
+        self._op_name = op_name
+        self._dtype = dtype
+        self._mode = mode
+        self._level = level
+        self._metadata = metadata
+        self._pending: list[dict[str, Any]] = []
+
+    def add(
+        self,
+        *,
+        shape_detail: Any,
+        latency: float | None,
+        latency_base: float | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """Add a measurement, computing speedup only for valid timings."""
+
+        # A caller-provided ratio must not override the ratio from the actual
+        # timings; the JSON recorder uses the timings as the source of truth.
+        extra.pop("speedup", None)
+        metric = benchmark_metric(
+            shape_detail=shape_detail,
+            latency=latency,
+            latency_base=latency_base,
+            speedup=_finite_positive_speedup(latency_base, latency),
+            **extra,
+        )
+        self._pending.append(metric)
+        return metric
+
+    def record(self) -> None:
+        """Submit pending shapes once, leaving an empty batch untouched."""
+
+        if not self._pending:
+            return
+        record_benchmark_result(
+            self._record_property,
+            op_name=self._op_name,
+            dtype=self._dtype,
+            result=self._pending,
+            mode=self._mode,
+            level=self._level,
+            **self._metadata,
+        )
+        self._pending = []
+
+
+def _finite_positive_speedup(
+    latency_base: float | None, latency: float | None
+) -> float | None:
+    if any(
+        not isinstance(value, Real) or isinstance(value, bool)
+        for value in (latency_base, latency)
+    ):
+        return None
+    try:
+        baseline = float(latency_base)
+        measured = float(latency)
+        speedup = baseline / measured
+    except (OverflowError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    if all(math.isfinite(value) and value > 0 for value in (baseline, measured, speedup)):
+        return speedup
+    return None
 
 
 def record_benchmark_result(

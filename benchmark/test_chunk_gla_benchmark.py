@@ -20,9 +20,9 @@ import torch.nn.functional as F
 import triton
 
 try:
-    from benchmark.recording import benchmark_metric, record_benchmark_result
+    from benchmark.recording import BenchmarkRecorder
 except ModuleNotFoundError:  # Direct script execution.
-    from recording import benchmark_metric, record_benchmark_result
+    from recording import BenchmarkRecorder
 
 from flag_attn.FLA.gated_linear_attention import chunk_gla as flag_attn_chunk_gla
 
@@ -131,7 +131,6 @@ _SHAPES = [
     (4, 2048, 16, 128),
     (4, 4096, 64, 128),
     (8, 2048, 32, 256),
-    (2, 2048, 16, 512),
     (4, 1024, 8, 512),
     (8, 1024, 8, 64),
 ]
@@ -195,7 +194,13 @@ def run_benchmark(
     )
 
     for dtype in _DTYPES:
-        metrics = []
+        recorder = BenchmarkRecorder(
+            record_property,
+            op_name="chunk_gla",
+            dtype=str(dtype),
+            baseline="FLA" if _HAS_FLA_CHUNK else None,
+            phase="forward",
+        )
         print("\ndtype:", dtype)
         for B, T, H, D in _SHAPES:
             q, k, v, g, kwargs = _build_inputs(B, T, H, D, dtype)
@@ -209,26 +214,12 @@ def run_benchmark(
                 lambda: flag_attn_chunk_gla(q, k, v, g, **kwargs), warmup, rep
             )
             _print_row(B, T, H, D, dtype, ms_fla, ms_flag_attn)
-            metrics.append(
-                benchmark_metric(
-                    shape_detail=(B, T, H, D),
-                    latency_base=ms_fla,
-                    latency=ms_flag_attn,
-                    speedup=(
-                        ms_fla / ms_flag_attn
-                        if ms_fla is not None and ms_flag_attn > 0
-                        else None
-                    ),
-                )
+            recorder.add(
+                shape_detail=(B, T, H, D),
+                latency_base=ms_fla,
+                latency=ms_flag_attn,
             )
-        record_benchmark_result(
-            record_property,
-            op_name="chunk_gla",
-            dtype=str(dtype),
-            result=metrics,
-            baseline="FLA" if _HAS_FLA_CHUNK else None,
-            phase="forward",
-        )
+        recorder.record()
 
     # ============================================================
     # Part 2: forward + backward
@@ -241,7 +232,13 @@ def run_benchmark(
     )
 
     for dtype in _DTYPES:
-        metrics = []
+        recorder = BenchmarkRecorder(
+            record_property,
+            op_name="chunk_gla",
+            dtype=str(dtype),
+            baseline="FLA" if _HAS_FLA_CHUNK else None,
+            phase="forward_backward",
+        )
         print("\ndtype:", dtype)
         for B, T, H, D in _SHAPES:
             q, k, v, g_logit, kwargs = _build_inputs(
@@ -271,26 +268,12 @@ def run_benchmark(
                 rep,
             )
             _print_row(B, T, H, D, dtype, ms_fla, ms_flag_attn)
-            metrics.append(
-                benchmark_metric(
-                    shape_detail=(B, T, H, D),
-                    latency_base=ms_fla,
-                    latency=ms_flag_attn,
-                    speedup=(
-                        ms_fla / ms_flag_attn
-                        if ms_fla is not None and ms_flag_attn > 0
-                        else None
-                    ),
-                )
+            recorder.add(
+                shape_detail=(B, T, H, D),
+                latency_base=ms_fla,
+                latency=ms_flag_attn,
             )
-        record_benchmark_result(
-            record_property,
-            op_name="chunk_gla",
-            dtype=str(dtype),
-            result=metrics,
-            baseline="FLA" if _HAS_FLA_CHUNK else None,
-            phase="forward_backward",
-        )
+        recorder.record()
 
     print(f"\n{'=' * 70}")
     print("  All done. ")
