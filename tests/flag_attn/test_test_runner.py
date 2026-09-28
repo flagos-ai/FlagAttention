@@ -213,6 +213,29 @@ def test_get_env_matches_shared_vendor_masking_without_path_injection(
     assert env["PYTHONPATH"] == "caller-controlled-path"
 
 
+def test_collect_marks_only_collects_tests(monkeypatch, tmp_path, runner):
+    ops = [f"op_{index}" for index in range(11)]
+    calls = []
+
+    def fake_call(command, **kwargs):
+        calls.append((command, kwargs))
+        marks_path = next(
+            Path(argument.split("=", 1)[1])
+            for argument in command
+            if argument.startswith("--collect-marks=")
+        )
+        marks_path.write_text("[]\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(runner.subprocess, "call", fake_call)
+    accuracy_marks, benchmark_marks = runner.collect_marks(ops)
+
+    assert accuracy_marks == set(ops)
+    assert benchmark_marks == set(ops)
+    assert [command[-1] for command, _ in calls] == ["tests/", "benchmark/"]
+    assert all("--collect-only" in command for command, _ in calls)
+
+
 def test_runner_commands_and_summary_processing_match_shared_flow(
     monkeypatch, tmp_path, runner
 ):
