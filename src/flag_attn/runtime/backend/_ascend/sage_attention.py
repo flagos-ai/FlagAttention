@@ -229,6 +229,17 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
 def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
             output_dtype=torch.float16, return_lse=False, maxnreg=None,
             q_scale_block=128, k_scale_block=64):
+    tensors = (q, k, v, q_scale, k_scale)
+    if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise TypeError("q, k, v, q_scale, and k_scale must be torch.Tensor instances")
+    if q.device.type != "npu":
+        raise ValueError("Ascend SageAttention requires NPU tensors")
+    if any(tensor.device != q.device for tensor in tensors):
+        raise ValueError("q, k, v, q_scale, and k_scale must use the same NPU device")
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q, k, and v must be four-dimensional tensors")
+    if k.shape != v.shape:
+        raise ValueError("k and v must have matching shapes")
     stage = 1
 
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
