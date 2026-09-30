@@ -35,6 +35,7 @@ from flag_attn.piecewise import attention as piecewise_attention  # noqa: F401
 from flag_attn.flash import attention as flash_attention  # noqa: F401
 from flag_attn.split_kv import attention as flash_attention_split_kv  # noqa: F401
 from flag_attn.paged import attention as paged_attention  # noqa: F401
+from flag_attn.rotary import rotary_embedding  # noqa: F401
 from flag_attn import testing  # noqa: F401
 
 _OPERATOR_EXPORTS = {
@@ -88,6 +89,7 @@ __all__ = [
     "flash_attention",
     "flash_attention_split_kv",
     "paged_attention",
+    "rotary_embedding",
     "chunk_gated_delta_rule",
     "chunk_gla",
     "chunk_gdn2",
