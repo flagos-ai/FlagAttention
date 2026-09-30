@@ -387,3 +387,36 @@ def test_attention_bwd_dropout(B, H, M, N, D, causal, dropout_p, stride_order, d
     assert gq_triton_max_diff < 2 * gq_torch_max_diff + 1e-5
     assert gk_triton_max_diff < 2 * gk_torch_max_diff + 1e-5
     assert gv_triton_max_diff < 2 * gv_torch_max_diff + 1e-5
+
+
+@pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
+@pytest.mark.parametrize('B, Hq, Hk, M, N, D', [
+    (4, 8, 8, 512, 512, 64),   # small kv workload: single-kernel path on most GPUs
+    (1, 2, 2, 128, 4096, 64),  # long N, few heads: split-kv path on most GPUs
+])
+@pytest.mark.parametrize('causal', [True, False])
+@pytest.mark.parametrize('dtype', [torch.float16])
+@pytest.mark.parametrize('strided_input', ['k', 'v'])
+def test_attention_fwd_mismatched_kv_layouts(B, Hq, Hk, M, N, D, causal, dtype, strided_input, device_id):
+    # k and v handed in with different memory layouts: the forward kernels used
+    # to initialize the K tile pointer with V's strides and vice versa, which is
+    # a no-op only while the two layouts agree. An every-2nd-token row view
+    # keeps innermost contiguity, so maybe_contiguous passes it through.
+    device = f"cuda:{device_id}"
+    q = torch.empty((B, Hq, M, D), dtype=dtype, device=device).normal_()
+    k = torch.empty((B, Hk, N, D), dtype=dtype, device=device).normal_()
+    v = torch.empty((B, Hk, N, D), dtype=dtype, device=device).normal_()
+    if strided_input == 'k':
+        k = torch.empty((B, Hk, 2 * N, D), dtype=dtype, device=device).normal_()[:, :, ::2, :]
+    else:
+        v = torch.empty((B, Hk, 2 * N, D), dtype=dtype, device=device).normal_()[:, :, ::2, :]
+
+    o_ref = flag_attn.testing.flash_attention(q, k, v, causal, upcast=True)
+    o_torch = flag_attn.testing.flash_attention(q, k, v, causal, upcast=False)
+    o_hyp = flag_attn.flash_attention(q, k, v, causal)
+
+    torch_max_diff = max_diff(o_torch, o_ref)
+    triton_max_diff = max_diff(o_hyp, o_ref)
+    report("o hyp", o_hyp, o_ref)
+    report("o torch", o_torch, o_ref)
+    assert triton_max_diff <= 2 * torch_max_diff + 1e-5
