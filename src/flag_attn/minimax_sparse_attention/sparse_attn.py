@@ -64,8 +64,30 @@ _MSA_PREFILL_UNTRANSPOSED_MIN_QH = 16
 # Register cap for the fp8 TLE prefill kernel. Staging K in smem frees
 # 64 regs/thread, but Triton will not spend that budget on occupancy unless
 # told to: without a cap the kernel still compiles to 255 registers and gains
-# nothing (1.00x), while maxnreg=128 reaches 1.28-1.36x. Single-peaked -- 144
-# and 120 are both worse, 80 and below lose to spills.
+# nothing (1.00x). On H20 (78 SM) the curve was single-peaked at 128.
+#
+# On H100 (132 SM) the right value depends on the shape, and 128 is the better
+# single choice -- it was re-verified here, not inherited.
+#
+# At GQA 24 with a long chunk, 128 does not hold the tile and spills to DRAM
+# (local-load sectors 5.51e9 vs 1.85e9 at 168; dram__bytes 50.91 GB vs 3.40 GB),
+# which costs that one shape 0.915x of upstream; 168 turns it into 1.144x.
+# But GQA 16 at short chunks goes the other way, and far more sharply. Measured
+# against upstream on an idle card, n=4 interleaved, launch-verified
+# (total_q = batch * query_len):
+#   shape          total_q   maxnreg=168   maxnreg=128
+#   1x128x4096         128        0.900x        1.052x
+#   1x128x16384        128        0.885x        1.040x
+#   1x128x65536        128        0.816x        1.025x
+#   4x128x4096         512        1.068x        1.113x
+# 128 is the only value that beats upstream at total_q = 128, where low
+# occupancy cannot be hidden; none/192/232 all lose there too. Over the 21-shape
+# GQA-16 prefill set, 128 keeps every shape at or above upstream while 168
+# regresses three of them by up to 18.6%.
+#
+# So this stays 128. A shape-conditional cap (168 only for QH >= 32, which is
+# where the spill actually happens) would capture both, but that needs a
+# conditional at the launch site rather than a constant.
 _MSA_PREFILL_FP8_MAXNREG = 128
 
 _SM_COUNT_CACHE: dict[int, int] = {}
@@ -1890,11 +1912,40 @@ def minimax_m3_sparse_attn_decode(
     # split-K over the selected blocks; chunk count is shape-constant (cuda
     # graph). 3*SM pushes a narrow band down to chunks == 1, which activates the
     # merge-skip; outside it the fixed 256 target is better.
+    #
+    # The band was derived for 78 SM, where 3*SM == 234 reaches chunks == 1 for
+    # P in 118..128. At 132 SM it cannot: 3*SM == 396 yields chunks == 2 there,
+    # and for P in 129..198 that is strictly worse than the fixed 256 target,
+    # which already gives 1. Measured on H100, the shipped band and no band at
+    # all are indistinguishable at every default and user shape (0.0647 vs
+    # 0.0647 ms at P=128) -- it is a dead configuration here.
+    #
+    # Reaching chunks == 1 at P == 128 needs a target in [128, 255], and the
+    # payoff splits by dtype, because halving the grid also halves occupancy
+    # (0.97 -> 0.48 waves/SM) and only bf16 is bandwidth-bound enough to come
+    # out ahead. Measured at P=128, n=5, GQA 16:
+    #            bf16                      fp8
+    #   chunks=2 (shipped)  0.0647 ms      0.0593 ms
+    #   chunks=1 (tg 255)   0.0626 ms      0.0740 ms
+    #                       1.034x faster  0.801x slower
+    # So the merge-skip is taken on the bf16 path only. P=64 and P=256 are
+    # unaffected either way (1.000-1.001x), confirming this is scoped to the band.
     p = max(1, total_q * num_kv_heads)
     if _MSA_DECODE_GRID_BAND_LO <= p <= _MSA_DECODE_GRID_BAND_HI:
         target_grid = 3 * _sm_count(q.device)
     else:
         target_grid = _MSA_DECODE_TARGET_GRID
+    if not use_fp8 and p <= _MSA_DECODE_TARGET_GRID:
+        # bf16: if a target just under the fixed one would collapse the chunk
+        # count to 1 while the selected target does not, take it -- that is the
+        # merge-skip the band was meant to reach. On 78 SM the band already
+        # gets there, so this changes nothing; it only fires where 3*SM
+        # overshoots. max_topk is in the min() above, so compare post-clamp.
+        skip_grid = _MSA_DECODE_TARGET_GRID - 1
+        if max(1, min(max_topk, skip_grid // p)) == 1 and (
+            max(1, min(max_topk, target_grid // p)) > 1
+        ):
+            target_grid = skip_grid
     target = max(1, min(max_topk, target_grid // p))
     num_topk_chunks = 1 << (target.bit_length() - 1)
 
