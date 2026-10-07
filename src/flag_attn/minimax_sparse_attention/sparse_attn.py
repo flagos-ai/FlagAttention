@@ -62,6 +62,20 @@ _MSA_DECODE_FUSED_MIN_PARALLELISM = 512
 _MSA_PREFILL_UNTRANSPOSED_MIN_QH = 16
 
 _SM_COUNT_CACHE: dict[int, int] = {}
+_PDL_SUPPORTED: bool | None = None
+
+
+def _pdl_supported() -> bool:
+    """Whether this platform supports programmatic dependent launch.
+
+    Measured at 4.7 us per call on this box, against a decode kernel of
+    17-25 us at small batch -- so querying it per launch is a real cost, not a
+    rounding error. The answer is fixed for the process.
+    """
+    global _PDL_SUPPORTED
+    if _PDL_SUPPORTED is None:
+        _PDL_SUPPORTED = current_platform.is_arch_support_pdl()
+    return _PDL_SUPPORTED
 
 
 def _sm_count(device) -> int:
@@ -1599,7 +1613,7 @@ def minimax_m3_sparse_attn_decode(
         if use_fp8
         else (output, output, 0, 0, 0, 0, _KV_SCALE_NONE)
     )
-    use_pdl = current_platform.is_arch_support_pdl()
+    use_pdl = _pdl_supported()
     pdl_launch = {"launch_pdl": True} if use_pdl else {}
 
     # split-K over the selected blocks; chunk count is shape-constant (cuda
