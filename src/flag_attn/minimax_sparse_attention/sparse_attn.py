@@ -1921,6 +1921,11 @@ def minimax_m3_sparse_attn_decode(
     # is a measurable share of wall time -- taking the shortest route here is
     # worth more than any kernel tweak. Measured: without this, small-batch
     # shapes ran 0.89-0.95x of upstream purely on host overhead.
+    # `single_chunk` selects the kernel and whether a merge pass runs; it is
+    # deliberately NOT folded into USE_PDL. Doing so forks that constexpr and
+    # splits the shared decode kernel into extra compiled variants, so the
+    # same shape resolves to different cache entries depending on the call
+    # site -- measured as a systematic 1.4-3.8% loss on the chunks>1 shapes.
     single_chunk = num_topk_chunks == 1
     if not single_chunk and not use_fused_decode:
         o_partial = torch.empty(
@@ -2023,7 +2028,7 @@ def minimax_m3_sparse_attn_decode(
             block_table.stride(0),
             BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
             NUM_TOPK_CHUNKS=num_topk_chunks,
-            USE_PDL=use_pdl and not single_chunk,
+            USE_PDL=use_pdl,
             SINGLE_CHUNK=single_chunk,
             **pdl_launch,
         )
@@ -2050,7 +2055,7 @@ def minimax_m3_sparse_attn_decode(
                 NUM_TOPK_CHUNKS=num_topk_chunks,
                 USE_FP8=use_fp8,
                 KV_SCALE_MODE=kv_scale_mode,
-                USE_PDL=use_pdl and not single_chunk,
+                USE_PDL=use_pdl,
                 SINGLE_CHUNK=single_chunk,
                 **pdl_launch,
             )
@@ -2072,7 +2077,7 @@ def minimax_m3_sparse_attn_decode(
                 NUM_TOPK_CHUNKS=num_topk_chunks,
                 USE_FP8=use_fp8,
                 KV_SCALE_MODE=kv_scale_mode,
-                USE_PDL=use_pdl and not single_chunk,
+                USE_PDL=use_pdl,
                 **pdl_launch,
             )
     if not single_chunk:
