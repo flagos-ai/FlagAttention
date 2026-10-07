@@ -61,6 +61,13 @@ _MSA_DECODE_FUSED_MIN_PARALLELISM = 512
 # runs out of bounds. Smaller GQA tiles go to the tl.dot kernel instead.
 _MSA_PREFILL_UNTRANSPOSED_MIN_QH = 16
 
+# Register cap for the fp8 TLE prefill kernel. Staging K in smem frees
+# 64 regs/thread, but Triton will not spend that budget on occupancy unless
+# told to: without a cap the kernel still compiles to 255 registers and gains
+# nothing (1.00x), while maxnreg=128 reaches 1.28-1.36x. Single-peaked -- 144
+# and 120 are both worse, 80 and below lose to spills.
+_MSA_PREFILL_FP8_MAXNREG = 128
+
 _SM_COUNT_CACHE: dict[int, int] = {}
 _PDL_SUPPORTED: bool | None = None
 
@@ -1418,6 +1425,233 @@ def _tma_allocator(size: int, align: int, stream):
 
 
 # ---------------------------------------------------------------------------
+# fp8 prefill on the TLE path. Upstream sends all fp8 to the tl.dot kernel,
+# which is 2.16x SLOWER than its own bf16 path while every memory channel sits
+# idle (DRAM 0.4%, L2 13.8%): ncu puts the cost in 255 registers + 6 spills and
+# 22% math_pipe_throttle, not in bandwidth. Meanwhile a direct probe puts the
+# fp8 WGMMA issue ceiling at 252.7 TFLOPS against bf16's 133.5.
+#
+# This kernel stages K through TMA and feeds it to WGMMA still in fp8, so the
+# [K, D] K tile is never materialized in registers -- that frees 64
+# regs/thread. The freed space only pays off under an explicit maxnreg cap:
+# measured at (1,4096,4096), upstream is 4.388 ms, upstream+maxnreg=128 is
+# 4.216 ms (1.03x, the cap alone achieves almost nothing), and this kernel with
+# maxnreg=128 is 3.213 ms -- so the two are complementary, not alternatives.
+#
+# maxnreg=128 is a single-peaked optimum, verified across five shapes:
+#   none 1.00x | 168 1.26x | 144 1.26x | 128 1.33x | 120 1.27x | 96 1.06x
+#   | 80 0.84x | 64 0.71x
+#
+# PV stays on tl.dot: it contracts over K, so an fp8 WGMMA would need V as
+# [D, K], and TMA cannot read the cache's [K, D] V transposed -- a descriptor
+# with swapped strides is rejected ("strides must be 16-byte aligned", fp8's
+# innermost stride being 1 byte).
+#
+# Scalar KV scales only (KV_SCALE_MODE == 1); other modes keep the tl.dot path.
+# ---------------------------------------------------------------------------
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+        "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_QH": lambda args: triton.next_power_of_2(
+            args["gqa_group_size"]
+        ),
+    }
+)
+@triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
+def _gqa_sparse_fwd_tle_fp8_kernel(
+    q_ptr,  # [total_q, num_heads, head_dim] bf16
+    kv_cache_ptr,  # [num_blocks, num_kv_heads, 128, 2*head_dim] fp8
+    k_desc,  # TMA view of the K half, fp8
+    k_scale_ptr,
+    v_scale_ptr,
+    t_ptr,
+    o_ptr,
+    block_table_ptr,
+    cu_seqlens_q,
+    seq_lens,
+    prefix_lens,
+    num_kv_heads,
+    gqa_group_size,
+    head_dim,
+    max_topk,
+    sm_scale,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_kv_blk,
+    stride_kv_h,
+    stride_kv_pos,
+    stride_kv_d,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_on,
+    stride_oh,
+    stride_od,
+    stride_bt_b,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_QH: tl.constexpr,
+):
+    sm_scale_log2e = sm_scale * 1.4426950409
+    pid_q = tl.program_id(0)
+    pid_kh = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    pid_h = pid_kh * gqa_group_size
+
+    q_start = tl.load(cu_seqlens_q + pid_b)
+    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
+    if pid_q >= q_len:
+        return
+    seq_len = tl.load(seq_lens + pid_b)
+    prefix_len = tl.load(prefix_lens + pid_b)
+
+    off_n = tl.arange(0, BLOCK_SIZE_K)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    q_abs = prefix_len + pid_q
+    loop_blocks = tl.minimum(max_topk, (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K)
+    causal_offsets = q_abs - off_n
+
+    bt_row = block_table_ptr + pid_b * stride_bt_b
+    q_ptrs = tl.make_block_ptr(
+        base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
+        shape=(q_len, gqa_group_size, head_dim),
+        strides=(stride_qn, stride_qh, stride_qd),
+        offsets=(pid_q, 0, 0),
+        block_shape=(1, BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(2, 1, 0),
+    )
+    q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
+    q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
+
+    # Scalar KV scales are invariant across pages: fold K's into the logits
+    # scale and defer V's to the normalized output, exactly as upstream does.
+    qk_scale = sm_scale_log2e * tl.load(k_scale_ptr)
+    v_scale_scalar = tl.load(v_scale_ptr)
+
+    # Q is quantized ONCE, outside the loop, per head. Its scale is restored on
+    # the fp32 logits, so no accuracy is traded for the fp8 operand.
+    q_absmax = tl.max(tl.abs(q), axis=1)
+    q_scale = tl.maximum(q_absmax * (1.0 / 448.0), 1.0e-8)
+    q_fp8 = (q / q_scale[:, None]).to(tl.float8e4nv)
+
+    # Staged in smem as [QH, D]: D innermost, which is what the K-major-only
+    # fp8 WGMMA requires of its B operand under trans_b.
+    q_smem = tle.gpu.alloc(
+        [1, BLOCK_SIZE_QH, BLOCK_SIZE_D],
+        dtype=tl.float8e4nv,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    tl.store(tle.gpu.local_ptr(q_smem.slot(0)), q_fp8)
+    tl.debug_barrier()
+
+    # K staged by TMA, kept in fp8 -- never materialized as a register tile.
+    # This is the change that is supposed to drop the register count.
+    k_smem = tle.gpu.alloc(
+        [1, BLOCK_SIZE_K, BLOCK_SIZE_D],
+        dtype=tl.float8e4nv,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    k_bytes: tl.constexpr = BLOCK_SIZE_K * BLOCK_SIZE_D  # fp8: 1 byte/elem
+    k_full = tle.gpu.alloc_barriers(
+        num_barriers=1, arrive_count=1, expect_bytes=k_bytes
+    )
+
+    m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_SIZE_QH,), dtype=tl.float32)
+    acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
+
+    topk_ptr = t_ptr + pid_kh * stride_th + (q_start + pid_q) * stride_tn
+
+    cur_page = tl.full((), 0, dtype=tl.int32)
+    cur_c = tl.full((), 0, dtype=tl.int32)
+    if loop_blocks > 0:
+        b0 = tl.load(topk_ptr).to(tl.int32)
+        cur_page = tl.load(bt_row + b0).to(tl.int32)
+        cur_c = b0 * BLOCK_SIZE_K
+
+    for block_iter in tl.range(loop_blocks, disable_licm=True, num_stages=1):
+        page = cur_page
+        c = cur_c
+        pos = c + off_n
+        pos_mask = pos < seq_len
+        k_row = (page * num_kv_heads + pid_kh) * BLOCK_SIZE_K
+
+        tle.gpu.copy(
+            k_desc,
+            k_smem.slot(0),
+            [BLOCK_SIZE_K, BLOCK_SIZE_D],
+            [k_row, 0],
+            barrier=k_full[0],
+        )
+        tle.gpu.barrier_wait(k_full[0], phaseIdx=block_iter)
+
+        # acc[K, QH] = K[K, D] @ Q[QH, D]^T -- both fp8, both D-innermost.
+        qk_t = tle.gpu.wgmma(
+            k_smem.slot(0),
+            q_smem.slot(0),
+            out_dtype=tl.float32,
+            trans_b=True,
+        )
+        qk_t = tle.gpu.wgmma_wait(0, qk_t)
+
+        # Resolve the next page while the WGMMA result is still being consumed.
+        if block_iter + 1 < loop_blocks:
+            nb = tl.load(topk_ptr + (block_iter + 1) * stride_tk).to(tl.int32)
+            cur_page = tl.load(bt_row + nb).to(tl.int32)
+            cur_c = nb * BLOCK_SIZE_K
+
+        # Restore Q's quantization scale on the fp32 logits and fold in both
+        # the softmax base-2 factor and the scalar K scale.
+        qk = tl.trans(qk_t) * (q_scale[:, None] * qk_scale)
+
+        if (c + BLOCK_SIZE_K) > q_abs:
+            qk += tl.where(causal_offsets[None, :] >= c, 0, float("-inf"))
+        if (c + BLOCK_SIZE_K) > seq_len:
+            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        p = tl.exp2(qk - m_ij[:, None])
+        alpha = tl.exp2(m_i - m_ij)
+        l_ij = tl.sum(p, axis=1)
+        acc_o *= alpha[:, None]
+
+        # PV stays on tl.dot: it contracts over K, so fp8 WGMMA would need V as
+        # [D, K] and TMA cannot produce that (see the module docstring). V is
+        # loaded to registers and dequantized to Q's dtype, as upstream does.
+        v = tl.load(
+            kv_cache_ptr
+            + page.to(tl.int64) * stride_kv_blk
+            + pid_kh * stride_kv_h
+            + off_n[:, None] * stride_kv_pos
+            + (head_dim + off_d[None, :]) * stride_kv_d,
+            mask=pos_mask[:, None],
+            other=0.0,
+        ).to(q_ptr.dtype.element_ty)
+        acc_o += tl.dot(p.to(v.dtype), v)
+
+        l_i = tl.math.fma(l_i, alpha, l_ij)
+        m_i = m_ij
+
+    inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0) * v_scale_scalar
+    acc_o *= inv_l[:, None]
+    acc_o = tl.reshape(acc_o, 1, BLOCK_SIZE_H, BLOCK_SIZE_D)
+    o_ptrs = tl.make_block_ptr(
+        base=o_ptr + q_start * stride_on + pid_h * stride_oh,
+        shape=(q_len, gqa_group_size, head_dim),
+        strides=(stride_on, stride_oh, stride_od),
+        offsets=(pid_q, 0, 0),
+        block_shape=(1, BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(2, 1, 0),
+    )
+    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
+
+
+# ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
 _KV_SCALE_NONE = 0
@@ -1531,6 +1765,43 @@ def minimax_m3_sparse_attn(
     # [BLOCK_SIZE_K, BLOCK_SIZE_QH] and issuing PV as
     # `wgmma(kv, p, acc, trans_a=True)` reads out of bounds at QH == 8
     # (measured: illegal memory access at gqa 6/7/8, exact at gqa >= 10).
+    # fp8 with scalar scales goes to the TLE kernel; the tl.dot path remains
+    # for per-token scales (not yet ported) and for GQA tiles too small to form
+    # a legal WGMMA.
+    use_fp8_tle = (
+        use_fp8
+        and tle is not None
+        and kv_scale_mode == _KV_SCALE_SCALAR
+        and block_size_h >= _MSA_PREFILL_UNTRANSPOSED_MIN_QH
+    )
+    if use_fp8_tle:
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        triton.set_allocator(_tma_allocator)
+        kv_cache_2d = kv_cache.view(-1, 2 * head_dim)
+        k_desc = TensorDescriptor(
+            kv_cache_2d,
+            shape=[kv_cache_2d.shape[0], kv_cache_2d.shape[1]],
+            strides=[kv_cache_2d.stride(0), kv_cache_2d.stride(1)],
+            block_shape=[SPARSE_BLOCK_SIZE, head_dim],
+        )
+        _gqa_sparse_fwd_tle_fp8_kernel[grid](
+            q, kv_cache, k_desc, k_scale_arg, v_scale_arg, topk_idx, output,
+            block_table, cu_seqlens_q, seq_lens, prefix_lens,
+            num_kv_heads, gqa_group_size, head_dim, topk, sm_scale,
+            q.stride(0), q.stride(1), q.stride(2),
+            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+            kv_cache.stride(3),
+            topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
+            output.stride(0), output.stride(1), output.stride(2),
+            block_table.stride(0),
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            num_warps=4,
+            num_stages=1,
+            maxnreg=_MSA_PREFILL_FP8_MAXNREG,
+        )
+        return
+
     if use_fp8 or block_size_h < 8:
         _gqa_sparse_fwd_kernel[grid](
             q, kv_cache, k_scale_arg, v_scale_arg, topk_idx, output,
