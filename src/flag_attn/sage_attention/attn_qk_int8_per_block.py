@@ -17,8 +17,6 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.runtime.backend._ascend.attn_qk_int8_per_block import forward
-
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,

@@ -17,7 +17,19 @@ import math
 import pytest
 import torch
 
-from flag_attn.runtime.backend._ascend import forward, per_block_int8
+try:
+    import torch_npu  # noqa: F401
+except ImportError:
+    pass
+
+_NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
+if _NPU_AVAILABLE:
+    from flag_attn.runtime.backend._ascend import forward, per_block_int8
+
+
+pytestmark = pytest.mark.skipif(
+    not _NPU_AVAILABLE, reason="Ascend SageAttention tests require an available NPU"
+)
 
 
 def _expand_scale(scale, block_size, length):

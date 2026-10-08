@@ -27,7 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.gated_delta_rule.index import prepare_chunk_indices
+from flag_attn.FLA.index import prepare_chunk_indices
 
 from ..triton_ops_helper import autotune_cache_kwargs, exp2
 

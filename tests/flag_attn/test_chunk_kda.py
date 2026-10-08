@@ -18,7 +18,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flag_attn.runtime.backend._enflame.kda import chunk_kda
+from flag_attn.runtime.backend._enflame.FLA.kda import chunk_kda
 
 LOWER_BOUND = -5.0
 ASSERT_RATIO = 0.005
@@ -30,6 +30,7 @@ def _accelerator_available() -> bool:
 
 pytestmark = [
     pytest.mark.chunk_kda,
+    pytest.mark.chunk_kda_enflame,
     pytest.mark.skipif(
         not _accelerator_available(),
         reason="chunk_kda tests require an available Enflame GCU",

@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.gated_delta_rule.index import prepare_chunk_indices
+from flag_attn.FLA.index import prepare_chunk_indices
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})

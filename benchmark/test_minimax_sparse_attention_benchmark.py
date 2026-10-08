@@ -21,16 +21,25 @@ with scalar K/V dequantization scales passed to both implementations.
 
 from __future__ import annotations
 
+import ast
 import inspect
+import math
 import sys
+import textwrap
 import warnings
-from dataclasses import dataclass
-from typing import Callable
+from dataclasses import dataclass, replace
+from typing import Any, Callable
 
+import pytest
 import torch
 import triton
 import triton.knobs
 import triton.testing as triton_testing
+
+try:
+    from benchmark.recording import BenchmarkRecorder
+except ModuleNotFoundError:  # Direct script execution.
+    from recording import BenchmarkRecorder
 
 from flag_attn.minimax_sparse_attention import (
     SPARSE_BLOCK_SIZE,
@@ -69,29 +78,29 @@ triton.knobs.autotuning.adjust_block_size = False
 
 
 class _CachedPlatform:
-    """Return one cached PDL decision during benchmark iterations."""
+    """Cache the PDL decision while retaining the platform's other methods."""
 
-    def __init__(self, supports_pdl: bool):
-        self._supports_pdl = supports_pdl
+    def __init__(self, platform: Any):
+        self._platform = platform
+        self._supports_pdl = platform.is_arch_support_pdl()
 
     def is_arch_support_pdl(self) -> bool:
         return self._supports_pdl
 
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._platform, name)
+
 
 _flag_attn_index_module = sys.modules[minimax_m3_index_decode.__module__]
 _flag_attn_sparse_module = sys.modules[minimax_m3_sparse_attn_decode.__module__]
-_flag_attn_platform = _CachedPlatform(
-    _flag_attn_index_module.current_platform.is_arch_support_pdl()
-)
+_flag_attn_platform = _CachedPlatform(_flag_attn_index_module.current_platform)
 _flag_attn_index_module.current_platform = _flag_attn_platform
 _flag_attn_sparse_module.current_platform = _flag_attn_platform
 
 if VLLM_AVAILABLE:
     _vllm_index_module = sys.modules[vllm_index_decode.__module__]
     _vllm_sparse_module = sys.modules[vllm_sparse_attn_decode.__module__]
-    _vllm_platform = _CachedPlatform(
-        _vllm_index_module.current_platform.is_arch_support_pdl()
-    )
+    _vllm_platform = _CachedPlatform(_vllm_index_module.current_platform)
     _vllm_index_module.current_platform = _vllm_platform
     _vllm_sparse_module.current_platform = _vllm_platform
 
@@ -102,6 +111,9 @@ FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 DEFAULT_WARMUP = 200
 DEFAULT_REP = 300
 KV_SCALE = 0.5
+BF16_ATOL = BF16_RTOL = 2e-2
+FP8_ATOL, FP8_RTOL = 6e-2, 8e-2
+OUTPUT_CHECK_CHUNK_ELEMENTS = 1 << 20
 
 PREFILL_SHAPES = [
     (1, 8192, 16, 96),
@@ -458,6 +470,160 @@ def _supports_fp8_scales() -> bool:
     )
 
 
+def _sparse_kv_layout(fn: Callable) -> str:
+    """Infer the cache contract from the actual vLLM wrapper's stride accesses."""
+    try:
+        source = inspect.getsource(inspect.unwrap(fn))
+        tree = ast.parse(textwrap.dedent(source))
+    except (OSError, TypeError, SyntaxError) as exc:
+        raise RuntimeError(
+            f"Cannot inspect vLLM {fn.__name__} KV cache layout; refusing to "
+            "report an unverified speedup."
+        ) from exc
+
+    indices: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if not (
+            isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "kv_cache"
+            and node.func.attr == "stride"
+        ):
+            continue
+        if (
+            len(node.args) != 1
+            or node.keywords
+            or not isinstance(node.args[0], ast.Constant)
+            or type(node.args[0].value) is not int
+        ):
+            raise RuntimeError(
+                f"Ambiguous vLLM {fn.__name__} KV cache stride access; "
+                "cannot select a safe cache layout."
+            )
+        indices.add(node.args[0].value)
+
+    layouts = {
+        frozenset(range(4)): "packed4d",
+        frozenset(range(5)): "split5d",
+    }
+    layout = layouts.get(frozenset(indices))
+    if layout is None:
+        raise RuntimeError(
+            f"Unknown vLLM {fn.__name__} KV cache stride indices "
+            f"{sorted(indices)}; cannot select a safe cache layout."
+        )
+    return layout
+
+
+def _vllm_kv_layout(prefill: Callable, decode: Callable) -> str:
+    prefill_layout = _sparse_kv_layout(prefill)
+    decode_layout = _sparse_kv_layout(decode)
+    if prefill_layout != decode_layout:
+        raise RuntimeError(
+            "vLLM prefill/decode KV cache layouts differ: "
+            f"{prefill_layout} vs {decode_layout}."
+        )
+    return prefill_layout
+
+
+def _vllm_data(data: MSAData, layout: str) -> MSAData:
+    if layout == "packed4d":
+        return data
+    if layout != "split5d":
+        raise ValueError(f"Unsupported vLLM KV cache layout: {layout}")
+    cache = data.kv_cache
+    if cache.ndim != 4 or cache.shape[-1] != 2 * HEAD_DIM:
+        raise ValueError(f"Unexpected FlagAttention KV cache shape: {tuple(cache.shape)}")
+    blocks, heads, tokens, _ = cache.shape
+    # 4D: [block, head, token, K|V] -> 5D: [block, K/V, token, head, dim].
+    # Convert after physical pages are randomized, preserving block_table indices.
+    legacy_cache = (
+        cache.reshape(blocks, heads, tokens, 2, HEAD_DIM)
+        .permute(0, 3, 2, 1, 4)
+        .contiguous()
+    )
+    return replace(data, kv_cache=legacy_cache)
+
+
+def _check_outputs(
+    flag_output: torch.Tensor,
+    vllm_output: torch.Tensor,
+    *,
+    shape: tuple[int, int, int, int],
+    dtype_name: str,
+    mode: str,
+    layout: str,
+) -> float:
+    context = f"{mode}, {dtype_name}, shape={shape}, vLLM layout={layout}"
+    # Keep the benchmark outputs on GPU, but do the accuracy work on CPU. A
+    # full-size GPU assert_close can need several times the output's size in
+    # temporary tensors, even when the two outputs match.
+    flag_cpu = flag_output.detach().cpu()
+    vllm_cpu = vllm_output.detach().cpu()
+    for provider, output in (("FlagAttention", flag_cpu), ("vLLM", vllm_cpu)):
+        for chunk in output.reshape(-1).split(OUTPUT_CHECK_CHUNK_ELEMENTS):
+            if not torch.isfinite(chunk).all().item():
+                raise AssertionError(f"{provider} produced NaN or Inf ({context})")
+
+    atol, rtol = (
+        (FP8_ATOL, FP8_RTOL) if dtype_name == "fp8" else (BF16_ATOL, BF16_RTOL)
+    )
+    if (
+        flag_output.shape != vllm_output.shape
+        or flag_output.dtype != vllm_output.dtype
+        or flag_output.device != vllm_output.device
+        or flag_output.layout != vllm_output.layout
+    ):
+        raise AssertionError(
+            f"FlagAttention/vLLM output mismatch ({context}); "
+            f"metadata differs: shape={tuple(flag_output.shape)}/{tuple(vllm_output.shape)}, "
+            f"dtype={flag_output.dtype}/{vllm_output.dtype}, "
+            f"device={flag_output.device}/{vllm_output.device}, "
+            f"layout={flag_output.layout}/{vllm_output.layout}"
+        )
+
+    flag_flat = flag_cpu.reshape(-1)
+    vllm_flat = vllm_cpu.reshape(-1)
+    try:
+        for flag_chunk, vllm_chunk in zip(
+            flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+            vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+        ):
+            torch.testing.assert_close(flag_chunk, vllm_chunk, atol=atol, rtol=rtol)
+    except AssertionError as exc:
+        max_abs_diff = 0.0
+        for flag_chunk, vllm_chunk in zip(
+            flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+            vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+        ):
+            if flag_chunk.numel():
+                diff = (flag_chunk.float() - vllm_chunk.float()).abs()
+                max_abs_diff = max(max_abs_diff, diff.max().item())
+        raise AssertionError(
+            f"FlagAttention/vLLM output mismatch ({context}); "
+            f"max_abs_diff={max_abs_diff:.6g}, atol={atol}, rtol={rtol}"
+        ) from exc
+
+    dot = flag_norm_sq = vllm_norm_sq = 0.0
+    for flag_chunk, vllm_chunk in zip(
+        flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+        vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+    ):
+        flag_values = flag_chunk.float().double()
+        vllm_values = vllm_chunk.float().double()
+        dot += torch.dot(flag_values, vllm_values).item()
+        flag_norm_sq += torch.dot(flag_values, flag_values).item()
+        vllm_norm_sq += torch.dot(vllm_values, vllm_values).item()
+    if flag_norm_sq == 0 and vllm_norm_sq == 0:
+        return 1.0
+    denominator = max(
+        math.sqrt(flag_norm_sq) * math.sqrt(vllm_norm_sq),
+        torch.finfo(torch.float32).tiny,
+    )
+    return max(-1.0, min(1.0, dot / denominator))
+
+
 def _bench_steps(
     data: MSAData,
     decode: bool,
@@ -584,11 +750,20 @@ def _format_columns(columns: list[tuple[str, int]]) -> str:
     return "  ".join(f"{value:>{width}s}" for value, width in columns)
 
 
-def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
+def _run_dtype(
+    args: MSABenchmarkArgs,
+    dtype_name: str,
+    record_property: Callable[[str, object], None] | None = None,
+) -> None:
     run_vllm = VLLM_AVAILABLE and not args.no_vllm
     if dtype_name == "fp8" and run_vllm and not _supports_fp8_scales():
         print("[baseline] vLLM FP8 skipped: k_scale/v_scale are unavailable")
         run_vllm = False
+    vllm_layout = (
+        _vllm_kv_layout(vllm_sparse_attn, vllm_sparse_attn_decode)
+        if run_vllm
+        else None
+    )
 
     mode = f"decode qlen={args.decode_qlen}" if args.decode else "prefill"
     use_identity_pages = args.identity_pages or dtype_name == "fp8"
@@ -602,13 +777,16 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
     )
     print("Timing: eager execution with CUDA events")
     if run_vllm:
+        print(f"vLLM KV cache layout: {vllm_layout}; outputs checked before timing")
         print("Provider order: alternates by shape")
     else:
         print("vLLM baseline: unavailable; FlagAttn only")
 
     headers = [("Shape [B,S,KVH,H]", 22), ("FlagAttn(ms)", 13)]
     if run_vllm:
-        headers.extend([("vLLM(ms)", 10), ("vLLM/ours", 10)])
+        headers.extend(
+            [("vLLM(ms)", 10), ("vLLM/ours", 10), ("Cosine", 9), ("Match", 6)]
+        )
     if args.per_step:
         if args.decode:
             headers.extend([("IdxDec(ms)", 11), ("AttnDec(ms)", 11)])
@@ -620,6 +798,16 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
     print(separator)
 
     device = torch.device("cuda")
+    recorder = BenchmarkRecorder(
+        record_property,
+        op_name="minimax_m3_sparse_attn",
+        dtype=str(torch.bfloat16 if dtype_name == "bf16" else FP8_DTYPE),
+        baseline="vLLM" if run_vllm else None,
+        vllm_kv_layout=vllm_layout,
+        phase="decode" if args.decode else "prefill",
+        topk=args.topk,
+        decode_qlen=args.decode_qlen if args.decode else None,
+    )
     for shape_index, shape in enumerate(_get_shapes(args)):
         batch, seq_len, num_kv_heads, num_heads = shape
         if num_heads % num_kv_heads != 0:
@@ -646,6 +834,7 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
             randomize_pages=not use_identity_pages,
             generator=generator,
         )
+        vllm_data = _vllm_data(data, vllm_layout) if vllm_layout else None
         flag_attn_output = torch.empty_like(data.q)
         vllm_output = torch.empty_like(data.q) if run_vllm else None
 
@@ -679,11 +868,12 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
 
         def vllm_run() -> None:
             assert vllm_output is not None
+            assert vllm_data is not None
             if args.decode:
                 run_decode(
                     vllm_index_decode,
                     vllm_sparse_attn_decode,
-                    data,
+                    vllm_data,
                     seq_len,
                     num_kv_heads,
                     args.topk,
@@ -697,7 +887,7 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
                     vllm_index_score,
                     vllm_index_topk,
                     vllm_sparse_attn,
-                    data,
+                    vllm_data,
                     seq_len,
                     num_kv_heads,
                     args.topk,
@@ -706,7 +896,21 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
                     vllm_output,
                 )
 
+        vllm_ms = None
+        accuracy = None
         if run_vllm:
+            flag_attn_run()
+            vllm_run()
+            torch.cuda.synchronize()
+            assert vllm_output is not None and vllm_layout is not None
+            accuracy = _check_outputs(
+                flag_attn_output,
+                vllm_output,
+                shape=shape,
+                dtype_name=dtype_name,
+                mode=mode,
+                layout=vllm_layout,
+            )
             providers = (
                 (("flag_attn", flag_attn_run), ("vllm", vllm_run))
                 if shape_index % 2 == 0
@@ -730,6 +934,8 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
                 [
                     (f"{vllm_ms:.4f}", 10),
                     (f"{vllm_ms / flag_attn_ms:.2f}x", 10),
+                    (f"{accuracy:.6f}", 9),
+                    ("pass", 6),
                 ]
             )
         if args.per_step:
@@ -750,9 +956,28 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
                 )
         print(_format_columns(row))
         sys.stdout.flush()
+        recorder.add(
+            shape_detail=shape,
+            latency_base=vllm_ms,
+            latency=flag_attn_ms,
+            accuracy=accuracy,
+            steps=steps,
+        )
+
+        # Release this shape before make_data allocates the next one. The
+        # closures and provider tuple also hold references to GPU tensors.
+        if run_vllm:
+            del providers, timings
+        del flag_attn_run, vllm_run, flag_attn_output, vllm_output, vllm_data, data, generator
+        torch.cuda.empty_cache()
+
+    recorder.record()
 
 
-def run_benchmark(args: MSABenchmarkArgs) -> None:
+def run_benchmark(
+    args: MSABenchmarkArgs,
+    record_property: Callable[[str, object], None] | None = None,
+) -> None:
     _require_cuda()
     if args.topk < 1:
         raise ValueError("--topk must be positive")
@@ -793,14 +1018,22 @@ def run_benchmark(args: MSABenchmarkArgs) -> None:
         if mode_index:
             print()
         for dtype_name in dtypes:
-            _run_dtype(args, dtype_name)
+            _run_dtype(args, dtype_name, record_property)
 
 
-def test_msa_benchmark(request) -> None:
+@pytest.mark.minimax_m3_sparse_attn
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="MiniMax M3 benchmark requires CUDA"
+)
+def test_msa_benchmark(request, record_property) -> None:
     """Run the MSA benchmark through pytest using benchmark CLI timing options."""
     args = MSABenchmarkArgs(
         topk=int(request.config.getoption("--topk", default=16)),
         warmup=int(request.config.getoption("--warmup", default=DEFAULT_WARMUP)),
         rep=int(request.config.getoption("--iter", default=DEFAULT_REP)),
     )
-    run_benchmark(args)
+    run_benchmark(args, record_property)
+
+
+if __name__ == "__main__":
+    run_benchmark(MSABenchmarkArgs())

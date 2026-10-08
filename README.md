@@ -1,322 +1,340 @@
 # FlagAttention
 
 <p align="center">
-    <img src="./assets/logo/horizontal-blue.png" width = "400" alt="flag-attention" >
+    <img src="./assets/logo/horizontal-blue.png" width="400" alt="FlagAttention">
 </p>
 
 [中文版](./README_cn.md)
 
-FlagAttention is a project for memory-efficient attention operators implemented in the [Triton language](https://github.com/triton-lang/triton). Motivated by the need for non-standard attention operators in language modeling, it starts as an extension of multi-head attention.
+FlagAttention is a collection of memory-efficient attention operators implemented with [Triton](https://github.com/triton-lang/triton). It targets model training and inference workloads that need custom attention-score transformations, paged or sparse KV-cache layouts, or recurrent linear-attention kernels.
 
-It saves memory footprint and traffic like [FlashAttention](https://arxiv.org/abs/2205.14135) and [FlashAttention v2](https://tridao.me/publications/flash2/flash2.pdf). Implemented in the Triton language, it is easier to understand and modify. The original implementation of FlashAttention in CUDA([flash-attention](https://github.com/Dao-AILab/flash-attention)) provides a good example of how to design an algorithm that takes different levels of memory into account. By tiling and re-computation, FlashAttention avoids materializing the attention scores, whose capacity is proportional to the square of the sequence length. However, custom transformation to the attention scores is not possible when using FlashAttention, unless it is supported by FlashAttention out-of-the-box.
-While extending FlashAttention requires proficiency in CUDA programming, FlagAttention implemented in the Triton language is easier to modify.
+Like [FlashAttention](https://arxiv.org/abs/2205.14135), the dense kernels tile the computation and recompute intermediates instead of materializing the full attention matrix. The repository also contains decoding, block-sparse, quantized, and recurrent operators that do not fit the standard scaled-dot-product-attention interface.
 
-For standard attention workloads, modern alternatives such as [FlashAttention-3](https://arxiv.org/abs/2407.08608), PyTorch `scaled_dot_product_attention`, and [FlexAttention](https://arxiv.org/abs/2412.05496) are also worth considering. FlagAttention remains useful when the attention score computation, KV-cache layout, or inference path needs project-specific customization.
+> [!IMPORTANT]
+> The repository contains operators at different maturity levels. Only FlashAttention and Piecewise Attention are currently marked `stable`; the remaining operator families are `alpha`. [`conf/operators.yaml`](./conf/operators.yaml) is the source of truth for stages, tests, and benchmark entry points.
 
-FlagAttention now offers several operators.
+## Operator overview
 
-1. **flash_attention**: FlashAttention v2-style attention implemented in the Triton language, with support for MQA/GQA, dropout, and auxiliary outputs.
-2. **piecewise_attention**: An extension used for NLPE(Non-Linearized position embedding) in both training and inference of the [Aquila-2-34B](https://github.com/FlagAI-Open/Aquila2) model.
-3. **flash_attention_split_kv**: A split-KV flash decoding operator for long KV sequences and grouped-query layouts.
-4. **paged_attention**: A paged KV-cache attention operator for inference.
-5. **chunk_log_linear_attn**: A forward-only TLE implementation of dense Log-Linear Attention with parallel local, tree-merge, and inter-chunk stages.
+| Operator family | Public import | Main layout/use | Gradient support | Stage |
+| --- | --- | --- | --- | --- |
+| FlashAttention | `flag_attn.flash_attention` | Dense attention; `q: [B,Hq,M,D]`, `k/v: [B,Hkv,N,D]`; MQA/GQA, dropout, auxiliary outputs | Forward + backward | Stable |
+| Piecewise Attention | `flag_attn.piecewise_attention` | Dense attention with two Q/K pairs selected by token distance | Forward + backward | Stable |
+| Split-KV FlashAttention | `flag_attn.flash_attention_split_kv` | Long-KV decoding and low-query-parallelism workloads | Forward | Alpha |
+| Paged Attention | `flag_attn.paged_attention` | Single-token queries over a paged KV cache | Forward | Alpha |
+| MiniMax M3 sparse attention | Six `flag_attn.minimax_m3_*` functions | 128-token page scoring, top-k selection, sparse prefill and decode | Inference | Alpha |
+| Chunk GLA | `flag_attn.chunk_gla` | Recurrent gated linear attention; `[B,T,H,D]`, fixed or packed variable lengths | Forward + backward | Alpha |
+| Chunk Gated Delta Rule | `flag_attn.chunk_gated_delta_rule` | Chunked delta-rule recurrence; head-first or sequence-first | Forward | Alpha |
+| GDN2 | `flag_attn.chunk_gdn2` | Chunked GDN2 prefill with native Triton/TLE and vendor paths | Forward/inference | Alpha |
+| Kimi Delta Attention | `flag_attn.chunk_kda` | Specialized chunked KDA inference; constraints depend on the active backend | Inference | Alpha |
+| SageAttention | `flag_attn.sage_attention.forward`, `per_block_int8` | Per-block INT8 Q/K quantization and attention; HND or NHD layout | Forward | Alpha |
+| Parallel NSA | `flag_attn.parallel_nsa.parallel_nsa`, `parallel_nsa_compression` | Native sparse attention and compression; fixed or packed variable lengths | Forward + backward | Alpha |
 
-When further customization is required, FlagAttention serves as an example.
+The top-level package exports the dense, paged, recurrent, KDA/GDN2, and MiniMax APIs. SageAttention and Parallel NSA are submodule APIs. Vendor-specific development interfaces are available under `flag_attn.runtime.backend._<vendor>` but are not treated as stable public APIs.
 
-## Changelog
+## Requirements and backends
 
-### v0.1
+- Python 3.10 or newer.
+- A PyTorch build for the target accelerator.
+- Triton 2.2 or newer, or a vendor runtime that provides compatible Triton APIs.
+- A supported accelerator for kernel execution. CPU-only hosts can inspect package metadata, but cannot run the attention kernels.
 
-Add piecewise_attention & flash_attention.
+PyTorch and accelerator runtimes are intentionally not hard dependencies in [`pyproject.toml`](./pyproject.toml), because the correct packages depend on the device and driver stack. Install the appropriate PyTorch build before FlagAttention.
 
-### v0.2
+The runtime recognizes `nvidia`, `amd`, `hygon`, `iluvatar`, `metax`, `enflame`, `ascend`, `cambricon`, `mthreads`, `intel`, and `cpu` for device metadata and explicit selection. Recognition does not mean that every operator is implemented or tested on every backend; consult [`conf/operators.yaml`](./conf/operators.yaml), the backend packages in [`src/flag_attn/runtime/backend`](./src/flag_attn/runtime/backend), and the relevant tests for operator-level coverage.
 
-Optimization of operators.
-1. applying mask only when needed.
-2. use a separate kernel to compute the gradien of q to avoid atomic RMW to global memory.
+Backend routing is also operator-specific. The top-level GDN2/KDA APIs select specialized Enflame, MetaX, and MThreads implementations; MiniMax M3 selects its MetaX implementation. Other vendor extensions may require their backend submodule. Do not assume that every top-level API dispatches to every detected vendor.
 
+Device metadata follows the FlagGems/FlagGems-vLLM convention:
 
-## Requirements
+```python
+import flag_attn
 
-FlagAttention requires Python 3.10+, PyTorch, and a Triton-compatible runtime. The package does not install Triton by default, so environments that already provide Triton APIs, for example through Triton itself or a compatible fork, can install FlagAttention without pulling another Triton package.
-
-For a standard Triton installation, use either the optional extra:
-
-```sh
-pip install -e ".[triton]"
+print(flag_attn.vendor_name)  # for example: "nvidia", "metax", "enflame"
+print(flag_attn.vendor)       # alias for vendor_name
+print(flag_attn.device)       # for example: "cuda", "gcu", "npu"
+print(flag_attn.backend_info) # structured DeviceDetector object
 ```
 
-or install Triton directly:
+Detection normally uses the available PyTorch device and Triton target. It can be overridden before importing the package:
 
 ```sh
-pip install triton
+FLAG_ATTN_BACKEND=metax python your_program.py
+# FLAG_ATTN_VENDOR is an alias; FLAG_ATTN_BACKEND takes precedence.
 ```
-
-Triton nightly builds are only recommended when you need a specific unreleased Triton feature or bug fix.
-
-FlagAttention requires a CUDA-capable GPU supported by PyTorch and Triton. It has been tested on Ampere Nvidia GPUs(e.g. A100, RTX-3090, ...). Other GPUs may work but have not been tested yet. When installing PyTorch, choose a build that matches your driver and CUDA runtime; PyTorch pip wheels commonly bundle the CUDA runtime and do not require a full local CUDA Toolkit installation for normal use.
 
 ## Installation
 
-FlagAttention can be installed in either way below.
-
-1. Editable Installation. Changes to the code in the local source tree are effective without re-installation.
-2. Build a distribution and then install. Only the package is installed.
-
-### Editable Installation
-
-Editable installation with pip.
+Clone the repository and first install the PyTorch/runtime build appropriate for your accelerator. For a standard upstream Triton development environment:
 
 ```sh
-git clone https://github.com/FlagOpen/FlagAttention && cd FlagAttention
-pip install -e .
+git clone https://github.com/flagos-ai/FlagAttention.git
+cd FlagAttention
+pip install -e ".[triton,test]"
 ```
 
-If Triton is not already available in the environment, install the Triton extra:
+If the environment already supplies Triton or a compatible vendor fork, do not install the `triton` extra:
 
 ```sh
-pip install -e ".[triton]"
+pip install -e ".[test]"
 ```
 
-### Build a Distribution & Install
+The current package initialization loads YAML tuning configuration and PyTorch reference helpers. Consequently, every installation currently needs PyYAML and pytest; the `test` extra installs both for editable installs. Triton nightly builds are only recommended when an operator explicitly needs an unreleased feature such as a matching TLE version.
 
-Following modern Python packaging convention(PEP-517), FlagAttention is configured by [`pyproject.toml`](https://pip.pypa.io/en/stable/reference/build-system/pyproject-toml/), and no `setup.py` is provided. To build a distribution, either a source distribution or a binary distribution, python package `build` is recommended.
-
-First, install `build` package via pip.
+To build a wheel or source distribution:
 
 ```sh
-pip install build
-```
-
-Then build the package.
-
-```sh
-git clone https://github.com/FlagOpen/FlagAttention && cd FlagAttention
-# to build in `no-isolation` mode requires installing build requirements manually
-pip install -U setuptools setuptools-scm
+pip install -U build setuptools setuptools-scm
 python -m build --no-isolation
+pip install PyYAML pytest
+pip install dist/flag_attn-*.whl
 ```
 
-The built package is in `dist/` for installation.
+There is no `setup.py`; packaging uses PEP 517 and setuptools-scm. Debian/RPM runtime notes are in [`packaging/INSTALL.md`](./packaging/INSTALL.md). The current distribution-package metadata and install notes may not supply both PyYAML and pytest, so ensure they are available in the Python environment used to import `flag_attn`.
 
-```sh
-pip install dist/flag_attn-xxx.whl
-```
+## Quick start
 
-## Usage
-
-FlagAttention provides customized operators for attention. When an operator is equivalent to a torch function, it can be used as a drop-in replacement.
-
-## Run the Tests
-
-A recent version of `pytest`(>=7.1.0) is required to run the tests in `tests/`. Operators in `FlagAttention` are tested against [reference implementations](src/flag_attn/testing) in Pytorch provided by `flag_attn.testing`, both for the forward and backward operators. For operators with support for inputs of `float16` or `bfloat16`, three different implementations are included for numerical accuracy testing.
-
-1. **Reference Implementation in Pytorch**: This implementation upcasts the inputs to `float32` and performs the computations in `float32` all the way through before casting the outputs to `float16` or `bfloat16`.
-2. **Triton Implementation**: The Triton implementation uses `float16` or `bfloat16` for MMA(matrix multiplication accumulation) inputs and `float32` for MMA outputs and other computations.
-3. **Pytorch Implementation**: This implementation mirrors the computations in the reference implementation, except that the precision is the same as the Triton implementation.
-
-The tests for numerical accuracy enforce that the maximum difference between the Triton implementation and reference implementation is not greater than twice the maximanum difference between the Pytorch implementation and reference implementation.
-
-```sh
-pytest .
-```
-
-## Run the Benchmark
-
-Benchmarks are included to quantify the achieved `TFLOP/s`, which serves as a metric of speed operators. The calculation of FLOPs for an operator considers only the matmul operation. The resulting FLOPs are then divided by the median runtime to determine the achieved FLOPs/s.
-
-The benchmarking process involves comparing the Triton implementations with counterparts in Pytorch. When the input size is large, resulting in memory exhaustion in the Pytorch implementation, the FLOP/s is considered zero.
-
-```sh
-cd benchmark/
-python flash_benchmark.py
-python piecewise_benchmark.py
-python log_linear_attn_benchmark.py
-```
-
-## Operators
-
-### chunk_log_linear_attn
-
-`chunk_log_linear_attn` implements dense Log-Linear Attention as a TLE pipeline:
-chunk-local masked attention and state construction, parallel binary-tree state
-merges, inter-chunk state reads, and an optional reduction across key tiles.
-The current forward-only path targets NVIDIA H100 with BF16 inputs, one shared
-Q/K head, power-of-two sequence lengths divisible by 64, and K/V dimensions in
-`{64, 128, 256}`. It requires a Triton build with `triton.experimental.tle`.
+### FlashAttention
 
 ```python
-from flag_attn import chunk_log_linear_attn
-
-output = chunk_log_linear_attn(q, k, v, g, level_scales)
-```
-
-The production implementation is under
-[`src/flag_attn/FLA/log_linear_attn/`](src/flag_attn/FLA/log_linear_attn/).
-The standalone benchmark follows the other scripts in `benchmark/`. It uses
-preallocated workspaces and reports kernel-only median latency over seven
-alternating rounds with
-`triton.testing.do_bench(warmup=1000, rep=100, return_mode="median")`.
-Local cumsum, LUT creation, allocation, compilation, and autotuning are excluded
-from the timed region. The six default shapes match the H100 comparison in PR #65.
-
-From the repository root:
-
-```sh
-python benchmark/log_linear_attn_benchmark.py
-# Require a TileLang comparison and optionally save results:
-python benchmark/log_linear_attn_benchmark.py --provider both --csv log_linear_attn.csv
-# Measure just TLE on a selected shape:
-python benchmark/log_linear_attn_benchmark.py --provider tle --shape 8 1024 8 64
-```
-
-Install PyTorch, pytest, and a FlagTree/Triton build with TLE support. TileLang
-(validated with 0.1.13) is optional: the default `--provider auto` compares both
-providers when available and otherwise measures TLE only. `--rounds`, `--warmup`,
-and `--rep` customize the measurement settings. The D256 default shape requires
-approximately 10 GiB for the dense tree workspace alone.
-
-The TileLang baseline lives in the corresponding test script,
-`tests/flag_attn/test_log_linear_attn.py`, and is shared by the standalone entry
-point and the opt-in pytest benchmark:
-
-```sh
-FLAG_ATTN_RUN_EXTERNAL_BENCHMARKS=1 pytest \
-  tests/flag_attn/test_log_linear_attn.py -k tilelang_benchmark -q -s
-```
-
-### flash_attention
-
-The implementation of FlashAttention in the Triton language. The interface is.
-
-```python
-flash_attention(q, k, v, causal=False, sm_scale=None, return_log_normalizer=False, return_total_attention=False)
-```
-
-In addition to the attention outputs, it can return some extra outputs dependes on `return_log_normalizer` and `return_total_attention`.
-
-1. log_normalizer: shape (batch_size, num_heads, seqlen_q). The log normalizer of the softmax inside attention operation.
-2. total_attention: shape (batch_size, num_heads, seqlen_k). The sum of attention weights along q's sequence axis.
-
-### piecewise_attention
-
-The first extension to FlashAttention is [piecewise_attention](src/flag_attn/piecewise.py). This operator enhances FlashAttention by using two `q`'s and two `k`'s to calculate the attention scores(S) before applying softmax to obtain the attention weights(P).
-
-The rationale behind this design is rooted in the observations that a transformer with rotary position embedding struggles with predicting sequences longer than the maximum sequence length it is trained on. Pairs of `(q, k)` yield unexpectedly high attention scores when the distance exceeds the maximum sequence length in the training set.
-
-To address this issue, BAAI proposes NLPE(Non-Linearized Position Embedding), which applies two different position embeddings to `q` and `k` based on whether the distance between `q` and `k` exceeds a pre-defined threshold, producing `q1, q2` and `k1, k2`. Then the attention score is computed as the dot product of `q1, k1` or `q2, k2` depending on the distance between `q` and `k`.
-
-
-
-The interface is shown below.
-
-![piecewise_attention_interface](./assets/piecewise_attention_interface.png)
-
-```python
-piecewise_attention(q1, k1, q2, k2, v, dist_threshold, causal=False, sm_scale=None)
-```
-
-It splices two attention scores(S) in the forward computation and splits the gradient of S in the backward computation.
-
-![piecewise attention](assets/piecewise_attention.png)
-
-#### Usage
-
-```python
-# piecewise_attention
-import torch
-from flag_attn import piecewise_attention
-
-B, H, T, D = 2, 16, 8192, 128
-dist_threshold = T // 2
-
-q1 = torch.randn((B, H, T, D), dtype=torch.float16, device="cuda:0").requires_grad_()
-q2 = torch.randn((B, H, T, D), dtype=torch.float16, device="cuda:0").requires_grad_()
-k1 = torch.randn((B, H, T, D), dtype=torch.float16, device="cuda:0").requires_grad_()
-k2 = torch.randn((B, H, T, D), dtype=torch.float16, device="cuda:0").requires_grad_()
-v = torch.randn((B, H, T, D), dtype=torch.float16, device="cuda:0").requires_grad_()
-o = piecewise_attention(q1, k1, q2, k2, v, dist_threshold, causal=True)
-print(o)
-
-go = torch.randn((B, H, T, D), dtype=torch.float16, device="cuda:0")
-gq1, gk1, gq2, gk2, gv = torch.autograd.grad(
-    o, (q1, k1, q2, k2, v), go
-)
-print(gq1)
-```
-
-```python
-# flash_attention
 import torch
 from flag_attn import flash_attention
 
-B, H, T, D = 2, 16, 8192, 128
+B, Hq, Hkv, M, N, D = 2, 16, 4, 2048, 4096, 128
+q = torch.randn(B, Hq, M, D, device="cuda", dtype=torch.float16,
+                requires_grad=True)
+k = torch.randn(B, Hkv, N, D, device="cuda", dtype=torch.float16,
+                requires_grad=True)
+v = torch.randn(B, Hkv, N, D, device="cuda", dtype=torch.float16,
+                requires_grad=True)
 
-q = torch.randn((B, H, T, D), dtype=torch.float16, device="cuda:0").requires_grad_()
-k = torch.randn((B, H, T, D), dtype=torch.float16, device="cuda:0").requires_grad_()
-v = torch.randn((B, H, T, D), dtype=torch.float16, device="cuda:0").requires_grad_()
-o = flash_attention(q, k, v, causal=True)
-print(o)
-
-go = torch.randn((B, H, T, D), dtype=torch.float16, device="cuda:0")
-gq, gk, gv = torch.autograd.grad(
-    o, (q, k, v), go
-)
-print(gq)
+out = flash_attention(q, k, v, causal=True)
+out.sum().backward()
 ```
 
-#### Performance
+The complete interface is:
 
-Benchmark is performed under such conditions.
+```python
+flash_attention(
+    q, k, v,
+    causal=False,
+    sm_scale=None,
+    dropout_p=0.0,
+    return_log_normalizer=False,
+    return_total_attention=False,
+    return_seed_offset=False,
+)
+```
 
-1. seqlen in `[512, 1k, 2k, 4k, 16k, 32k]`;
-2. batch size: `32k / seqlen`;
-3. headdim in`[64, 128]`；
-4. num_heads: `2048 / headdim`.
+`Hq` must be divisible by `Hkv`, and `D` must be one of `16`, `32`, `64`, or `128`. Rectangular causal attention is bottom-right aligned. The implementation automatically selects the regular or split-KV forward path according to GPU occupancy.
 
-##### flash_attention
+When any auxiliary-return flag is enabled, the function always returns five values; disabled fields are `None`:
 
-The performance of flash_attention with causal masking is shown below.
+```python
+out, lse, total, seed, offset = flash_attention(
+    q, k, v,
+    return_log_normalizer=True,
+    return_total_attention=True,
+)
+```
 
-![headdim64](./assets/v0.2/flash_attention_d64.png)
+- `lse`: `[B, Hq, M]`, the row log-normalizer.
+- `total`: `[B, Hq, N]`, attention probabilities summed over the query axis.
+- `seed` and `offset`: Philox state when dropout is active and requested.
 
-![headdim128](./assets/v0.2/flash_attention.png)
+Dropout is not supported when the occupancy heuristic selects the split-KV path. Use a non-split shape or `dropout_p=0` for those workloads.
 
-The forward operator runs as fast as, and in some cases, faster than FlashAttention(CUDA), but the backward operator is generally slower than FlashAttention. We first follow the paper and update the gradient of Q with atomic addition in the backward operator, which runs extremely slowly. Then we split the backward operator into two kernels, one to compute the gradient of k and v, the other to compute the gradient of q. This alternation avoids atomic additions but introduces more re-computation. Although this strategy yields a 4x to 5x speedup in the backward operator, it is still slower than FlashAttention(CUDA).
+### Piecewise Attention
 
-The same split-kernel trick is also applied to `piecewise_attention` for efficiency.
+```python
+import torch
+from flag_attn import piecewise_attention
 
-##### piecewise_attention
+B, H, M, N, D = 1, 2, 128, 128, 64
+q1 = torch.randn(B, H, M, D, device="cuda", dtype=torch.float16)
+q2 = torch.randn_like(q1)
+k1 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+k2 = torch.randn_like(k1)
+v = torch.randn_like(k1)
 
-The performance of piecewise_attention has improved compared to that in v0.1. In the case where the head dim is 128 and causal masking is applied, the forward and backward operator is faster than that in v0.1 by 36% and 9%, respectively.
+out = piecewise_attention(
+    q1, k1, q2, k2, v,
+    dist_threshold=32,
+    causal=True,
+)
+```
 
-![piecewise_attention](./assets/v0.2/piecewise_attention.png)
+For query row `m` and key column `n`, the operator uses `q2 @ k2` when the signed, bottom-right-aligned offset `N - M + m - n >= dist_threshold`; otherwise it uses `q1 @ k1`. It then applies the same tiled online softmax strategy as FlashAttention and splits `dScore` across both Q/K pairs in backward. `q1/q2` use `[B,H,M,D]`, `k1/k2/v` use `[B,H,N,D]`, all inputs have the same head count (no GQA), and `D` is one of `16`, `32`, `64`, or `128`.
 
-#### Features
+Piecewise Attention was introduced for NLPE (Non-Linearized Position Embedding), used by [Aquila-2-34B](https://github.com/FlagAI-Open/Aquila2) to switch positional representations beyond a distance threshold.
 
-- support for [Nvidia](https://www.nvidia.com/) Ampere GPU(Tested on RTX-3090 and A100)；
-- support for [Iluvatar CoreX](https://www.iluvatar.com/) GPU(Tested on Iluvatar CoreX MR-V100)；
-- datatype support, `float16` and `bfloat16` for Ampere Nvidia GPUs;
-- support causal and non-causal modes;
-- support forward & backward modes;
-- the sequence length of k/v can be different from that of q;
-- support computation of total attention of each `k` gets from all `q`'s;
-- supports returning accumulative attention of each keys.
-- supports [MQA](https://arxiv.org/abs/1911.02150) and [GQA](https://arxiv.org/pdf/2305.13245).
-- supports dropout of attention weights.
+Additional CUDA-oriented scripts are available in [`examples`](./examples), but some are historical. In particular, [`examples/flash_attention_with_aux_outputs.py`](./examples/flash_attention_with_aux_outputs.py) still unpacks three values although the current auxiliary-output API returns five; use the five-value example above until that script is updated. The tests are the authoritative usage examples. PyTorch reference implementations used for validation are exposed as `flag_attn.testing`.
 
-#### Limitations
+## Inference and sparse APIs
 
-- `headdim` should be in `[16, 32, 64, 128]`.
+### Split-KV and paged attention
 
-## TODOs
+```python
+from flag_attn import flash_attention_split_kv, paged_attention
+```
 
-1. Test on other GPUs;
-2. Test on more versions of triton；
-3. Improve performance of attention operators(especially for the backward op);
-4. Support other extensions to flash attention.
+`flash_attention_split_kv` is an explicit forward-only API for long-KV workloads. It accepts `q: [B,Hq,M,D]` and `k/v: [B,Hkv,N,D]`, requires `Hq % Hkv == 0`, and supports `D` in `{16,32,64,128}`. When multiple splits are selected, each computes a partial output and log-normalizer; a second kernel combines them with a global logsumexp. A single split returns its output directly.
+
+`paged_attention` accepts:
+
+```text
+query:        [num_sequences, num_query_heads, head_size]
+key_cache:    [num_blocks, num_kv_heads, block_size, head_size]
+value_cache:  [num_blocks, num_kv_heads, block_size, head_size]
+context_lens: [num_sequences]
+block_tables: [num_sequences, max_blocks_per_sequence]
+```
+
+It selects a one-pass or partitioned/reduced implementation automatically; `num_splits` can override that choice. K and V caches must have the same shape and strides. Supported head sizes are `{16,32,64,128,256,512}`; when `num_query_heads > num_kv_heads`, the cache block size must be at least 16 tokens. Explicit `num_splits > 1` also requires the resulting partition size to be at least the cache block size and divisible by it. See [`examples/paged_example.py`](./examples/paged_example.py).
+
+Call `paged_attention(query, key_cache, value_cache, context_lens, block_tables, attn_scale, max_context_len, num_splits=0)`; it returns an output with the same shape as `query`. `attn_scale` is the softmax scale (typically `head_size**-0.5`), and `max_context_len` is the largest context length represented by the batch.
+
+### MiniMax M3 sparse attention
+
+The M3 path uses a vLLM-compatible paged cache with a fixed sparse block size of 128 tokens:
+
+```text
+Prefill: minimax_m3_index_score
+      -> minimax_m3_index_topk
+      -> minimax_m3_sparse_attn
+
+Decode: minimax_m3_index_decode (score + top-k)
+     -> minimax_m3_sparse_attn_decode
+
+Score-only decode API: minimax_m3_index_decode_score
+```
+
+The sparse attention kernels support GQA and BF16 KV caches, with FP8 cache scaling on supported hardware. These functions are inference-only and use caller-provided paged caches, sequence metadata, and block tables. Sparse prefill/decode require an `output` buffer and write into it, returning `None`; index-scoring/top-k functions return tensors, and some accept optional reusable output buffers. See the function signatures in [`src/flag_attn/minimax_sparse_attention`](./src/flag_attn/minimax_sparse_attention) and the end-to-end tests in [`tests/flag_attn/test_minimax_sparse_attention.py`](./tests/flag_attn/test_minimax_sparse_attention.py).
+
+### SageAttention
+
+```python
+import torch
+from flag_attn.sage_attention import forward as sage_attention
+from flag_attn.sage_attention import per_block_int8
+
+B, H, N, D = 1, 2, 128, 64
+q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+k = torch.randn_like(q)
+v = torch.randn_like(q)
+
+q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k, tensor_layout="HND")
+out, lse = sage_attention(
+    q_int8, k_int8, v, q_scale, k_scale,
+    tensor_layout="HND",
+    return_lse=True,
+)
+```
+
+Both `HND` (`[B,H,N,D]`) and `NHD` (`[B,N,H,D]`) layouts are supported. Q is quantized in 128-token blocks and K in 64-token blocks by default. The forward kernel accepts boolean or additive attention masks.
+
+`forward` always returns `(out, lse)`; when `return_lse=False`, `lse` is an empty CPU tensor. The public `flag_attn.sage_attention` submodule automatically selects the Ascend implementation on an available NPU; other vendor-specific SageAttention implementations use their backend development modules.
+
+## Recurrent and linear attention APIs
+
+GLA, GDN2, and KDA use sequence-first `[B,T,H,D]`. Gated Delta Rule defaults to head-first `[B,H,T,D]` with `head_first=True`, and also accepts sequence-first input. Most recurrent APIs return `(output, final_state)` and support packed variable-length sequences through `cu_seqlens`.
+
+- [`chunk_gla`](./src/flag_attn/FLA/gated_linear_attention/chunk_gla.py) implements chunked gated linear attention with autograd and optional initial/final recurrent states.
+- [`chunk_gated_delta_rule`](./src/flag_attn/FLA/gated_delta_rule/api.py) provides a forward-only delta-rule implementation. `head_first=True` uses `[B,H,T,D]`; `BT` is currently fixed at 64.
+- [`chunk_gdn2`](./src/flag_attn/gdn2/chunk.py) dispatches between native Triton, TLE, and vendor-specific GDN2 forward paths.
+- [`chunk_kda`](./src/flag_attn/FLA/chunk_kda.py) is an inference API. The generic CUDA path requires Triton TLE 3.6 or newer, inference mode, BF16 inputs, `K=V=128`, chunk size 16, V-first state, and gate parameters; vendor implementations may differ.
+- [`parallel_nsa`](./src/flag_attn/parallel_nsa) contains Native Sparse Attention selection and compression operators with fixed-length and packed-variable-length support. `parallel_nsa` needs either precomputed `block_indices` or `g_cmp`, and `Hq/Hkv` must be a power of two and at least 16. Sliding-window composition additionally needs `g_swa` and the external `flash-attn` package. For fixed-length input, the compression API consumes full-length Q and K/V with time dimension `ceil(T / block_size)`, then returns `(output, lse)`; packed input stores the per-sequence compressed blocks consecutively. The registered NSA tests import the Enflame-specific modules, so they do not establish coverage for the public `flag_attn.parallel_nsa` submodule on other backends.
+
+These alpha APIs are optimized for specific model layouts. Read their docstrings and tests before integrating them; arguments and backend constraints may change.
+
+## Tests
+
+Install the development dependencies and list the operator inventory without probing a GPU:
+
+```sh
+pip install -e ".[triton,test]"
+python tools/run_tests.py --list-ops --stages all
+```
+
+Run the full pytest suite in a compatible CUDA environment:
+
+```sh
+pytest tests
+```
+
+The dense operators are compared against FP32 PyTorch references. Their accuracy checks require the Triton error relative to the FP32 reference to be no greater than roughly twice the same-precision PyTorch error, with a small absolute allowance. Much of the generic suite currently assumes CUDA; on other accelerators, select the relevant vendor tests or inventory entries instead of expecting every CUDA test to skip.
+
+The inventory-driven scheduler runs `stable` operators by default and distributes work across selected CUDA GPUs:
+
+```sh
+python tools/run_tests.py --stages stable --gpus 0 --skip-benchmarks
+python tools/run_tests.py --stages all --gpus all --dump-output
+```
+
+Use the pytest recorder for FlagGems-compatible case-level JSON. It also writes an operator-level upload summary as `summary.json` beside the requested output:
+
+```sh
+pytest -m "sage_attention" --record json --output accuracy_sage_attention.json --continue-on-collection-errors -vs
+```
+
+The `--output` file keeps only the original FlagGems-compatible case or operator records. Its sibling `summary.json` contains top-level `timestamp`, `env`, and `result` fields. Each `result[operator]` has separate `accuracy` and `performance` results; `performance.data` groups valid shape-level baseline and FlagAttention latencies and speedups by dtype. From the repository root, a path-free `--record json -m OP_NAME` command also collects `benchmark/`. If `--output` is omitted, benchmark invocations write `benchmark_result.json`, while accuracy-only invocations write `accuracy_result.json`. The upload summary describes the current run even when an output path is reused.
+
+`OP_NAME` is a pytest marker. The inventory names `chunk_gated_delta_rule_fwd` and `chunk_kda_enflame` are supported alongside their shorter legacy markers. A marker with no matching tests produces `NotRun` accuracy, `Skipped` performance, and no speedup data.
+
+## Benchmarks
+
+Available benchmark entry points are registered alongside their operators in [`conf/operators.yaml`](./conf/operators.yaml); not every inventory entry has a benchmark. Run them through the scheduler or directly, depending on the file:
+
+```sh
+python tools/run_tests.py --stages all --gpus 0
+
+python benchmark/flash_benchmark.py
+python benchmark/piecewise_benchmark.py
+python benchmark/flash_decoding_benchmark.py
+
+cd benchmark
+pytest -m "sage_attention" --record json --output performance_result.json --continue-on-collection-errors -vs
+```
+
+The requested `performance_result.json` contains each measured shape's baseline latency, FlagAttention latency, and `speedup = baseline / FlagAttention` under the operator key. When only benchmark tests run, the separate `summary.json` marks accuracy as not run; a passing benchmark does not claim that the accuracy suite passed. Without a valid baseline, neither file invents a speedup for that shape. For a platform upload zip, place the generated `summary.json` at the archive root or one directory below it.
+
+The path-free pytest command collects the pytest benchmark tests under `benchmark/`. Standalone benchmark scripts are run directly and do not contribute data to this pytest JSON file.
+
+The scheduler runs accuracy tests before benchmarks. Under each operator's output directory, human-readable benchmark output is saved as `performance_stdout.log`, while structured records from each benchmark script are saved separately as `performance_records_0.log`, `performance_records_1.log`, and so on. These records use FlagGems-compatible `[INFO] {` JSON lines containing shapes, baseline latency, FlagAttention latency, and speedup when a baseline is available. Raw records use `speedup: null` without a baseline; the FlagGems-compatible `--record json` report omits those shape rows so FlagGems reports the dtype as `Unknown`.
+
+Direct script execution without a record path still prints machine records to stdout for older schedulers. Set `FLAG_ATTN_BENCHMARK_LOG_PATH=/path/to/records.log` to keep direct console output free of JSON. Existing tables, plots, and matmul-based throughput remain available; the `flash_decoding_benchmark.py` plot axis now correctly says milliseconds. Historical v0.2 plots remain under [`assets/v0.2`](./assets/v0.2); rerun the current benchmark for conclusions about current code, Triton, and hardware.
+
+## Repository layout
+
+```text
+FlagAttention/
+├── src/flag_attn/
+│   ├── flash.py, piecewise.py, split_kv.py, paged.py
+│   ├── minimax_sparse_attention/   # MiniMax M3 index + sparse attention
+│   ├── sage_attention/             # INT8 Q/K quantization + attention
+│   ├── parallel_nsa/               # NSA selection and compression
+│   ├── FLA/                        # GLA, Gated Delta Rule, KDA helpers
+│   ├── gdn2/                       # Generic GDN2 implementation
+│   ├── runtime/backend/            # Device detection and vendor backends
+│   └── testing/                    # PyTorch reference implementations
+├── tests/                          # Accuracy and dispatch tests
+├── benchmark/                      # Performance entry points
+├── examples/                       # Small usage programs
+├── conf/operators.yaml             # Operator stage/test/benchmark inventory
+├── tools/run_tests.py              # Multi-device test scheduler
+└── packaging/                      # Debian/RPM packaging
+```
+
+## Current limitations
+
+- All compute kernels require a supported accelerator; CPU is metadata/reference-only.
+- Operator and dtype coverage varies by backend. Do not infer support only from successful backend detection.
+- FlashAttention and Piecewise Attention require head dimensions in `{16, 32, 64, 128}`; paged and specialized operators have their own constraints.
+- FlashAttention dropout cannot run when the automatic dispatcher selects split-KV.
+- Split-KV, paged, MiniMax M3, recurrent/linear, SageAttention, and NSA APIs are currently alpha.
+- Several TLE paths require a specific recent Triton build and stricter shapes than their native fallbacks.
 
 ## More
 
-For more about the open source system for large models from BAAI, please with [BAAI/FlagOpen](https://flagopen.baai.ac.cn/).
-[<img src="./assets/logo/baai-flagopen.jpeg">](https://flagopen.baai.ac.cn/)
+FlagAttention is part of the FlagOS/FlagOpen open-source ecosystem. See [FlagOpen](https://flagopen.baai.ac.cn/) for more projects.
+
+[<img src="./assets/logo/baai-flagopen.jpeg" alt="BAAI FlagOpen">](https://flagopen.baai.ac.cn/)

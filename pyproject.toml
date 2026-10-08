@@ -37,6 +37,8 @@ triton = [
 test = [
     "pytest>=7.1.0",
     "PyYAML>=6.0",
+    "distro==1.9.0",
+    "flash-linear-attention[cuda]",
 ]
 
 [project.urls]
@@ -59,12 +61,37 @@ namespaces = false
 # https://docs.pytest.org/en/7.3.x/reference/customize.html#rootdir
 # https://docs.pytest.org/en/7.3.x/reference/reference.html#confval-pythonpath
 [tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
 testpaths = [
     "tests",
 ]
 pythonpath = [
+    ".",
     "src",
     "tests/flag_attn",
+]
+markers = [
+    "chunk_gated_delta_rule: chunked gated delta rule tests and benchmarks",
+    "chunk_gated_delta_rule_fwd: inventory alias for chunked gated delta rule forward tests and benchmarks",
+    "chunk_gdn2: chunked GDN2 tests and benchmarks",
+    "chunk_gla: chunked gated linear attention tests and benchmarks",
+    "chunk_gla_chunk: chunked gated linear attention",
+    "chunk_gla_state_v_first: gated linear attention state layout",
+    "chunk_gla_varlen: variable-length gated linear attention",
+    "chunk_kda: Kimi Delta Attention",
+    "chunk_kda_enflame: inventory alias for Enflame Kimi Delta Attention tests and benchmark",
+    "minimax_m3_sparse_attn: MiniMax M3 sparse attention tests and benchmarks",
+    "minimax_sparse_attention_decode: MiniMax sparse attention decoding",
+    "minimax_sparse_attention_prefill: MiniMax sparse attention prefill",
+    "minimax_sparse_attention_topk: MiniMax sparse attention top-k selection",
+    "parallel_moba: parallel MoBA tests and benchmarks",
+    "attention_with_kvcache_blocksparse_prefill_fp8: HPC-Ops FP8 block-sparse prefill attention tests and benchmarks",
+    "attention_decode_bf16_static: HPC-Ops BF16 static decode attention tests and benchmarks",
+    "attention_decode_bf16_dynamic: HPC-Ops BF16 dynamic decode attention tests and benchmarks",
+    "attention_decode_fp8: HPC-Ops FP8 decode attention tests and benchmarks",
+    "parallel_nsa: native sparse attention",
+    "parallel_nsa_compression: native sparse attention compression",
+    "sage_attention: SageAttention tests and benchmarks",
 ]
 
 [tool.ruff]

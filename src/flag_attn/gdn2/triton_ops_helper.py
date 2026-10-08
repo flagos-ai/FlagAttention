@@ -3,7 +3,7 @@
 import triton
 import triton.language as tl
 
-from flag_attn.gated_delta_rule.triton_ops_helper import autotune_cache_kwargs, exp
+from flag_attn.FLA.utils import autotune_cache_kwargs, exp
 
 
 @triton.jit

@@ -9,7 +9,7 @@
 
 import torch
 
-from flag_attn.gated_delta_rule.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from flag_attn.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 
 from .chunk_intra import chunk_gdn2_fwd_intra
 from .cumsum import chunk_local_cumsum

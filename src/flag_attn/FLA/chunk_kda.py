@@ -19,7 +19,7 @@ import triton.experimental.tle.language as tle
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from flaggems_vllm.ops.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
+from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 
 __all__ = ["chunk_kda_fwd_infer"]
 

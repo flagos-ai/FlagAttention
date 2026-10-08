@@ -18,8 +18,8 @@ import triton
 import triton.language as tl
 
 # 此仓库的pre index的入口参数没有BT，不支持varlen
-from flag_attn.gated_delta_rule.compat import has_triton_tle
-from flag_attn.gated_delta_rule.index import prepare_chunk_indices, prepare_chunk_offsets
+from flag_attn.utils import has_triton_tle
+from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 
 from .native.chunk_fwd import chunk_gdn2_fwd
 from .triton_ops_helper import autotune_cache_kwargs, exp2

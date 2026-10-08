@@ -13,11 +13,17 @@
 # limitations under the License.
 
 import argparse
+import sys
+from pathlib import Path
 
 import torch
 import triton
 
-from flag_attn.runtime.backend._ascend import forward
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:  # Direct execution of this source-tree script.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
+    from benchmark.recording import benchmark_metric, record_benchmark_result
 
 
 def parse_args():
@@ -35,8 +41,14 @@ def parse_args():
 
 def benchmark(args):
     if hasattr(torch, "npu") and torch.npu.is_available():
+        from flag_attn.runtime.backend._ascend import forward
+
         device = "npu"
     elif torch.cuda.is_available():
+        # The Ascend kernel statically unrolls the KV loop for its NPU backend.
+        # Use the CUDA implementation when running this benchmark on CUDA.
+        from flag_attn.sage_attention import forward
+
         device = "cuda"
     else:
         raise RuntimeError("SageAttention benchmark requires a CUDA or NPU device")
@@ -45,6 +57,7 @@ def benchmark(args):
     print(f"device: {device}")
     print("seq_len\tlatency_ms\ttflops")
 
+    metrics = []
     for seq_len in args.seq_lens:
         shape = (args.batch_size, args.num_heads, seq_len, args.head_dim)
         q = torch.randint(-100, 100, shape, device=device, dtype=torch.int8)
@@ -76,6 +89,27 @@ def benchmark(args):
         flops = 4 * args.batch_size * args.num_heads * seq_len * seq_len * args.head_dim
         tflops = flops / latency_ms * 1e-9
         print(f"{seq_len}\t{latency_ms:.4f}\t{tflops:.2f}")
+        metrics.append(
+            benchmark_metric(
+                shape_detail={
+                    "batch_size": args.batch_size,
+                    "num_heads": args.num_heads,
+                    "seq_len": seq_len,
+                    "head_dim": args.head_dim,
+                },
+                latency=latency_ms,
+                tflops=tflops,
+            )
+        )
+
+    record_benchmark_result(
+        None,
+        op_name="sage_attention_ascend",
+        dtype=str(dtype),
+        result=metrics,
+        baseline=None,
+        device=device,
+    )
 
 
 if __name__ == "__main__":

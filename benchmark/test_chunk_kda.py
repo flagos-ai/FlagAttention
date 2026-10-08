@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from benchmark.base import Benchmark
-from flag_attn.runtime.backend._enflame.kda import chunk_kda
+from flag_attn.runtime.backend._enflame.FLA.kda import chunk_kda
 
 DEVICE = "gcu"
 LOWER_BOUND = -5.0
@@ -271,10 +271,11 @@ class ChunkKDABenchmark(Benchmark):
     reason="chunk_kda benchmark requires an available Enflame GCU",
 )
 @pytest.mark.chunk_kda
-def test_chunk_kda():
+@pytest.mark.chunk_kda_enflame
+def test_chunk_kda(record_property):
     bench = ChunkKDABenchmark(
         op_name="chunk_kda",
         torch_op=_chunk_kda_torch_reference_op,
     )
     bench.set_gems(_chunk_kda_inference_op)
-    bench.run()
+    bench.run(record_property)

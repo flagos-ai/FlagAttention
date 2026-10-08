@@ -16,7 +16,6 @@
 import torch
 import triton
 import triton.language as tl
-from flag_attn.runtime.backend._ascend.quant_per_block import per_block_int8
 
 @triton.jit
 def quant_per_block_int8_kernel(Input, Output, Scale, L,

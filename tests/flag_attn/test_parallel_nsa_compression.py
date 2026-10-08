@@ -19,7 +19,7 @@ import torch
 
 torch_gcu = pytest.importorskip("torch_gcu")
 
-from flag_attn.runtime.backend._enflame.nsa.parallel_nsa_compression import (
+from flag_attn.runtime.backend._enflame.FLA.nsa.parallel_nsa_compression import (
     parallel_nsa_compression,
 )
 

@@ -15,10 +15,16 @@
 import logging
 import pathlib
 import datetime
+import math
 import torch
 import triton
 
 import flag_attn
+
+try:
+    from benchmark.recording import record_triton_report
+except ModuleNotFoundError:  # Direct execution from the benchmark directory.
+    from recording import record_triton_report
 
 try:
     from flash_attn import flash_attn_func
@@ -127,4 +133,26 @@ def bench_flash_attention(N_CTX, D_HEAD, causal, mode, provider, dtype=torch.flo
 today = datetime.date.today().strftime(format("%Y%m%d"))
 output_dir = pathlib.Path(f"results_piecewise_attention_{today}")
 output_dir.mkdir(exist_ok=True)
-bench_flash_attention.run(save_path=output_dir, print_data=True)
+def _latency_from_tflops(tflops, shape):
+    if not math.isfinite(tflops) or tflops <= 0:
+        return math.inf
+    n_ctx = shape['N_CTX']
+    head_dim = shape['D_HEAD']
+    batch = 32768 // n_ctx
+    heads = 2048 // head_dim
+    macs = 3.0 * batch * heads * n_ctx * n_ctx * head_dim
+    if shape['mode'] == 'bwd':
+        macs *= 8.0 / 3.0
+    flops = 2.0 * macs * (0.5 if shape['causal'] else 1.0)
+    return flops / tflops * 1e-9
+
+
+results = bench_flash_attention.run(save_path=output_dir, print_data=True, return_df=True)
+record_triton_report(
+    bench_flash_attention,
+    results,
+    op_name='piecewise_attention',
+    provider='piecewise',
+    baseline='torch',
+    latency_from_value=_latency_from_tflops,
+)

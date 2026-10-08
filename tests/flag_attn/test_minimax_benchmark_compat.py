@@ -1,0 +1,285 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Host checks for MiniMax benchmark baseline compatibility and accuracy guards."""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from benchmark import test_minimax_sparse_attention_benchmark as benchmark
+
+
+class _PlatformWithRocm:
+    device_type = "cuda"
+
+    def __init__(self, *, is_rocm: bool = False):
+        self.pdl_checks = 0
+        self.rocm_checks = 0
+        self._is_rocm = is_rocm
+
+    def is_arch_support_pdl(self):
+        self.pdl_checks += 1
+        return True
+
+    def is_rocm(self):
+        self.rocm_checks += 1
+        return self._is_rocm
+
+    def describe(self, device_name):
+        return f"{self.device_type}:{device_name}"
+
+
+def test_cached_platform_caches_pdl_and_delegates_other_platform_features():
+    original = _PlatformWithRocm()
+    cached = benchmark._CachedPlatform(original)
+
+    assert cached.is_arch_support_pdl() is True
+    assert cached.is_arch_support_pdl() is True
+    assert original.pdl_checks == 1
+    assert cached.is_rocm() is False
+    assert original.rocm_checks == 1
+    assert cached.device_type == "cuda"
+    assert cached.describe("H800") == "cuda:H800"
+    with pytest.raises(AttributeError):
+        cached.unknown_platform_feature
+
+
+@pytest.mark.parametrize(
+    "is_rocm,is_gfx942,expected_kwargs",
+    [
+        (False, False, {}),
+        (True, False, {}),
+        (True, True, {"num_stages": 1}),
+    ],
+)
+def test_cached_platform_supports_legacy_vllm_stage_selection(is_rocm, is_gfx942, expected_kwargs):
+    # Older vLLM sparse_attn.py calls current_platform.is_rocm() when
+    # choosing Triton num_stages, after the benchmark has wrapped that object.
+    original = _PlatformWithRocm(is_rocm=is_rocm)
+    cached = benchmark._CachedPlatform(original)
+
+    def legacy_sparse_attn_num_stages_kwarg():
+        kwarg = {}
+        if cached.is_rocm() and is_gfx942:
+            kwarg = {"num_stages": 1}
+        return kwarg
+
+    assert legacy_sparse_attn_num_stages_kwarg() == expected_kwargs
+    assert original.rocm_checks == 1
+
+
+def _packed_prefill(kv_cache):
+    return (
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        kv_cache.stride(3),
+    )
+
+
+def _packed_decode(kv_cache):
+    return (
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        kv_cache.stride(3),
+    )
+
+
+def _split_prefill(kv_cache):
+    return (
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        kv_cache.stride(3),
+        kv_cache.stride(4),
+    )
+
+
+def _split_decode(kv_cache):
+    return (
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        kv_cache.stride(3),
+        kv_cache.stride(4),
+    )
+
+
+def _dynamic_stride(kv_cache, axis):
+    return kv_cache.stride(axis)
+
+
+def _partial_stride(kv_cache):
+    return kv_cache.stride(0)
+
+
+@pytest.mark.parametrize(
+    "prefill,decode,expected",
+    [
+        (_packed_prefill, _packed_decode, "packed4d"),
+        (_split_prefill, _split_decode, "split5d"),
+    ],
+)
+def test_vllm_layout_follows_both_wrapper_stride_contracts(prefill, decode, expected):
+    assert benchmark._vllm_kv_layout(prefill, decode) == expected
+
+
+def test_vllm_layout_rejects_mixed_prefill_and_decode_contracts():
+    with pytest.raises(RuntimeError, match="prefill/decode KV cache layouts differ"):
+        benchmark._vllm_kv_layout(_packed_prefill, _split_decode)
+
+
+@pytest.mark.parametrize("wrapper", [_dynamic_stride, _partial_stride, len])
+def test_vllm_layout_rejects_uninspectable_or_ambiguous_contracts(wrapper):
+    with pytest.raises(RuntimeError, match="layout|stride"):
+        benchmark._sparse_kv_layout(wrapper)
+
+
+def _data_with_remapped_pages():
+    # Logical pages [0, 1, 2] refer to physical pages [2, 0, 1].
+    cache = torch.arange(3 * 2 * 4 * 2 * benchmark.HEAD_DIM, dtype=torch.int32)
+    cache = cache.reshape(3, 2, 4, 2 * benchmark.HEAD_DIM)
+    return benchmark.MSAData(
+        q=torch.empty(1),
+        idx_q=torch.empty(1),
+        kv_cache=cache,
+        index_kv_cache=torch.empty(1),
+        block_table=torch.tensor([[2, 0, 1]], dtype=torch.int32),
+        cu_q=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([3 * 4], dtype=torch.int32),
+        prefix_lens=torch.tensor([0], dtype=torch.int32),
+        sm_scale=1.0,
+        k_scale=None,
+        v_scale=None,
+    )
+
+
+def test_vllm_legacy_cache_keeps_each_physical_page_and_kv_channel():
+    data = _data_with_remapped_pages()
+    legacy = benchmark._vllm_data(data, "split5d")
+    assert legacy.kv_cache.shape == (3, 2, 4, 2, benchmark.HEAD_DIM)
+    assert legacy.kv_cache.is_contiguous()
+    assert legacy.kv_cache is not data.kv_cache
+    assert legacy.block_table is data.block_table
+    assert legacy.index_kv_cache is data.index_kv_cache
+
+    for logical_page in range(3):
+        physical_page = data.block_table[0, logical_page].item()
+        for head in range(2):
+            torch.testing.assert_close(
+                legacy.kv_cache[physical_page, 0, :, head],
+                data.kv_cache[physical_page, head, :, : benchmark.HEAD_DIM],
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                legacy.kv_cache[physical_page, 1, :, head],
+                data.kv_cache[physical_page, head, :, benchmark.HEAD_DIM :],
+                rtol=0,
+                atol=0,
+            )
+
+
+def test_vllm_packed_cache_reuses_original_data():
+    data = _data_with_remapped_pages()
+    assert benchmark._vllm_data(data, "packed4d") is data
+
+
+def _check_outputs(flag, vllm, dtype_name="bf16"):
+    return benchmark._check_outputs(
+        flag,
+        vllm,
+        shape=(1, 128, 2, 4),
+        dtype_name=dtype_name,
+        mode="prefill",
+        layout="split5d",
+    )
+
+
+@pytest.mark.parametrize("dtype_name", ["bf16", "fp8"])
+def test_output_check_accepts_identical_results(dtype_name):
+    output = torch.tensor([0.25, -0.5], dtype=torch.float32)
+    accuracy = _check_outputs(output, output.clone(), dtype_name)
+    assert accuracy == pytest.approx(1.0)
+    assert accuracy <= 1.0
+
+
+def test_output_check_treats_matching_zero_outputs_as_exact():
+    output = torch.zeros(4)
+    assert _check_outputs(output, output.clone()) == 1.0
+
+
+@pytest.mark.parametrize("dtype_name", ["bf16", "fp8"])
+def test_output_check_rejects_wrong_baseline_results(dtype_name):
+    with pytest.raises(AssertionError, match="output mismatch.*max_abs_diff"):
+        _check_outputs(torch.tensor([0.0]), torch.tensor([1.0]), dtype_name)
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+def test_output_check_rejects_nonfinite_results(bad_value):
+    with pytest.raises(AssertionError, match="vLLM produced NaN or Inf"):
+        _check_outputs(torch.tensor([0.0]), torch.tensor([bad_value]))
+
+
+@pytest.mark.parametrize("dtype_name", ["bf16", "fp8"])
+def test_output_check_compares_every_chunk_and_preserves_cosine(monkeypatch, dtype_name):
+    monkeypatch.setattr(benchmark, "OUTPUT_CHECK_CHUNK_ELEMENTS", 3)
+    baseline = torch.tensor([0, 0.25, -0.5, 1, -1, 2, 0], dtype=torch.bfloat16)
+    actual = baseline.clone()
+    actual[3] += 0.015625
+    atol, rtol = (
+        (benchmark.FP8_ATOL, benchmark.FP8_RTOL)
+        if dtype_name == "fp8"
+        else (benchmark.BF16_ATOL, benchmark.BF16_RTOL)
+    )
+    original_assert_close = torch.testing.assert_close
+    original_assert_close(actual, baseline, atol=atol, rtol=rtol)
+    actual_float, baseline_float = actual.float(), baseline.float()
+    expected_cosine = (
+        torch.dot(actual_float, baseline_float)
+        / (torch.linalg.vector_norm(actual_float) * torch.linalg.vector_norm(baseline_float))
+    ).item()
+
+    checked_chunk_sizes = []
+
+    def assert_close_bounded(flag_chunk, vllm_chunk, **kwargs):
+        assert flag_chunk.device.type == vllm_chunk.device.type == "cpu"
+        assert flag_chunk.numel() <= benchmark.OUTPUT_CHECK_CHUNK_ELEMENTS
+        checked_chunk_sizes.append(flag_chunk.numel())
+        return original_assert_close(flag_chunk, vllm_chunk, **kwargs)
+
+    monkeypatch.setattr(torch.testing, "assert_close", assert_close_bounded)
+    assert _check_outputs(actual, baseline, dtype_name) == pytest.approx(expected_cosine, abs=1e-6)
+    assert checked_chunk_sizes == [3, 3, 1]
+
+    bad = actual.clone()
+    bad[1] = 0.5
+    bad[-1] = 1
+    with pytest.raises(AssertionError, match=r"output mismatch.*max_abs_diff=1(?:\.0)?[,;]"):
+        _check_outputs(bad, baseline, dtype_name)
+
+
+def test_output_check_rejects_shape_mismatch_with_equal_element_count():
+    with pytest.raises(AssertionError, match="metadata differs: shape="):
+        _check_outputs(torch.zeros(2, 2), torch.zeros(4))
+
+
+@pytest.mark.parametrize(
+    "dtype_name,difference,passes",
+    [
+        ("bf16", 0.03125, False),
+        ("fp8", 0.03125, True),
+        ("fp8", 0.0703125, False),
+    ],
+)
+def test_output_check_keeps_dtype_tolerance_thresholds(dtype_name, difference, passes):
+    actual = torch.tensor([difference], dtype=torch.bfloat16)
+    baseline = torch.zeros_like(actual)
+    if passes:
+        assert _check_outputs(actual, baseline, dtype_name) == 0.0
+    else:
+        with pytest.raises(AssertionError, match="output mismatch.*max_abs_diff"):
+            _check_outputs(actual, baseline, dtype_name)
