@@ -1,4 +1,5 @@
 # Copyright 2026 FlagOS Contributors
+# Copyright contributors to the vLLM project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,9 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flag_attn.testing.flash import attention as flash_attention # noqa: F401
-from flag_attn.testing.piecewise import attention as piecewise_attention # noqa: F401
-from flag_attn.testing.paged import attention as paged_attention # noqa: F401
-from flag_attn.testing.dropout import recompute_mask # noqa: F401
-from flag_attn.testing.attnres import fused_attnres # noqa: F401
-from flag_attn.testing.log_linear_attn import log_linear_attn_reference # noqa: F401
+"""DiffKV attention with standard Triton and optional TLE backends."""
+
+from .api import (
+    DEFAULT_LAYOUT,
+    DiffKVLayout,
+    OP_NAME,
+    diffkv_attention,
+    unified_attention_diffkv,
+    unified_attention_diffkv_fallback,
+    unified_attention_diffkv_tle,
+)
+
+__all__ = [
+    "OP_NAME",
+    "diffkv_attention",
+    "unified_attention_diffkv",
+    "unified_attention_diffkv_tle",
+    "unified_attention_diffkv_fallback",
+    "DiffKVLayout",
+    "DEFAULT_LAYOUT",
+]
