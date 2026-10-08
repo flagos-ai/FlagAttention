@@ -13,6 +13,68 @@
 # limitations under the License.
 
 ops:
+  - id: attention_with_kvcache_blocksparse_prefill_fp8
+    description: Triton-TLE FP8 block-sparse prefill attention implementation compatible with Tencent Hy3 HPC-Ops Attention Operator. Supports paged KV cache, NHD/HND KV-cache layouts, multiple quantization modes, and optional block masking. Its tests and benchmarks require PyTorch 2.7.0.
+    for:
+      - attention_with_kvcache_blocksparse_prefill_fp8
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_hpc_ops_prefill_fp8.py::test_attention_blocksparse_prefill_fp8_rejects_cpu
+      - tests/flag_attn/test_hpc_ops_prefill_fp8.py::test_attention_blocksparse_prefill_fp8
+    benchmark: benchmark/test_hpc_ops_prefill_fp8_perf.py
+  - id: attention_decode_bf16_static
+    description: Triton-TLE BF16 static Split-K decode attention implementation compatible with Tencent Hy3 HPC-Ops Attention Operator. Supports paged KV cache, MTP decoding (MTP=1/2/3), and NHD/HND KV-cache layouts. Its tests and benchmarks require PyTorch 2.7.0.
+    for:
+      - attention_decode_bf16_static
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_hpc_ops_decode_bf16.py::test_attn_bf16_sm90
+    benchmark: benchmark/test_hpc_ops_decode_bf16_perf.py
+  - id: attention_decode_bf16_dynamic
+    description: Triton-TLE BF16 dynamic decode attention implementation compatible with Tencent Hy3 HPC-Ops Attention Operator. Uses workload-aware task scheduling for variable-length KV-cache workloads and supports MTP decoding (MTP=1/2/3) with NHD/HND KV-cache layouts. Its tests and benchmarks require PyTorch 2.7.0.
+    for:
+      - attention_decode_bf16_dynamic
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_hpc_ops_decode_bf16.py::test_attn_bf16_sm90
+    benchmark: benchmark/test_hpc_ops_decode_bf16_perf.py
+  - id: attention_decode_fp8
+    description: Triton-TLE FP8 decode attention implementation compatible with Tencent Hy3 HPC-Ops Attention Operator. Supports paged KV cache, static and dynamic scheduling, MTP decoding (MTP=1/2/4), multiple quantization modes, and NHD/HND KV-cache layouts. Its tests and benchmarks require PyTorch 2.7.0.
+    for:
+      - attention_decode_fp8
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_hpc_ops_decode_qkpertoken_perhead_vperhead_fp8.py::test_attn_fp8_sm90
+      - tests/flag_attn/test_hpc_ops_decode_qpertoken_perhead_kvpertensor_fp8.py::test_attn_fp8_sm90
+    benchmark: benchmark/test_hpc_ops_decode_fp8_perf.py
   - id: chunk_gated_delta_rule_fwd
     description: Run the forward path for chunked gated delta rule attention.
     for:
@@ -30,9 +92,28 @@ ops:
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_full_tle_matches_native
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_public_api_matches_native
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_two_kernel_matches_native
+      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_two_kernel_configs
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_hybrid_matches_two_kernel
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_hybrid_matches_fla
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_public_api_uses_two_kernel
+    benchmark: benchmark/test_gated_delta_rule_benchmark.py
+    benchmark_requires:
+      - fla
+  - id: chunk_gdn2
+    description: Compare native and TLE chunked GDN2 implementations and resource controls.
+    for:
+      - chunk_gdn2
+    labels:
+      - fused
+      - FLA
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_gdn2.py
+    benchmark: benchmark/test_gdn2_benchmark.py
   - id: chunk_gla
     description: Run fixed-length, state-v-first, and variable-length chunked gated linear attention.
     for:
@@ -49,7 +130,38 @@ ops:
       - tests/flag_attn/test_chunk_gla.py::test_chunk
       - tests/flag_attn/test_chunk_gla.py::test_chunk_state_v_first
       - tests/flag_attn/test_chunk_gla.py::test_chunk_varlen
-    benchmark: benchmark/chunk_gla_benchmark.py
+    benchmark: benchmark/test_chunk_gla_benchmark.py
+  - id: chunk_kda
+    description: Compare CUDA TLE Kimi Delta Attention against its recurrent reference.
+    for:
+      - chunk_kda_fwd_infer
+    labels:
+      - fused
+      - FLA
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/test_FLA/test_chunk_kda.py
+    benchmark: benchmark/test_FLA/bench_chunk_kda.py
+  - id: chunk_kda_enflame
+    description: Run Enflame Kimi Delta Attention accuracy tests and its pytest benchmark.
+    for:
+      - chunk_kda
+    labels:
+      - fused
+      - FLA
+      - enflame
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_chunk_kda.py
+      - benchmark/test_chunk_kda.py
   - id: flash_attention
     description: Run FlashAttention forward, including its auxiliary-output path.
     for:
@@ -99,6 +211,7 @@ ops:
     tests:
       - tests/flag_attn/test_flash_attention.py::test_attention_fwd_dropout
       - tests/flag_attn/test_flash_attention.py::test_attention_bwd_dropout
+      - tests/flag_attn/test_flash_attention.py::test_attention_bwd_dropout_bfloat16_precision
       - tests/flag_attn/test_dropout.py::test_recompute_mask
   - id: flash_attention_split_kv
     description: Run split-KV FlashAttention for long KV sequences and grouped-query layouts.
@@ -115,6 +228,9 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/flag_attn/test_flash_attention.py::test_attention_splitkv
+      - tests/flag_attn/test_flash_attention.py::test_splitkv_large_logits
+      - tests/flag_attn/test_flash_attention.py::test_splitkv_single_split_preserves_dtype
+      - tests/flag_attn/test_flash_attention.py::test_splitkv_independent_kv_strides
     benchmark: benchmark/flash_decoding_benchmark.py
   - id: minimax_m3_index_topk
     description: Select MiniMax M3 prefill sparse-attention top-k blocks.
@@ -133,7 +249,7 @@ ops:
       - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_topk_streaming_partial_tile_excludes_padding
       - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_topk_radix_path
   - id: minimax_m3_sparse_attn
-    description: Run the MiniMax M3 sparse-attention prefill path.
+    description: Validate MiniMax M3 backend exports and the sparse-attention prefill path.
     for:
       - minimax_m3_index_score
       - minimax_m3_index_topk
@@ -148,9 +264,11 @@ ops:
     stages:
       - alpha: 'unreleased'
     tests:
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_public_exports_use_active_backend
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_metax_public_exports
       - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_fp8
-    benchmark: benchmark/minimax_sparse_attention_benchmark.py
+    benchmark: benchmark/test_minimax_sparse_attention_benchmark.py
   - id: minimax_m3_sparse_attn_decode
     description: Run the MiniMax M3 sparse-attention decode and decode top-k paths.
     for:
@@ -172,6 +290,24 @@ ops:
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_k16_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_identity_out_and_score_out_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_fp8
+  - id: parallel_moba
+    description: Run variable-length parallel MoBA attention.
+    for:
+      - parallel_moba
+    labels:
+      - fused
+      - FLA
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_moba.py
+    benchmark: benchmark/test_moba_perf.py
+    benchmark_requires:
+      - flash_moba
   - id: paged_attention
     description: Run paged KV-cache attention with automatic, explicit, and targeted split selection.
     for:
@@ -190,8 +326,39 @@ ops:
       - tests/flag_attn/test_paged_attention.py::test_paged_attention_by_num_splits
       - tests/flag_attn/test_paged_attention.py::test_paged_attention_by_case
     benchmark: benchmark/paged_benchmark.py
+  - id: parallel_nsa
+    description: Run Enflame native sparse attention with fixed-length and variable-length inputs.
+    for:
+      - parallel_nsa
+    labels:
+      - fused
+      - FLA
+      - enflame
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_parallel_nsa.py
+    benchmark: benchmark/parallel_nsa_benchmark.py
     benchmark_requires:
-      - vllm
+      - torch_gcu
+  - id: parallel_nsa_compression
+    description: Run Enflame sparse-attention compression forward, backward, and inference tests.
+    for:
+      - parallel_nsa_compression
+    labels:
+      - fused
+      - FLA
+      - enflame
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_parallel_nsa_compression.py
   - id: piecewise_attention
     description: Run the forward path for piecewise attention.
     for:
@@ -221,3 +388,47 @@ ops:
       - stable: '0.2'
     tests:
       - tests/flag_attn/test_piecewise_attention.py::test_attention_bwd
+  - id: runtime
+    description: Validate public device metadata and backend selection.
+    for:
+      - runtime
+    labels:
+      - runtime
+    kind:
+      - Runtime
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_runtime.py
+      - tests/flag_attn/test_test_runner.py
+  - id: sage_attention
+    description: Run SageAttention quantization, masking, layouts, and argument validation.
+    for:
+      - sage_attention
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_sage_attention.py
+    benchmark: benchmark/test_sage_attention_benchmark.py
+  - id: sage_attention_ascend
+    description: Run the Ascend SageAttention backend tests and benchmark.
+    for:
+      - sage_attention
+    labels:
+      - fused
+      - Attention
+      - ascend
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - src/flag_attn/runtime/backend/_ascend/test_sage_attention.py
+    benchmark: src/flag_attn/runtime/backend/_ascend/sage_attention_benchmark.py

@@ -21,14 +21,27 @@ The cache layout is compatible with vLLM:
   block_table: [batch, max_blocks]
 """
 
-from .index_topk import (
-    SPARSE_BLOCK_SIZE,
-    minimax_m3_index_decode,
-    minimax_m3_index_decode_score,
-    minimax_m3_index_score,
-    minimax_m3_index_topk,
-)
-from .sparse_attn import minimax_m3_sparse_attn, minimax_m3_sparse_attn_decode
+from flag_attn.runtime.backend import is_metax_backend
+
+if is_metax_backend():
+    from flag_attn.runtime.backend._metax.msa import (
+        SPARSE_BLOCK_SIZE,
+        minimax_m3_index_decode,
+        minimax_m3_index_decode_score,
+        minimax_m3_index_score,
+        minimax_m3_index_topk,
+        minimax_m3_sparse_attn,
+        minimax_m3_sparse_attn_decode,
+    )
+else:
+    from .index_topk import (
+        SPARSE_BLOCK_SIZE,
+        minimax_m3_index_decode,
+        minimax_m3_index_decode_score,
+        minimax_m3_index_score,
+        minimax_m3_index_topk,
+    )
+    from .sparse_attn import minimax_m3_sparse_attn, minimax_m3_sparse_attn_decode
 
 __all__ = [
     "SPARSE_BLOCK_SIZE",

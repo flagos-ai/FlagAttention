@@ -17,9 +17,12 @@ import os
 
 import triton
 
+from .backend import DeviceDetector
 from .configs_loader import TunedConfigLoader
 
-config_loader = TunedConfigLoader()
+device = DeviceDetector()
+torch_device_fn = device.torch_device_fn
+config_loader = TunedConfigLoader(device.vendor_name)
 
 
 def get_tuned_config(op_name: str):

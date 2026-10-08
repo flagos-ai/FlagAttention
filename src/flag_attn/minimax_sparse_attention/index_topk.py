@@ -38,13 +38,13 @@ if has_triton_tle(3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
 
-        _HAS_TLE = True
+        _HAS_TLE_RADIX = True
     except ImportError:
         tle = None
-        _HAS_TLE = False
+        _HAS_TLE_RADIX = False
 else:
     tle = None
-    _HAS_TLE = False
+    _HAS_TLE_RADIX = False
 
 
 # One sparse block == one KV page.
@@ -173,7 +173,13 @@ def _index_block_score_kernel(
             + off_k[None, :] * stride_ik_pos
             + off_d[:, None] * stride_ik_d,
         )
-        qk = tl.dot(q, k)
+        # FP8 MMA may round distinct block scores to the same value. Widening
+        # FP8 inputs to FP16 is exact and preserves their ordering with FP32
+        # accumulation, which matters when selecting the last top-k block.
+        if q.dtype.is_fp8():
+            qk = tl.dot(q.to(tl.float16), k.to(tl.float16))
+        else:
+            qk = tl.dot(q, k)
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
             qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
@@ -519,7 +525,7 @@ def _load_prefill_topk_score(
     return score, valid
 
 
-if _HAS_TLE:
+if _HAS_TLE_RADIX:
 
     @triton.jit(do_not_specialize_on_alignment=["prefix_lens"])
     def _topk_index_kernel_radix_tle(
@@ -774,10 +780,11 @@ def _decode_index_score_kernel(
             + off_k[:, None] * stride_ik_pos
             + off_d * stride_ik_d,
         )  # [N,D]
-        # fp32 accumulation is required for the fp8 (e4m3) index cache: q/k are
-        # loaded in their stored dtype (bf16 or e4m3) and the MMA accumulates in
-        # fp32 so the per-block max score is exact for the fp8 indexer too.
-        kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
+        # As in prefill, avoid reduced-precision FP8 MMA score ties.
+        if q.dtype.is_fp8():
+            kq = tl.dot(k.to(tl.float16), q.to(tl.float16), out_dtype=tl.float32)
+        else:
+            kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
         kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [HQ]
         is_visible_block = blk < num_blocks_q
@@ -1161,7 +1168,7 @@ def _can_use_radix_prefill_topk(
     max_query_len: int,
 ) -> bool:
     """Use Radix for a short Prefill chunk over a wide existing context."""
-    if not _HAS_TLE or _topk_index_kernel_radix_tle is None:
+    if not _HAS_TLE_RADIX or _topk_index_kernel_radix_tle is None:
         return False
     if not _supports_prefill_selector_input(score, topk):
         return False

@@ -23,9 +23,11 @@ from .backend import get_backend_name
 
 
 class TunedConfigLoader:
-    def __init__(self):
-        backend = get_backend_name()
-        config_path = Path(__file__).parent / "backend" / f"_{backend}" / "tune_configs.yaml"
+    def __init__(self, backend: str | None = None):
+        backend = backend or get_backend_name()
+        config_path = (
+            Path(__file__).parent / "backend" / f"_{backend}" / "tune_configs.yaml"
+        )
         try:
             with config_path.open() as config_file:
                 self._configs = yaml.safe_load(config_file) or {}

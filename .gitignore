@@ -1,3 +1,6 @@
+# Server-local baselines and speedup measurements
+/BaselineBenchmark/
+
 # results of benchmark
 benchmark/results*/
 playground/

@@ -1,0 +1,159 @@
+# MetaX C550 GDN2 measured-winner candidate unions, not per-shape optimality claims.
+# Full test and benchmark coverage is unchanged.
+# FLAG_ATTN_GDN2_FULL_TUNING=1 restores the original candidate search.
+# Evidence report SHA256: 7c1ce279ca4990cfeba7250b634fda66aa382f99e1851c24e5f4cd9468f659ce
+_chunk_gdn2_fwd_intra_infer_kernel:
+- META:
+    BK: 32
+    BV: 32
+  num_warps: 2
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BK: 32
+    BV: 32
+  num_warps: 2
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: 72
+- META:
+    BK: 64
+    BV: 64
+  num_warps: 1
+  num_stages: 1
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BK: 64
+    BV: 64
+  num_warps: 4
+  num_stages: 1
+  num_ctas: 1
+  maxnreg: 72
+chunk_gdn2_fwd_kernel_inter_solve_fused:
+- META:
+    BK: 32
+  num_warps: 1
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BK: 32
+  num_warps: 2
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BK: 64
+  num_warps: 1
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BK: 64
+  num_warps: 2
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+chunk_gdn2_fwd_kernel_intra_token_parallel:
+- META:
+    BH: 2
+  num_warps: 1
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BH: 2
+  num_warps: 2
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BH: 4
+  num_warps: 2
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BH: 8
+  num_warps: 1
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+recompute_w_u_fwd_gdn2_kernel:
+- META: {}
+  num_warps: 4
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- META: {}
+  num_warps: 4
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- META: {}
+  num_warps: 8
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+
+# GDN2-only output candidates; shared GLA keeps its full tuner.
+# Evidence SHA256: 16fe7b18c44f329bab6f3450b00f6b49b8c246d1002c1719150d349d3adea913
+gdn2_native_output_tle:
+- META:
+    BK: 32
+    BV: 64
+    B_VCHUNK: 1
+  num_warps: 4
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BK: 32
+    BV: 64
+    B_VCHUNK: 1
+  num_warps: 4
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BK: 32
+    BV: 64
+    B_VCHUNK: 1
+  num_warps: 4
+  num_stages: 4
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BK: 32
+    BV: 64
+    B_VCHUNK: 2
+  num_warps: 4
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BK: 64
+    BV: 64
+    B_VCHUNK: 1
+  num_warps: 2
+  num_stages: 4
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BK: 64
+    BV: 64
+    B_VCHUNK: 1
+  num_warps: 4
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- META:
+    BK: 64
+    BV: 64
+    B_VCHUNK: 1
+  num_warps: 4
+  num_stages: 4
+  num_ctas: 1
+  maxnreg: null
