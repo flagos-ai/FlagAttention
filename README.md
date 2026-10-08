@@ -131,6 +131,7 @@ The benchmarking process involves comparing the Triton implementations with coun
 cd benchmark/
 python flash_benchmark.py
 python piecewise_benchmark.py
+python log_linear_attn_benchmark.py
 ```
 
 ## Operators
@@ -152,9 +153,32 @@ output = chunk_log_linear_attn(q, k, v, g, level_scales)
 
 The production implementation is under
 [`src/flag_attn/FLA/log_linear_attn/`](src/flag_attn/FLA/log_linear_attn/).
-The optional TileLang baseline and pytest benchmark use preallocated workspaces,
-seven alternating rounds, and
-`triton.testing.do_bench(warmup=1000, rep=100, return_mode="median")`:
+The standalone benchmark follows the other scripts in `benchmark/`. It uses
+preallocated workspaces and reports kernel-only median latency over seven
+alternating rounds with
+`triton.testing.do_bench(warmup=1000, rep=100, return_mode="median")`.
+Local cumsum, LUT creation, allocation, compilation, and autotuning are excluded
+from the timed region. The six default shapes match the H100 comparison in PR #65.
+
+From the repository root:
+
+```sh
+python benchmark/log_linear_attn_benchmark.py
+# Require a TileLang comparison and optionally save results:
+python benchmark/log_linear_attn_benchmark.py --provider both --csv log_linear_attn.csv
+# Measure just TLE on a selected shape:
+python benchmark/log_linear_attn_benchmark.py --provider tle --shape 8 1024 8 64
+```
+
+Install PyTorch, pytest, and a FlagTree/Triton build with TLE support. TileLang
+(validated with 0.1.13) is optional: the default `--provider auto` compares both
+providers when available and otherwise measures TLE only. `--rounds`, `--warmup`,
+and `--rep` customize the measurement settings. The D256 default shape requires
+approximately 10 GiB for the dense tree workspace alone.
+
+The TileLang baseline lives in the corresponding test script,
+`tests/flag_attn/test_log_linear_attn.py`, and is shared by the standalone entry
+point and the opt-in pytest benchmark:
 
 ```sh
 FLAG_ATTN_RUN_EXTERNAL_BENCHMARKS=1 pytest \
