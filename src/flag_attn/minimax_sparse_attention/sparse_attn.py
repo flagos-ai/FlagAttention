@@ -127,6 +127,65 @@ def _sm_count(device) -> int:
         _SM_COUNT_CACHE[index] = count
     return count
 
+
+# Which prefill loop the QH == 8 bf16 path runs on H100.
+#
+# `_gqa_sparse_fwd_tle_kernel` issues each page's K tile as one TMA copy and
+# waits on it immediately -- nothing is in flight, so the copy's whole latency
+# is exposed every iteration. ncu's per-instruction stall samples put 37.1% of
+# this kernel's on the K barrier's spin branch and 18.8% on V's, against 4.0%
+# and 2.5% for upstream, whose half-KV pipeline has the next 64-row half in
+# flight during softmax/PV. The loop still issues 35% fewer instructions, so it
+# wins where latency is cheap (1x128x4096: 1.25-1.34x) and loses where it is
+# not -- large grids, or scattered indices that make co-resident CTAs miss in
+# L2 (0.93-0.98x). Routing those shapes to upstream only gave up the win; the
+# fix is to prefetch inside this loop.
+#
+# `_gqa_sparse_fwd_tle_prefetch_kernel` does that: separate K and V slots, each
+# issued one page ahead, bit-exact with the single-stage loop. It removes both
+# waits and is 1.02-1.54x upstream on 15 of the 21 benchmark shapes. The cost
+# is smem: 68.1KB against 36.1KB, so 3 CTAs/SM instead of 6. That is free while
+# the grid fits in one 3-CTA wave and while CTAs are long enough to hide the
+# tail, but at 512 CTAs it loses a whole wave's worth of overlap (1x512x4096:
+# 0.87x) and at >= 4096 CTAs with short per-CTA work it cannot amortize it.
+#
+# So the three loops win on different shapes and none wins everywhere. Since
+# neither the index pattern nor seq_len is known at launch, each shape is
+# routed by its measured worst case over sorted (index_topk) and random
+# indices, and anything where both fork loops lose runs upstream's kernel
+# verbatim (PTX identical, i.e. exactly upstream's performance):
+#   - at most one CTA per SM: prefetch, where occupancy cannot matter
+#     (1x128: 1.40-1.54x);
+#   - the uniform batches below: prefetch at 1.00-1.19x;
+#   - everything else: upstream.
+# Only on 132 SM, where this was measured; H20 and other devices always keep
+# the single-stage loop, so their behavior is unchanged.
+_PREFILL_PREFETCH_LOOP_SHAPES = frozenset({
+    # (batch, max_query_len, num_kv_heads)
+    (1, 1024, 1),
+    (4, 512, 1),
+    (4, 1024, 1),
+    (8, 128, 1),
+    (16, 128, 1),
+    (32, 128, 1),
+})
+_PREFILL_TUNED_SM_COUNTS = frozenset({132})
+
+
+def _prefill_qh8_kernel_choice(device, total_q, batch, max_query_len,
+                               num_kv_heads):
+    """'fork' | 'prefetch' | 'upstream' for the QH == 8 bf16 prefill."""
+    sm = _sm_count(device)
+    if sm not in _PREFILL_TUNED_SM_COUNTS:
+        return "fork"
+    if total_q * num_kv_heads <= sm:
+        return "prefetch"
+    uniform = total_q == batch * max_query_len
+    if uniform and (batch, max_query_len,
+                    num_kv_heads) in _PREFILL_PREFETCH_LOOP_SHAPES:
+        return "prefetch"
+    return "upstream"
+
 # A 64-token double buffer amortizes its extra softmax/barrier work only for
 # the smallest benchmark GQA tile. Larger tiles reuse one full-page KV stage.
 _PREFILL_HALF_KV_MAX_BLOCK_SIZE_QH = 8
@@ -830,6 +889,686 @@ def _gqa_sparse_fwd_tle_kernel(
 
 
 # ---------------------------------------------------------------------------
+# `_gqa_sparse_fwd_tle_kernel` with the page's KV loads prefetched.
+#
+# Same math, same instruction savings, bit-exact outputs -- the only change is
+# that K and V get a slot each and page i + 1 is issued as soon as the WGMMA
+# that reads page i has drained, so neither barrier_wait finds its copy still
+# in flight. That is what the single-stage loop spends 56% of its stall samples
+# on (see _prefill_qh8_kernel_choice), and removing it is worth up to 1.54x
+# upstream. It costs 68.1KB of smem against 36.1KB, i.e. 3 CTAs/SM instead of
+# 6, so it is only dispatched where the measurement says the lost occupancy
+# does not cost more than the hidden latency saves.
+# ---------------------------------------------------------------------------
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+        "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_QH": lambda args: triton.next_power_of_2(
+            args["gqa_group_size"]
+        ),
+    }
+)
+@triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
+def _gqa_sparse_fwd_tle_prefetch_kernel(
+    q_ptr,  # [total_q, num_heads, head_dim]
+    kv_cache_ptr,  # [num_blocks, num_kv_heads, 128, 2*head_dim]
+    kv_cache_desc,  # TMA view: [num_blocks*num_kv_heads*128, 2*head_dim]
+    t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
+    o_ptr,  # [total_q, num_heads, head_dim]
+    block_table_ptr,  # [num_reqs, max_blocks]
+    cu_seqlens_q,
+    cu_seqblocks_q,
+    seq_lens,
+    prefix_lens,
+    num_kv_heads,
+    gqa_group_size,
+    head_dim,
+    max_topk,
+    sm_scale,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_on,
+    stride_oh,
+    stride_od,
+    stride_bt_b,
+    BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_QH: tl.constexpr,  # == BLOCK_SIZE_H, since BLOCK_SIZE_Q == 1
+    KEEP_TRANS: tl.constexpr,
+):
+    sm_scale_log2e = sm_scale * 1.4426950409
+    pid_q = tl.program_id(0)
+    pid_kh = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    pid_h = pid_kh * gqa_group_size
+
+    q_start = tl.load(cu_seqlens_q + pid_b)
+    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
+    q_block_start = tl.load(cu_seqblocks_q + pid_b)
+    q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
+    if pid_q >= q_block_len:
+        return
+    seq_len = tl.load(seq_lens + pid_b)
+    prefix_len = tl.load(prefix_lens + pid_b)
+
+    off_n = tl.arange(0, BLOCK_SIZE_K)
+    # BLOCK_SIZE_Q == 1: one query token per program, so the valid block count
+    # is a scalar rather than a 1-element tensor reduced with tl.max.
+    q_abs = prefix_len + pid_q
+    loop_blocks = tl.minimum(max_topk, (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K)
+    causal_offsets = q_abs - off_n
+
+    bt_row = block_table_ptr + pid_b * stride_bt_b
+    q_ptrs = tl.make_block_ptr(
+        base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
+        shape=(q_len, gqa_group_size, head_dim),
+        strides=(stride_qn, stride_qh, stride_qd),
+        offsets=(pid_q, 0, 0),
+        block_shape=(1, BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(2, 1, 0),
+    )
+    q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
+    q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
+
+    # Four warps form one Hopper warpgroup. Q is staged once and reused by every
+    # selected page as the transposed WGMMA B operand.
+    q_smem = tle.gpu.alloc(
+        [1, BLOCK_SIZE_QH, BLOCK_SIZE_D],
+        dtype=q_ptr.dtype.element_ty,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    tl.store(tle.gpu.local_ptr(q_smem.slot(0)), q)
+    tl.debug_barrier()
+
+    m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_SIZE_QH,), dtype=tl.float32)
+    acc_o_t = tl.zeros((BLOCK_SIZE_D, BLOCK_SIZE_QH), dtype=tl.float32)
+
+    topk_ptr = t_ptr + pid_kh * stride_th + (q_block_start + pid_q) * stride_tn
+
+    # p_smem normally holds P as [BLOCK_SIZE_K, BLOCK_SIZE_QH] -- the layout
+    # WGMMA already produces -- so the QK result never has to be transposed.
+    # ncu attributed 99.5% of this kernel's shared-bank conflicts to that one
+    # store, and removing the transpose cut instructions by 14%.
+    #
+    # KEEP_TRANS restores the transposed [QH, K] form for BLOCK_SIZE_QH == 8,
+    # where `wgmma(v, p, acc, trans_a=True)` silently computes a WRONG result
+    # (an N=8 transposed-A WGMMA returned 96.0 for an exact-128.0 reduction;
+    # N>=16 is correct). Everything else in this kernel still applies there.
+    if KEEP_TRANS:
+        p_smem = tle.gpu.alloc(
+            [1, BLOCK_SIZE_QH, BLOCK_SIZE_K],
+            dtype=kv_cache_ptr.dtype.element_ty,
+            layout=None,
+            scope=tle.gpu.smem,
+        )
+    else:
+        p_smem = tle.gpu.alloc(
+            [1, BLOCK_SIZE_K, BLOCK_SIZE_QH],
+            dtype=kv_cache_ptr.dtype.element_ty,
+            layout=None,
+            scope=tle.gpu.smem,
+        )
+    # Dedicated K and V slots, each one page ahead: K(i+1) is issued as soon
+    # as QK(i) has read K(i), V(i+1) as soon as PV(i) has read V(i).
+    k_smem = tle.gpu.alloc(
+        [1, BLOCK_SIZE_K, BLOCK_SIZE_D],
+        dtype=kv_cache_ptr.dtype.element_ty,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    v_smem = tle.gpu.alloc(
+        [1, BLOCK_SIZE_K, BLOCK_SIZE_D],
+        dtype=kv_cache_ptr.dtype.element_ty,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    kv_stage_bytes: tl.constexpr = BLOCK_SIZE_K * BLOCK_SIZE_D * 2
+    k_full = tle.gpu.alloc_barriers(num_barriers=1, arrive_count=1,
+                                    expect_bytes=kv_stage_bytes)
+    v_full = tle.gpu.alloc_barriers(num_barriers=1, arrive_count=1,
+                                    expect_bytes=kv_stage_bytes)
+
+    # Prologue: page 0's K and V. From here on each iteration issues page i + 1,
+    # so only the column offset has to be carried across iterations.
+    cur_c = tl.full((), 0, dtype=tl.int32)
+    if loop_blocks > 0:
+        blk0 = tl.load(topk_ptr).to(tl.int32)
+        page0 = tl.load(bt_row + blk0).to(tl.int32)
+        row0 = (page0 * num_kv_heads + pid_kh) * BLOCK_SIZE_K
+        cur_c = blk0 * BLOCK_SIZE_K
+        tle.gpu.copy(kv_cache_desc, k_smem.slot(0), [BLOCK_SIZE_K, BLOCK_SIZE_D],
+                     [row0, 0], barrier=k_full[0])
+        tle.gpu.copy(kv_cache_desc, v_smem.slot(0), [BLOCK_SIZE_K, BLOCK_SIZE_D],
+                     [row0, BLOCK_SIZE_D], barrier=v_full[0])
+
+    for block_iter in tl.range(loop_blocks, disable_licm=True, num_stages=1):
+        c = cur_c
+        pos = c + off_n
+        pos_mask = pos < seq_len
+        # Next page's address, issued early so the loads overlap the K wait.
+        nxt_row = tl.full((), 0, dtype=tl.int32)
+        nxt_c = tl.full((), 0, dtype=tl.int32)
+        if block_iter + 1 < loop_blocks:
+            nblk = tl.load(topk_ptr + (block_iter + 1) * stride_tk).to(tl.int32)
+            npage = tl.load(bt_row + nblk).to(tl.int32)
+            nxt_row = (npage * num_kv_heads + pid_kh) * BLOCK_SIZE_K
+            nxt_c = nblk * BLOCK_SIZE_K
+
+        tle.gpu.barrier_wait(k_full[0], phaseIdx=block_iter)
+        qk_t = tle.gpu.wgmma(
+            k_smem.slot(0),
+            q_smem.slot(0),
+            out_dtype=tl.float32,
+            trans_b=True,
+        )
+        # Drains QK: K(i) is read, so the K slot can take K(i+1) right away.
+        qk_t = tle.gpu.wgmma_wait(0, qk_t)
+        qk_t *= sm_scale_log2e
+        if block_iter + 1 < loop_blocks:
+            tle.gpu.copy(kv_cache_desc, k_smem.slot(0), [BLOCK_SIZE_K, BLOCK_SIZE_D],
+                         [nxt_row, 0], barrier=k_full[0])
+
+        qk = tl.reshape(tl.trans(qk_t), (BLOCK_SIZE_QH, BLOCK_SIZE_K))
+        if (c + BLOCK_SIZE_K) > q_abs:
+            qk += tl.where(causal_offsets[None, :] >= c, 0, float("-inf"))
+        if (c + BLOCK_SIZE_K) > seq_len:
+            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        p = tl.exp2(qk - m_ij[:, None])
+        alpha = tl.exp2(m_i - m_ij)
+        l_ij = tl.sum(p, axis=1)
+        acc_o_t *= alpha[None, :]
+        tl.store(
+            tle.gpu.local_ptr(p_smem.slot(0)),
+            p.to(kv_cache_ptr.dtype.element_ty),
+        )
+
+        tle.gpu.barrier_wait(v_full[0], phaseIdx=block_iter)
+        tl.debug_barrier()
+        acc_o_t = tle.gpu.wgmma(
+            v_smem.slot(0),
+            p_smem.slot(0),
+            acc_o_t,
+            trans_a=True,
+            trans_b=True,
+        )
+        # Drains PV: V(i) is read, so the V slot can take V(i+1).
+        acc_o_t = tle.gpu.wgmma_wait(0, acc_o_t)
+        if block_iter + 1 < loop_blocks:
+            tle.gpu.copy(kv_cache_desc, v_smem.slot(0), [BLOCK_SIZE_K, BLOCK_SIZE_D],
+                         [nxt_row, BLOCK_SIZE_D], barrier=v_full[0])
+
+        l_i = tl.math.fma(l_i, alpha, l_ij)
+        m_i = m_ij
+        cur_c = nxt_c
+
+    inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0)
+    acc_o_t *= inv_l[None, :]
+    acc_o = tl.trans(acc_o_t)
+    acc_o = tl.reshape(acc_o, 1, BLOCK_SIZE_H, BLOCK_SIZE_D)
+    o_ptrs = tl.make_block_ptr(
+        base=o_ptr + q_start * stride_on + pid_h * stride_oh,
+        shape=(q_len, gqa_group_size, head_dim),
+        strides=(stride_on, stride_oh, stride_od),
+        offsets=(pid_q, 0, 0),
+        block_shape=(1, BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(2, 1, 0),
+    )
+    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
+
+
+# ---------------------------------------------------------------------------
+# Upstream's TLE prefill kernel, copied verbatim (only renamed). Used for the
+# QH == 8 bf16 shapes where its half-KV double-buffered pipeline beats both of
+# this file's loops; see _prefill_qh8_kernel_choice. Keeping it
+# byte-for-byte avoids the 1-4.5% gap a re-implementation of the same loop
+# measured, and its PTX is checked identical to upstream's. The
+# USE_TL_DOT_PATH branch is dead (always launched with False) and kept only so
+# the body stays verbatim; _gqa_sparse_fwd_kernel has the same signature here.
+# ---------------------------------------------------------------------------
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+        "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
+        * triton.next_power_of_2(args["gqa_group_size"]),
+    }
+)
+@triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
+def _gqa_sparse_fwd_tle_upstream_kernel(
+    q_ptr,  # [total_q, num_heads, head_dim]
+    kv_cache_ptr,  # [num_blocks, num_kv_heads, 128, 2*head_dim]
+    kv_cache_desc,  # flattened [num_blocks*num_kv_heads*128, 2*head_dim]
+    k_scale_ptr,
+    v_scale_ptr,
+    t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
+    o_ptr,  # [total_q, num_heads, head_dim]
+    block_table_ptr,  # [num_reqs, max_blocks]
+    cu_seqlens_q,
+    cu_seqblocks_q,
+    seq_lens,
+    prefix_lens,
+    num_kv_heads,
+    gqa_group_size,
+    head_dim,
+    max_topk,
+    num_q_loop,
+    sm_scale,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_kv_blk,
+    stride_kv_h,
+    stride_kv_pos,
+    stride_kv_d,
+    stride_ks_h,
+    stride_ks_t,
+    stride_vs_h,
+    stride_vs_t,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_on,
+    stride_oh,
+    stride_od,
+    stride_bt_b,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_QH: tl.constexpr,
+    USE_TL_DOT_PATH: tl.constexpr,
+    USE_FP8: tl.constexpr,
+    KV_SCALE_MODE: tl.constexpr,
+    USE_HALF_KV_PIPE: tl.constexpr,
+):
+    if USE_TL_DOT_PATH:
+        _gqa_sparse_fwd_kernel(
+            q_ptr,
+            kv_cache_ptr,
+            k_scale_ptr,
+            v_scale_ptr,
+            t_ptr,
+            o_ptr,
+            block_table_ptr,
+            cu_seqlens_q,
+            cu_seqblocks_q,
+            seq_lens,
+            prefix_lens,
+            num_kv_heads,
+            gqa_group_size,
+            head_dim,
+            max_topk,
+            num_q_loop,
+            sm_scale,
+            stride_qn,
+            stride_qh,
+            stride_qd,
+            stride_kv_blk,
+            stride_kv_h,
+            stride_kv_pos,
+            stride_kv_d,
+            stride_ks_h,
+            stride_ks_t,
+            stride_vs_h,
+            stride_vs_t,
+            stride_th,
+            stride_tn,
+            stride_tk,
+            stride_on,
+            stride_oh,
+            stride_od,
+            stride_bt_b,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_K,
+            BLOCK_SIZE_D,
+            BLOCK_SIZE_H,
+            BLOCK_SIZE_QH,
+            USE_FP8,
+            KV_SCALE_MODE,
+        )
+        return
+
+    sm_scale_log2e = sm_scale * 1.4426950409
+    pid_q = tl.program_id(0)
+    pid_kh = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    pid_h = pid_kh * gqa_group_size
+    q_start = tl.load(cu_seqlens_q + pid_b)
+    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
+    q_block_start = tl.load(cu_seqblocks_q + pid_b)
+    q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
+    seq_len = tl.load(seq_lens + pid_b)
+    prefix_len = tl.load(prefix_lens + pid_b)
+
+    q_tile_start = pid_q * BLOCK_SIZE_Q
+    if q_tile_start >= q_block_len:
+        return
+
+    off_q = tl.arange(0, BLOCK_SIZE_Q)
+    off_n = tl.arange(0, BLOCK_SIZE_K)
+    q_abs = prefix_len + q_tile_start + off_q
+    real_topk = tl.minimum(max_topk, (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K)
+
+    bt_row = block_table_ptr + pid_b * stride_bt_b
+    q_ptrs = tl.make_block_ptr(
+        base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
+        shape=(q_len, gqa_group_size, head_dim),
+        strides=(stride_qn, stride_qh, stride_qd),
+        offsets=(q_tile_start, 0, 0),
+        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(2, 1, 0),
+    )
+    q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
+    q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
+
+    # Four warps form one Hopper warpgroup. Q is staged once and reused by all
+    # selected pages as the transposed WGMMA B operand.
+    q_smem = tle.gpu.alloc(
+        [1, BLOCK_SIZE_QH, BLOCK_SIZE_D],
+        dtype=q_ptr.dtype.element_ty,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    tl.store(tle.gpu.local_ptr(q_smem.slot(0)), q)
+    tl.debug_barrier()
+
+    m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_SIZE_QH,), dtype=tl.float32)
+    acc_o_t = tl.zeros((BLOCK_SIZE_D, BLOCK_SIZE_QH), dtype=tl.float32)
+
+    loop_blocks = tl.max(real_topk, axis=0)
+    topk_ptr = t_ptr + pid_kh * stride_th + (q_block_start + q_tile_start) * stride_tn
+
+    if USE_HALF_KV_PIPE:
+        HALF_K: tl.constexpr = BLOCK_SIZE_K // 2
+        off_half = tl.arange(0, HALF_K)
+        causal_offsets = q_abs[:, None] - off_half[None, :]
+        p_smem = tle.gpu.alloc(
+            [1, BLOCK_SIZE_QH, HALF_K],
+            dtype=kv_cache_ptr.dtype.element_ty,
+            layout=None,
+            scope=tle.gpu.smem,
+        )
+        kv_smem = tle.gpu.alloc(
+            [2, HALF_K, BLOCK_SIZE_D],
+            dtype=kv_cache_ptr.dtype.element_ty,
+            layout=None,
+            scope=tle.gpu.smem,
+        )
+        kv_stage_bytes: tl.constexpr = HALF_K * BLOCK_SIZE_D * 2
+        kv_empty = tle.gpu.alloc_barriers(
+            num_barriers=2,
+            arrive_count=1,
+            init=tle.gpu.READY,
+        )
+        kv_full = tle.gpu.alloc_barriers(
+            num_barriers=2,
+            arrive_count=1,
+            expect_bytes=kv_stage_bytes,
+        )
+        loop_tiles = loop_blocks * 2
+        # The K prefetch already resolves the next tile's logical block and
+        # physical page. Keep these two scalar addresses live across the loop
+        # so the V copy does not reload topk_idx and block_table for that tile.
+        cur_kv_row = tl.full((), 0, dtype=tl.int32)
+        cur_c = tl.full((), 0, dtype=tl.int32)
+
+        # Prologue: stage the first K half before entering the ping-pong loop.
+        if loop_tiles > 0:
+            first_blk = tl.load(topk_ptr).to(tl.int32)
+            first_page = tl.load(bt_row + first_blk).to(tl.int32)
+            first_row = (first_page * num_kv_heads + pid_kh) * BLOCK_SIZE_K
+            cur_kv_row = first_row
+            cur_c = first_blk * BLOCK_SIZE_K
+            tle.gpu.barrier_wait(kv_empty[0], phaseIdx=0)
+            tle.gpu.copy(
+                kv_cache_desc,
+                kv_smem.slot(0),
+                [HALF_K, BLOCK_SIZE_D],
+                [first_row, 0],
+                barrier=kv_full[0],
+            )
+
+        for tile_iter in tl.range(loop_tiles, disable_licm=True, num_stages=1):
+            block_iter = tile_iter // 2
+            # half_idx = tile_iter % 2
+            buf_idx = tile_iter % 2
+            reuse_iter = tile_iter // 2
+            k_phase = reuse_iter * 2
+            v_phase = k_phase + 1
+
+            kv_row = cur_kv_row
+            c = cur_c
+            pos = c + off_half
+            pos_mask = pos < seq_len
+
+            tle.gpu.barrier_wait(kv_full[buf_idx], phaseIdx=k_phase)
+            qk_t = tle.gpu.wgmma(
+                kv_smem.slot(buf_idx),
+                q_smem.slot(0),
+                out_dtype=tl.float32,
+                trans_b=True,
+            )
+            qk_t = tle.gpu.wgmma_wait(0, qk_t)
+            qk_t *= sm_scale_log2e
+            qk = tl.reshape(
+                tl.trans(qk_t),
+                (BLOCK_SIZE_Q, BLOCK_SIZE_H, HALF_K),
+            )
+
+            # Reuse this slot for V while the other slot receives the next K.
+            tle.gpu.barrier_arrive(kv_empty[buf_idx], phaseIdx=k_phase)
+            tle.gpu.barrier_wait(kv_empty[buf_idx], phaseIdx=v_phase)
+            tle.gpu.copy(
+                kv_cache_desc,
+                kv_smem.slot(buf_idx),
+                [HALF_K, BLOCK_SIZE_D],
+                [kv_row, BLOCK_SIZE_D],
+                barrier=kv_full[buf_idx],
+            )
+
+            if tile_iter + 1 < loop_tiles:
+                next_tile = tile_iter + 1
+                next_block_iter = next_tile // 2
+                next_half_idx = next_tile % 2
+                next_buf_idx = next_tile % 2
+                next_reuse_iter = next_tile // 2
+                next_k_phase = next_reuse_iter * 2
+                next_blk = tl.load(
+                    topk_ptr + next_block_iter * stride_tk
+                ).to(tl.int32)
+                next_page = tl.load(bt_row + next_blk).to(tl.int32)
+                next_kv_row = (
+                    next_page * num_kv_heads + pid_kh
+                ) * BLOCK_SIZE_K + next_half_idx * HALF_K
+                next_c = next_blk * BLOCK_SIZE_K + next_half_idx * HALF_K
+                tle.gpu.barrier_wait(
+                    kv_empty[next_buf_idx], phaseIdx=next_k_phase
+                )
+                tle.gpu.copy(
+                    kv_cache_desc,
+                    kv_smem.slot(next_buf_idx),
+                    [HALF_K, BLOCK_SIZE_D],
+                    [next_kv_row, 0],
+                    barrier=kv_full[next_buf_idx],
+                )
+                cur_kv_row = next_kv_row
+                cur_c = next_c
+
+            if (c + HALF_K) > (prefix_len + q_tile_start):
+                qk += tl.where(causal_offsets[:, None, :] >= c, 0, float("-inf"))
+            qk = tl.reshape(qk, BLOCK_SIZE_QH, HALF_K)
+            if (c + HALF_K) > seq_len:
+                qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            p = tl.exp2(qk - m_ij[:, None])
+            alpha = tl.exp2(m_i - m_ij)
+            l_ij = tl.sum(p, axis=1)
+            acc_o_t *= alpha[None, :]
+            tl.store(
+                tle.gpu.local_ptr(p_smem.slot(0)),
+                p.to(kv_cache_ptr.dtype.element_ty),
+            )
+
+            tle.gpu.barrier_wait(kv_full[buf_idx], phaseIdx=v_phase)
+            tl.debug_barrier()
+            acc_o_t = tle.gpu.wgmma(
+                kv_smem.slot(buf_idx),
+                p_smem.slot(0),
+                acc_o_t,
+                trans_a=True,
+                trans_b=True,
+            )
+            acc_o_t = tle.gpu.wgmma_wait(0, acc_o_t)
+            tle.gpu.barrier_arrive(kv_empty[buf_idx], phaseIdx=v_phase)
+
+            l_i = tl.math.fma(l_i, alpha, l_ij)
+            m_i = m_ij
+    else:
+        causal_offsets = q_abs[:, None] - off_n[None, :]
+        p_smem = tle.gpu.alloc(
+            [1, BLOCK_SIZE_QH, BLOCK_SIZE_K],
+            dtype=kv_cache_ptr.dtype.element_ty,
+            layout=None,
+            scope=tle.gpu.smem,
+        )
+        kv_smem = tle.gpu.alloc(
+            [1, BLOCK_SIZE_K, BLOCK_SIZE_D],
+            dtype=kv_cache_ptr.dtype.element_ty,
+            layout=None,
+            scope=tle.gpu.smem,
+        )
+        kv_stage_bytes: tl.constexpr = BLOCK_SIZE_K * BLOCK_SIZE_D * 2
+        kv_empty = tle.gpu.alloc_barriers(
+            num_barriers=1,
+            arrive_count=1,
+            init=tle.gpu.READY,
+        )
+        kv_full = tle.gpu.alloc_barriers(
+            num_barriers=1,
+            arrive_count=1,
+            expect_bytes=kv_stage_bytes,
+        )
+        # Resolve page(0) before the loop. Each iteration consumes the carried
+        # row/offset, then resolves page(i + 1) while V(i) is in flight.
+        cur_kv_row = tl.full((), 0, dtype=tl.int32)
+        cur_c = tl.full((), 0, dtype=tl.int32)
+        if loop_blocks > 0:
+            first_blk = tl.load(topk_ptr).to(tl.int32)
+            first_page = tl.load(bt_row + first_blk).to(tl.int32)
+            cur_kv_row = (
+                first_page * num_kv_heads + pid_kh
+            ) * BLOCK_SIZE_K
+            cur_c = first_blk * BLOCK_SIZE_K
+
+        for block_iter in tl.range(loop_blocks, disable_licm=True, num_stages=1):
+            k_phase = block_iter * 2
+            v_phase = k_phase + 1
+            kv_row = cur_kv_row
+            c = cur_c
+            pos = c + off_n
+            pos_mask = pos < seq_len
+
+            tle.gpu.barrier_wait(kv_empty[0], phaseIdx=k_phase)
+            tle.gpu.copy(
+                kv_cache_desc,
+                kv_smem.slot(0),
+                [BLOCK_SIZE_K, BLOCK_SIZE_D],
+                [kv_row, 0],
+                barrier=kv_full[0],
+            )
+            tle.gpu.barrier_wait(kv_full[0], phaseIdx=k_phase)
+
+            qk_t = tle.gpu.wgmma(
+                kv_smem.slot(0),
+                q_smem.slot(0),
+                out_dtype=tl.float32,
+                trans_b=True,
+            )
+            qk_t = tle.gpu.wgmma_wait(0, qk_t)
+            qk_t *= sm_scale_log2e
+            qk = tl.reshape(
+                tl.trans(qk_t),
+                (BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K),
+            )
+
+            tle.gpu.barrier_arrive(kv_empty[0], phaseIdx=k_phase)
+            tle.gpu.barrier_wait(kv_empty[0], phaseIdx=v_phase)
+            tle.gpu.copy(
+                kv_cache_desc,
+                kv_smem.slot(0),
+                [BLOCK_SIZE_K, BLOCK_SIZE_D],
+                [kv_row, BLOCK_SIZE_D],
+                barrier=kv_full[0],
+            )
+
+            if block_iter + 1 < loop_blocks:
+                next_blk = tl.load(
+                    topk_ptr + (block_iter + 1) * stride_tk
+                ).to(tl.int32)
+                next_page = tl.load(bt_row + next_blk).to(tl.int32)
+                cur_kv_row = (
+                    next_page * num_kv_heads + pid_kh
+                ) * BLOCK_SIZE_K
+                cur_c = next_blk * BLOCK_SIZE_K
+
+            if (c + BLOCK_SIZE_K) > (prefix_len + q_tile_start):
+                qk += tl.where(causal_offsets[:, None, :] >= c, 0, float("-inf"))
+            qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
+            if (c + BLOCK_SIZE_K) > seq_len:
+                qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            p = tl.exp2(qk - m_ij[:, None])
+            alpha = tl.exp2(m_i - m_ij)
+            l_ij = tl.sum(p, axis=1)
+            acc_o_t *= alpha[None, :]
+            tl.store(
+                tle.gpu.local_ptr(p_smem.slot(0)),
+                p.to(kv_cache_ptr.dtype.element_ty),
+            )
+
+            tle.gpu.barrier_wait(kv_full[0], phaseIdx=v_phase)
+            tl.debug_barrier()
+            acc_o_t = tle.gpu.wgmma(
+                kv_smem.slot(0),
+                p_smem.slot(0),
+                acc_o_t,
+                trans_a=True,
+                trans_b=True,
+            )
+            acc_o_t = tle.gpu.wgmma_wait(0, acc_o_t)
+            tle.gpu.barrier_arrive(kv_empty[0], phaseIdx=v_phase)
+
+            l_i = tl.math.fma(l_i, alpha, l_ij)
+            m_i = m_ij
+
+    inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0)
+    acc_o_t *= inv_l[None, :]
+    acc_o = tl.trans(acc_o_t)
+    acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
+    o_ptrs = tl.make_block_ptr(
+        base=o_ptr + q_start * stride_on + pid_h * stride_oh,
+        shape=(q_len, gqa_group_size, head_dim),
+        strides=(stride_on, stride_oh, stride_od),
+        offsets=(q_tile_start, 0, 0),
+        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(2, 1, 0),
+    )
+    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
+
+
+# ---------------------------------------------------------------------------
 # Decode kernels (split-K). Decode batches are flattened request-major, with a
 # runtime query length used to map each query token back to its request metadata.
 # This parallelizes over the selected top-k blocks, producing partials that the
@@ -837,6 +1576,18 @@ def _gqa_sparse_fwd_tle_kernel(
 # constants so the grid is fixed within a cuda graph. Base-2 (exp2/log2)
 # softmax matches the prefill kernel.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Decode kernels (split-K). Decode batches are flattened request-major, with a
+# runtime query length used to map each query token back to its request metadata.
+# This parallelizes over the selected top-k blocks, producing partials that the
+# merge kernel combines (flash-decoding). All chunk counts depend only on shape
+# constants so the grid is fixed within a cuda graph. Base-2 (exp2/log2)
+# softmax matches the prefill kernel.
+# ---------------------------------------------------------------------------
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_H": lambda args: max(
@@ -1680,6 +2431,42 @@ def minimax_m3_sparse_attn(
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     triton.set_allocator(_tma_allocator)
+    qh8_choice = (_prefill_qh8_kernel_choice(q.device, total_q, batch,
+                                             max_query_len, num_kv_heads)
+                  if block_size_h <= _PREFILL_HALF_KV_MAX_BLOCK_SIZE_QH else "fork")
+    if qh8_choice == "upstream":
+        # Exactly upstream's launch for this case: half-height TMA boxes for
+        # the two-stage KV pipeline, and the same constexprs.
+        kv_cache_2d = kv_cache.view(-1, 2 * head_dim)
+        kv_cache_desc = TensorDescriptor(
+            kv_cache_2d,
+            shape=[kv_cache_2d.shape[0], kv_cache_2d.shape[1]],
+            strides=[kv_cache_2d.stride(0), kv_cache_2d.stride(1)],
+            block_shape=[SPARSE_BLOCK_SIZE // 2, head_dim],
+        )
+        _gqa_sparse_fwd_tle_upstream_kernel[grid](
+            q, kv_cache, kv_cache_desc, k_scale_arg, v_scale_arg, topk_idx,
+            output, block_table, cu_seqlens_q, cu_seqlens_q, seq_lens,
+            prefix_lens, num_kv_heads, gqa_group_size, head_dim, topk,
+            1,  # num_q_loop
+            sm_scale,
+            q.stride(0), q.stride(1), q.stride(2),
+            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+            kv_cache.stride(3),
+            stride_ks_h, stride_ks_t, stride_vs_h, stride_vs_t,
+            topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
+            output.stride(0), output.stride(1), output.stride(2),
+            block_table.stride(0),
+            BLOCK_SIZE_Q=1,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            USE_TL_DOT_PATH=False,
+            USE_FP8=use_fp8,
+            KV_SCALE_MODE=kv_scale_mode,
+            USE_HALF_KV_PIPE=True,
+            num_warps=4,
+            num_stages=1,
+        )
+        return
     kv_cache_2d = kv_cache.view(-1, 2 * head_dim)
     kv_cache_desc = TensorDescriptor(
         kv_cache_2d,
@@ -1687,6 +2474,21 @@ def minimax_m3_sparse_attn(
         strides=[kv_cache_2d.stride(0), kv_cache_2d.stride(1)],
         block_shape=[SPARSE_BLOCK_SIZE, head_dim],
     )
+    if qh8_choice == "prefetch":
+        _gqa_sparse_fwd_tle_prefetch_kernel[grid](
+            q, kv_cache, kv_cache_desc, topk_idx, output, block_table,
+            cu_seqlens_q, cu_seqlens_q, seq_lens, prefix_lens,
+            num_kv_heads, gqa_group_size, head_dim, topk, sm_scale,
+            q.stride(0), q.stride(1), q.stride(2),
+            topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
+            output.stride(0), output.stride(1), output.stride(2),
+            block_table.stride(0),
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            KEEP_TRANS=block_size_h < _MSA_PREFILL_UNTRANSPOSED_MIN_QH,
+            num_warps=4,
+            num_stages=1,
+        )
+        return
     _gqa_sparse_fwd_tle_kernel[grid](
         q, kv_cache, kv_cache_desc, topk_idx, output, block_table,
         cu_seqlens_q, cu_seqlens_q, seq_lens, prefix_lens,
