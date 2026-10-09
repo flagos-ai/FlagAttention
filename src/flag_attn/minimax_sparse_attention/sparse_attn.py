@@ -1016,8 +1016,20 @@ def _gqa_sparse_decode_kernel(
         order=(1, 0),
     )
     tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
+    # The lse store is unconditional even though the merge-skip path never
+    # reads it back. Gating it on a constexpr looks like free dead-code
+    # removal and is not: dropping it removes a register pressure point late
+    # in the kernel, the scheduler then picks a more aggressive allocation
+    # (168 -> 190 regs), and at 73732 B of smem per CTA that crosses the
+    # occupancy cliff from 3 CTAs/SM to 2 (65536 / (190*4*32) = 2). Measured
+    # at (b=512, s=3072) fp8: 291.4 us with the store, 330.4 us without --
+    # 13% slower to skip ~5 KB of writes. An explicit maxnreg=168 cap only
+    # recovers half of it (316.3 us) because the cap spills instead.
     lse_ptrs = tl.make_block_ptr(
-        base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
+        base=lse_ptr
+        + pid_c * stride_l_c
+        + pid_b * stride_l_b
+        + pid_h * stride_l_h,
         shape=(gqa_group_size,),
         strides=(stride_l_h,),
         offsets=(0,),
@@ -1249,200 +1261,6 @@ def _gqa_sparse_decode_fused_kernel(
         )
         tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty),
                  boundary_check=(0,))
-
-
-@triton.heuristics(
-    {
-        "BLOCK_SIZE_H": lambda args: max(
-            16, triton.next_power_of_2(args["gqa_group_size"])
-        ),
-        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-    }
-)
-@triton.jit(do_not_specialize=["decode_query_len"])
-def _gqa_sparse_decode_mergeskip_kernel(
-    q_ptr,
-    kv_cache_ptr,
-    k_scale_ptr,
-    v_scale_ptr,
-    t_ptr,
-    o_ptr,
-    lse_ptr,
-    block_table_ptr,
-    seq_lens,
-    total_q,
-    gqa_group_size,
-    head_dim,
-    max_topk,
-    sm_scale,
-    decode_query_len,
-    stride_qn,
-    stride_qh,
-    stride_qd,
-    stride_kv_blk,
-    stride_kv_h,
-    stride_kv_pos,
-    stride_kv_d,
-    stride_ks_h,
-    stride_ks_t,
-    stride_vs_h,
-    stride_vs_t,
-    stride_th,
-    stride_tn,
-    stride_tk,
-    stride_o_c,
-    stride_o_b,
-    stride_o_h,
-    stride_o_d,
-    stride_l_c,
-    stride_l_b,
-    stride_l_h,
-    stride_bt_b,
-    BLOCK_SIZE_K: tl.constexpr,
-    NUM_TOPK_CHUNKS: tl.constexpr,
-    BLOCK_SIZE_H: tl.constexpr,
-    BLOCK_SIZE_D: tl.constexpr,
-    USE_FP8: tl.constexpr,
-    KV_SCALE_MODE: tl.constexpr,
-    USE_PDL: tl.constexpr,
-    SINGLE_CHUNK: tl.constexpr,
-):
-    sm_scale_log2e = sm_scale * 1.4426950409
-    pid_bc, pid_kh = tl.program_id(0), tl.program_id(1)
-    pid_b = pid_bc % total_q
-    pid_c = pid_bc // total_q
-    req_id = pid_b // decode_query_len
-    q_offset = pid_b - req_id * decode_query_len
-    pid_h = pid_kh * gqa_group_size
-    chunk_size_topk = (max_topk + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
-    chunk_start_topk = pid_c * chunk_size_topk
-    chunk_end_compiletime = chunk_start_topk + chunk_size_topk
-
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
-
-    seq_len = tl.load(seq_lens + req_id)
-    query_pos = seq_len - decode_query_len + q_offset
-    # Full-CG padding uses zero-length request rows. Clamp to an empty attention
-    # range instead of letting padded rows produce negative lengths.
-    kv_len = tl.maximum(query_pos + 1, 0)
-
-    idx_base = t_ptr + pid_kh * stride_th + pid_b * stride_tn
-    num_blocks = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
-    real_topk = tl.minimum(max_topk, num_blocks)
-    chunk_end_topk = tl.minimum(chunk_end_compiletime, real_topk)
-
-    off_n = tl.arange(0, BLOCK_SIZE_K)
-    off_d = tl.arange(0, BLOCK_SIZE_D)
-    d_mask = off_d < head_dim
-    bt_row = block_table_ptr + req_id * stride_bt_b
-
-    m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
-    lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
-    acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + pid_b * stride_qn + pid_h * stride_qh,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_qh, stride_qd),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
-    )
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
-
-    cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
-    for _ in tl.range(chunk_start_topk, chunk_end_topk):
-        blk = tl.load(cur_idx_ptr).to(tl.int32)
-        cur_idx_ptr = cur_idx_ptr + stride_tk
-        c = blk * BLOCK_SIZE_K
-        page = tl.load(bt_row + blk).to(tl.int64)
-        pos = c + off_n
-        pos_mask = pos < kv_len
-        k = tl.load(
-            kv_cache_ptr
-            + page * stride_kv_blk
-            + pid_kh * stride_kv_h
-            + off_n[None, :] * stride_kv_pos
-            + off_d[:, None] * stride_kv_d,
-            mask=d_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
-        if USE_FP8:
-            k = k.to(q.dtype)
-            if KV_SCALE_MODE == 1:
-                k = (k * tl.load(k_scale_ptr)).to(q.dtype)
-            elif KV_SCALE_MODE == 2:
-                k_scale = tl.load(
-                    k_scale_ptr
-                    + pid_kh * stride_ks_h
-                    + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
-                    mask=pos_mask,
-                    other=1.0,
-                )
-                k = (k * k_scale[None, :]).to(q.dtype)
-        qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-        qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-        qk += tl.dot(q, k) * sm_scale_log2e
-        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp2(qk - m_ij[:, None])
-        l_ij = tl.sum(p, axis=1)
-        acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
-        v = tl.load(
-            kv_cache_ptr
-            + page * stride_kv_blk
-            + pid_kh * stride_kv_h
-            + off_n[:, None] * stride_kv_pos
-            + (head_dim + off_d[None, :]) * stride_kv_d,
-            mask=pos_mask[:, None] & d_mask[None, :],
-            other=0.0,
-        )
-        if USE_FP8:
-            v = v.to(q.dtype)
-            if KV_SCALE_MODE == 1:
-                v = (v * tl.load(v_scale_ptr)).to(q.dtype)
-            elif KV_SCALE_MODE == 2:
-                v_scale = tl.load(
-                    v_scale_ptr
-                    + pid_kh * stride_vs_h
-                    + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
-                    mask=pos_mask,
-                    other=1.0,
-                )
-                v = (v * v_scale[:, None]).to(q.dtype)
-        acc_o += tl.dot(p.to(v.dtype), v)
-        m_i = m_ij
-        lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
-
-    if USE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-    # Empty chunks for active rows must store zero output; otherwise the merge
-    # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
-    scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
-    acc_o = acc_o * scale[:, None]
-    o_ptrs = tl.make_block_ptr(
-        base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_o_h, stride_o_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
-    )
-    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
-    # With a single chunk there is no merge to consume lse: the store is dead.
-    if not SINGLE_CHUNK:
-        lse_ptrs = tl.make_block_ptr(
-            base=lse_ptr
-            + pid_c * stride_l_c
-            + pid_b * stride_l_b
-            + pid_h * stride_l_h,
-            shape=(gqa_group_size,),
-            strides=(stride_l_h,),
-            offsets=(0,),
-            block_shape=(BLOCK_SIZE_H,),
-            order=(0,),
-        )
-        tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
 
 
 def _tma_allocator(size: int, align: int, stream):
@@ -1983,11 +1801,12 @@ def minimax_m3_sparse_attn_decode(
     # is a measurable share of wall time -- taking the shortest route here is
     # worth more than any kernel tweak. Measured: without this, small-batch
     # shapes ran 0.89-0.95x of upstream purely on host overhead.
-    # `single_chunk` selects the kernel and whether a merge pass runs; it is
-    # deliberately NOT folded into USE_PDL. Doing so forks that constexpr and
-    # splits the shared decode kernel into extra compiled variants, so the
-    # same shape resolves to different cache entries depending on the call
-    # site -- measured as a systematic 1.4-3.8% loss on the chunks>1 shapes.
+    # `single_chunk` decides where the kernel writes and whether a merge pass
+    # runs. It is deliberately NOT folded into a constexpr of the shared
+    # decode kernel: that forks the kernel so one shape resolves to different
+    # compiled variants depending on the call site (measured as a systematic
+    # 1.4-3.8% loss on the chunks>1 shapes), and the one dead store it would
+    # let the compiler remove costs an occupancy tier (see that store).
     single_chunk = num_topk_chunks == 1
     if not single_chunk and not use_fused_decode:
         o_partial = torch.empty(
@@ -2035,14 +1854,30 @@ def minimax_m3_sparse_attn_decode(
 
     if single_chunk:
         o_partial = output
-        lse_partial = output  # unused; keeps the launch signature uniform
         stride_o_c = 0
-        stride_l_c = stride_l_b = stride_l_h = 0
         stride_o_b, stride_o_h, stride_o_d = (
             output.stride(0),
             output.stride(1),
             output.stride(2),
         )
+        if use_fused_decode:
+            # The fused kernel drops its lse store under SINGLE_CHUNK without
+            # losing occupancy (its constexpr-bounded pointers already hold it
+            # at 168 regs), so no buffer is needed.
+            lse_partial = output  # unused; keeps the launch signature uniform
+            stride_l_c = stride_l_b = stride_l_h = 0
+        else:
+            # The shared kernel stores lse unconditionally; see the note at
+            # that store for why removing it costs more than the write.
+            lse_partial = torch.empty(
+                num_topk_chunks, total_q, num_heads,
+                dtype=torch.float32, device=q.device,
+            )
+            stride_l_c, stride_l_b, stride_l_h = (
+                lse_partial.stride(0),
+                lse_partial.stride(1),
+                lse_partial.stride(2),
+            )
         pdl_launch = {}
     else:
         o_partial = torch.empty(
@@ -2095,53 +1930,31 @@ def minimax_m3_sparse_attn_decode(
             **pdl_launch,
         )
     else:
-        # Only the merge-skip path needs the modified kernel. When there are
-        # multiple chunks there is no merge to skip, so use upstream's kernel
-        # verbatim: the extra constexpr bought nothing and measured 0.89-0.92x
-        # on this repo's small-batch benchmark shapes.
-        if single_chunk:
-            _gqa_sparse_decode_mergeskip_kernel[grid](
-                q, kv_cache, k_scale_arg, v_scale_arg, topk_idx, o_partial,
-                lse_partial, block_table, seq_lens,
-                total_q, gqa_group_size, head_dim, max_topk, sm_scale,
-                decode_query_len,
-                q.stride(0), q.stride(1), q.stride(2),
-                kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
-                kv_cache.stride(3),
-                stride_ks_h, stride_ks_t, stride_vs_h, stride_vs_t,
-                topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
-                stride_o_c, stride_o_b, stride_o_h, stride_o_d,
-                stride_l_c, stride_l_b, stride_l_h,
-                block_table.stride(0),
-                BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-                NUM_TOPK_CHUNKS=num_topk_chunks,
-                USE_FP8=use_fp8,
-                KV_SCALE_MODE=kv_scale_mode,
-                USE_PDL=use_pdl,
-                SINGLE_CHUNK=single_chunk,
-                **pdl_launch,
-            )
-        else:
-            _gqa_sparse_decode_kernel[grid](
-                q, kv_cache, k_scale_arg, v_scale_arg, topk_idx, o_partial,
-                lse_partial, block_table, seq_lens,
-                total_q, gqa_group_size, head_dim, max_topk, sm_scale,
-                decode_query_len,
-                q.stride(0), q.stride(1), q.stride(2),
-                kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
-                kv_cache.stride(3),
-                stride_ks_h, stride_ks_t, stride_vs_h, stride_vs_t,
-                topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
-                stride_o_c, stride_o_b, stride_o_h, stride_o_d,
-                stride_l_c, stride_l_b, stride_l_h,
-                block_table.stride(0),
-                BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-                NUM_TOPK_CHUNKS=num_topk_chunks,
-                USE_FP8=use_fp8,
-                KV_SCALE_MODE=kv_scale_mode,
-                USE_PDL=use_pdl,
-                **pdl_launch,
-            )
+        # Upstream's kernel verbatim for both chunk counts: it carries no
+        # merge-skip constexpr, so a given shape always resolves to the same
+        # compiled variant regardless of call site. The merge-skip is purely
+        # a host-side decision (where o_partial points, and whether the merge
+        # launches below).
+        _gqa_sparse_decode_kernel[grid](
+            q, kv_cache, k_scale_arg, v_scale_arg, topk_idx, o_partial,
+            lse_partial, block_table, seq_lens,
+            total_q, gqa_group_size, head_dim, max_topk, sm_scale,
+            decode_query_len,
+            q.stride(0), q.stride(1), q.stride(2),
+            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+            kv_cache.stride(3),
+            stride_ks_h, stride_ks_t, stride_vs_h, stride_vs_t,
+            topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
+            stride_o_c, stride_o_b, stride_o_h, stride_o_d,
+            stride_l_c, stride_l_b, stride_l_h,
+            block_table.stride(0),
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            NUM_TOPK_CHUNKS=num_topk_chunks,
+            USE_FP8=use_fp8,
+            KV_SCALE_MODE=kv_scale_mode,
+            USE_PDL=use_pdl,
+            **pdl_launch,
+        )
     if not single_chunk:
         merge_grid = (total_q, num_heads)
         _merge_topk_attn_out_kernel[merge_grid](
