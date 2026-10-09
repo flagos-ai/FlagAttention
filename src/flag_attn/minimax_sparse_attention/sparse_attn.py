@@ -90,6 +90,11 @@ _MSA_PREFILL_UNTRANSPOSED_MIN_QH = 16
 # conditional at the launch site rather than a constant.
 _MSA_PREFILL_FP8_MAXNREG = 128
 
+# Minimum GQA tile for the fp8 TLE kernel. Only its QK is a WGMMA, and that is
+# a trans_b form with both operands K-major, so the N == 8 transposed-A defect
+# that constrains the bf16 path does not apply.
+_MSA_PREFILL_FP8_MIN_QH = 8
+
 _SM_COUNT_CACHE: dict[int, int] = {}
 _PDL_SUPPORTED: bool | None = None
 
@@ -1790,11 +1795,17 @@ def minimax_m3_sparse_attn(
     # fp8 with scalar scales goes to the TLE kernel; the tl.dot path remains
     # for per-token scales (not yet ported) and for GQA tiles too small to form
     # a legal WGMMA.
+    # BLOCK_SIZE_QH >= 8 is enough here, unlike the bf16 path's >= 16. That
+    # larger bound exists because the bf16 kernel's PV is a transposed-A WGMMA,
+    # which silently returns a wrong result at N == 8. This kernel only uses
+    # WGMMA for QK (trans_b, both operands K-major) and keeps PV on tl.dot, so
+    # the transposed-A defect cannot apply. Verified directly: fp8 QK at QH = 8
+    # returns the exact result (128.0 for an exact-128.0 reduction).
     use_fp8_tle = (
         use_fp8
         and tle is not None
         and kv_scale_mode == _KV_SCALE_SCALAR
-        and block_size_h >= _MSA_PREFILL_UNTRANSPOSED_MIN_QH
+        and block_size_h >= _MSA_PREFILL_FP8_MIN_QH
     )
     if use_fp8_tle:
         from triton.tools.tensor_descriptor import TensorDescriptor
