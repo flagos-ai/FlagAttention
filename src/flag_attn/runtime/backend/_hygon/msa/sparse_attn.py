@@ -37,6 +37,34 @@ import triton.language as tl
 
 from ..utils import current_platform
 
+# kv_cache is [..., pos, 2*head_dim] with the head dim contiguous, so the
+# upstream [D, K] K-tile load strides across memory. Loading K contiguously and
+# transposing in-register trades a transpose for coalesced traffic.
+_DECODE_COALESCE_K = os.environ.get(
+    "FLAG_ATTN_HYGON_COALESCE_K", "1"
+).lower() in {"1", "true", "yes", "on"}
+
+# Height of the decode head tile. MFMA requires M >= 16: an 8-high tile lowers
+# tl.dot to scalar fp32 FMA with a spilling accumulator, which measured
+# 1.74x-11.58x slower (geomean 3.59x over the 18 deployment decode shapes) at
+# GQA 8. Padding to 16 wastes half the tile and still wins by a wide margin.
+# Overridable to A/B the two lowerings.
+_DECODE_BLOCK_SIZE_H_FLOOR = int(
+    os.environ.get("FLAG_ATTN_HYGON_DECODE_BLOCK_H", "16")
+)
+
+# MFMA instruction tile for the prefill dot. 0 leaves the choice to the
+# compiler, which picks a non-MFMA lowering for an 8-high tile.
+_PREFILL_MFMA_NONKDIM = int(
+    os.environ.get("FLAG_ATTN_HYGON_PREFILL_NONKDIM", "16")
+)
+
+
+def _prefill_mfma_kwargs(is_hip_backend: bool) -> dict:
+    if not is_hip_backend or _PREFILL_MFMA_NONKDIM <= 0:
+        return {}
+    return {"matrix_instr_nonkdim": _PREFILL_MFMA_NONKDIM}
+
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 
@@ -738,12 +766,19 @@ def _gqa_sparse_fwd_kernel(
 # constants so the grid is fixed within a cuda graph. Base-2 (exp2/log2)
 # softmax matches the prefill kernel.
 # ---------------------------------------------------------------------------
+def _decode_block_size_h(gqa_group_size: int) -> int:
+    """Head-tile height for the decode kernel.
+
+    MFMA needs M >= 16: at M == 8 the dot lowers to scalar fp32 FMA and the
+    accumulator spills, which measured an order of magnitude slower on gfx936.
+    The wrapper mirrors this to decide TIGHT_H, so both must agree.
+    """
+    return max(_DECODE_BLOCK_SIZE_H_FLOOR, triton.next_power_of_2(gqa_group_size))
+
+
 @triton.heuristics(
     {
-        "BLOCK_SIZE_H": lambda args: max(
-            8 if torch.version.hip is not None else 16,
-            triton.next_power_of_2(args["gqa_group_size"]),
-        ),
+        "BLOCK_SIZE_H": lambda args: _decode_block_size_h(args["gqa_group_size"]),
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
     }
 )
@@ -793,6 +828,8 @@ def _gqa_sparse_decode_kernel(
     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
     USE_PDL: tl.constexpr,
+    TIGHT_H: tl.constexpr,  # BLOCK_SIZE_H == gqa_group_size exactly
+    COALESCE_K: tl.constexpr,  # load K contiguously and transpose in-register
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # split-K over the topk dimension: pid(0) folds (query-token, chunk).
@@ -829,14 +866,29 @@ def _gqa_sparse_decode_kernel(
     m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + pid_b * stride_qn + pid_h * stride_qh,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_qh, stride_qd),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
-    )
+    # Bounding the head axis by the constexpr BLOCK_SIZE_H instead of the
+    # runtime gqa_group_size lets Triton prove the tile is in range and drop
+    # the boundary mask. Only valid when the two are equal -- otherwise the
+    # pointer runs past this kv_head into the next one. On HIP the heuristic
+    # floors BLOCK_SIZE_H at 8, so GQA 8 (one KV head per rank) qualifies.
+    if TIGHT_H:
+        q_ptrs = tl.make_block_ptr(
+            base=q_ptr + pid_b * stride_qn + pid_h * stride_qh,
+            shape=(BLOCK_SIZE_H, head_dim),
+            strides=(stride_qh, stride_qd),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+            order=(1, 0),
+        )
+    else:
+        q_ptrs = tl.make_block_ptr(
+            base=q_ptr + pid_b * stride_qn + pid_h * stride_qh,
+            shape=(gqa_group_size, head_dim),
+            strides=(stride_qh, stride_qd),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+            order=(1, 0),
+        )
     q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
@@ -847,28 +899,56 @@ def _gqa_sparse_decode_kernel(
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = c + off_n
         pos_mask = pos < kv_len
-        k = tl.load(
-            kv_cache_ptr
-            + page * stride_kv_blk
-            + pid_kh * stride_kv_h
-            + off_n[None, :] * stride_kv_pos
-            + off_d[:, None] * stride_kv_d,
-            mask=d_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
-        if USE_FP8:
-            k = k.to(q.dtype)
-            if KV_SCALE_MODE == 1:
-                k = (k * tl.load(k_scale_ptr)).to(q.dtype)
-            elif KV_SCALE_MODE == 2:
-                k_scale = tl.load(
-                    k_scale_ptr
-                    + pid_kh * stride_ks_h
-                    + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
-                    mask=pos_mask,
-                    other=1.0,
-                )
-                k = (k * k_scale[None, :]).to(q.dtype)
+        # One base address shared by the K and V loads.
+        kv_base = kv_cache_ptr + page * stride_kv_blk + pid_kh * stride_kv_h
+        if COALESCE_K:
+            # kv_cache is [..., pos, d] with stride_kv_d == 1, so loading K as
+            # [D, K] makes the tile's fastest-varying axis walk stride_kv_pos
+            # (256 elems == 512 B here) and every cache line delivers 2 useful
+            # bytes. Load it [K, D] like V -- contiguous along d -- and let
+            # tl.trans supply the [D, K] operand tl.dot needs.
+            k_kd = tl.load(
+                kv_base
+                + off_n[:, None] * stride_kv_pos
+                + off_d[None, :] * stride_kv_d,
+                mask=pos_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            if USE_FP8:
+                k_kd = k_kd.to(q.dtype)
+                if KV_SCALE_MODE == 1:
+                    k_kd = (k_kd * tl.load(k_scale_ptr)).to(q.dtype)
+                elif KV_SCALE_MODE == 2:
+                    k_scale = tl.load(
+                        k_scale_ptr
+                        + pid_kh * stride_ks_h
+                        + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
+                        mask=pos_mask,
+                        other=1.0,
+                    )
+                    k_kd = (k_kd * k_scale[:, None]).to(q.dtype)
+            k = tl.trans(k_kd)
+        else:
+            k = tl.load(
+                kv_base
+                + off_n[None, :] * stride_kv_pos
+                + off_d[:, None] * stride_kv_d,
+                mask=d_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
+            if USE_FP8:
+                k = k.to(q.dtype)
+                if KV_SCALE_MODE == 1:
+                    k = (k * tl.load(k_scale_ptr)).to(q.dtype)
+                elif KV_SCALE_MODE == 2:
+                    k_scale = tl.load(
+                        k_scale_ptr
+                        + pid_kh * stride_ks_h
+                        + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
+                        mask=pos_mask,
+                        other=1.0,
+                    )
+                    k = (k * k_scale[None, :]).to(q.dtype)
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
         qk += tl.dot(q, k) * sm_scale_log2e
@@ -877,9 +957,7 @@ def _gqa_sparse_decode_kernel(
         l_ij = tl.sum(p, axis=1)
         acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
         v = tl.load(
-            kv_cache_ptr
-            + page * stride_kv_blk
-            + pid_kh * stride_kv_h
+            kv_base
             + off_n[:, None] * stride_kv_pos
             + (head_dim + off_d[None, :]) * stride_kv_d,
             mask=pos_mask[:, None] & d_mask[None, :],
@@ -909,23 +987,47 @@ def _gqa_sparse_decode_kernel(
     # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
     acc_o = acc_o * scale[:, None]
-    o_ptrs = tl.make_block_ptr(
-        base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_o_h, stride_o_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
-    )
+    if TIGHT_H:
+        o_ptrs = tl.make_block_ptr(
+            base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b
+            + pid_h * stride_o_h,
+            shape=(BLOCK_SIZE_H, head_dim),
+            strides=(stride_o_h, stride_o_d),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+            order=(1, 0),
+        )
+    else:
+        o_ptrs = tl.make_block_ptr(
+            base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b
+            + pid_h * stride_o_h,
+            shape=(gqa_group_size, head_dim),
+            strides=(stride_o_h, stride_o_d),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+            order=(1, 0),
+        )
     tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
-    lse_ptrs = tl.make_block_ptr(
-        base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
-        shape=(gqa_group_size,),
-        strides=(stride_l_h,),
-        offsets=(0,),
-        block_shape=(BLOCK_SIZE_H,),
-        order=(0,),
-    )
+    if TIGHT_H:
+        lse_ptrs = tl.make_block_ptr(
+            base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b
+            + pid_h * stride_l_h,
+            shape=(BLOCK_SIZE_H,),
+            strides=(stride_l_h,),
+            offsets=(0,),
+            block_shape=(BLOCK_SIZE_H,),
+            order=(0,),
+        )
+    else:
+        lse_ptrs = tl.make_block_ptr(
+            base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b
+            + pid_h * stride_l_h,
+            shape=(gqa_group_size,),
+            strides=(stride_l_h,),
+            offsets=(0,),
+            block_shape=(BLOCK_SIZE_H,),
+            order=(0,),
+        )
     tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
 
 
@@ -1076,15 +1178,21 @@ def minimax_m3_sparse_attn(
     # Keep cases that cannot form a legal WGMMA result out of the TLE kernel:
     # FP8 KV has a dtype mismatch with BF16 Q, and a GQA tile below eight heads
     # has an illegal WGMMA N dimension.
-    is_hip_backend = torch.version.hip is not None
+    is_hip_backend = current_platform.is_hygon()
     force_tle = os.environ.get(
         "FLAG_ATTN_FORCE_TLE",
         "0",
     ).lower() in {"1", "true", "yes", "on"}
 
     if (is_hip_backend and not force_tle) or use_fp8 or block_size_h < 8:
+        # One query row per program. This is the only knob mapping work onto
+        # programs, and a wider loop just serializes rows inside a program:
+        # measured fastest at 1 on all 21 deployment prefill shapes (38.35 ms
+        # total vs 42.24 at 4), by 1.06x on the large ones and up to 1.81x at
+        # total_q == 128, where a q_loop of 4 leaves three quarters of the
+        # grid's programs with nothing to do.
         direct_num_q_loop = int(
-            os.environ.get("FLAG_ATTN_HYGON_Q_LOOP", "4")
+            os.environ.get("FLAG_ATTN_HYGON_Q_LOOP", "1")
         )
         direct_grid = (
             triton.cdiv(max_query_len, direct_num_q_loop),
@@ -1145,6 +1253,10 @@ def minimax_m3_sparse_attn(
                 if is_hip_backend
                 else 3
             ),
+            # The QH tile is 8 high at GQA 8, below the 16 MFMA wants, so the
+            # default lowering falls back to scalar FMA. Asking for the 16x16
+            # MFMA variant keeps the dot on the matrix unit.
+            **_prefill_mfma_kwargs(is_hip_backend),
         )
         return
 
@@ -1265,16 +1377,52 @@ def minimax_m3_sparse_attn_decode(
     pdl_launch = {"launch_pdl": True} if use_pdl else {}
     decode_launch = (
         {"num_warps": 2, "num_stages": 1}
-        if torch.version.hip is not None
+        if current_platform.is_hygon()
         else {}
     )
     # split-K over the selected blocks; chunk count is shape-constant (cuda graph).
-    TARGET_GRID = 256
+    #
+    # The 256 default comes from NVIDIA, where 78-132 SMs are saturated by that
+    # many blocks. This DCU has 80 CUs and the decode kernel runs 128 threads
+    # per block, so the machine holds 80 * (2560 / 128) = 1600 blocks at once
+    # and a 256-block grid leaves ~84% of the slots idle. Raising the target
+    # splits the top-k range further and fills them.
+    TARGET_GRID = int(os.environ.get("FLAG_ATTN_HYGON_DECODE_TARGET_GRID", "256"))
     target = max(1, min(max_topk, TARGET_GRID // max(1, total_q * num_kv_heads)))
     num_topk_chunks = 1 << (target.bit_length() - 1)
-    o_partial = torch.empty(
-        num_topk_chunks, total_q, num_heads, head_dim, dtype=q.dtype, device=q.device
-    )
+
+    # Only tighten the head-axis bound when the tile fits inside the GQA group.
+    # BLOCK_SIZE_H > gqa_group_size makes the constexpr-bounded pointers run
+    # past this kv_head into the next one -- with the bound removed that is a
+    # hard VMFault, not a silent misread. Must mirror the kernel's heuristic.
+    tight_h = _decode_block_size_h(gqa_group_size) <= gqa_group_size
+
+    # One chunk makes the merge a pure copy (its softmax weights are identically
+    # 1.0): write the final output directly and skip the merge launch and both
+    # partial buffers.
+    single_chunk = num_topk_chunks == 1
+    if single_chunk:
+        o_partial = output
+        stride_o_c = 0
+        stride_o_b, stride_o_h, stride_o_d = (
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+        )
+    else:
+        o_partial = torch.empty(
+            num_topk_chunks, total_q, num_heads, head_dim,
+            dtype=q.dtype, device=q.device,
+        )
+        stride_o_c, stride_o_b, stride_o_h, stride_o_d = (
+            o_partial.stride(0),
+            o_partial.stride(1),
+            o_partial.stride(2),
+            o_partial.stride(3),
+        )
+    # The kernel stores lse unconditionally: gating that store on a constexpr
+    # perturbs register allocation and measured slower upstream, so keep the
+    # buffer even when the merge is skipped.
     lse_partial = torch.empty(
         num_topk_chunks, total_q, num_heads, dtype=torch.float32, device=q.device
     )
@@ -1309,10 +1457,10 @@ def minimax_m3_sparse_attn_decode(
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
-        o_partial.stride(0),
-        o_partial.stride(1),
-        o_partial.stride(2),
-        o_partial.stride(3),
+        stride_o_c,
+        stride_o_b,
+        stride_o_h,
+        stride_o_d,
         lse_partial.stride(0),
         lse_partial.stride(1),
         lse_partial.stride(2),
@@ -1322,9 +1470,13 @@ def minimax_m3_sparse_attn_decode(
         USE_FP8=use_fp8,
         KV_SCALE_MODE=kv_scale_mode,
         USE_PDL=use_pdl,
+        TIGHT_H=tight_h,
+        COALESCE_K=_DECODE_COALESCE_K,
         **decode_launch,
         **pdl_launch,
     )
+    if single_chunk:
+        return
     merge_grid = (total_q, num_heads)
     _merge_topk_attn_out_kernel[merge_grid](
         o_partial,
