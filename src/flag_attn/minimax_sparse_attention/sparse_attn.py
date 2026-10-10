@@ -171,6 +171,34 @@ _PREFILL_PREFETCH_LOOP_SHAPES = frozenset({
 })
 _PREFILL_TUNED_SM_COUNTS = frozenset({132})
 
+# Where upstream's half-KV kernel runs without its `kv_empty` WAR barrier.
+#
+# `wgmma_wait(0)` already retires each operand read, so the handshake is
+# provably redundant for this single-warpgroup sequential loop (the argument is
+# at the two overwrite sites in the kernel, and the single-stage loop in this
+# file has shipped without it since 4eaf5a3). Dropping it removes 4 sync ops
+# per tile, 8 per page.
+#
+# It is not a free win everywhere: measured against pristine upstream at N=6,
+# 1x512x4096 gains 2.6% but 64x128x4096 loses a reproducible 0.65%
+# (0.9930-0.9942, far outside the +-0.4% A/A noise floor). Neither grid size
+# nor pages-per-CTA separates those two -- 4x128x4096 has the same 512-CTA grid
+# and 16 pages/CTA as the winner and shows nothing -- so there is no rule to
+# generalise from, only the measurements. Everything not listed keeps the
+# barrier and therefore keeps upstream's exact PTX.
+_PREFILL_NO_WAR_BARRIER_SHAPES = frozenset({
+    # (batch, max_query_len, num_kv_heads)
+    (1, 512, 1),  # 1.026x at seq 4096, 1.006x at 16384, both index patterns
+})
+
+
+def _prefill_drop_war_barrier(total_q, batch, max_query_len, num_kv_heads):
+    """True to run upstream's half-KV loop without the kv_empty handshake."""
+    if total_q != batch * max_query_len:
+        return False  # only uniform batches were measured
+    return (batch, max_query_len,
+            num_kv_heads) in _PREFILL_NO_WAR_BARRIER_SHAPES
+
 
 def _prefill_qh8_kernel_choice(device, total_q, batch, max_query_len,
                                num_kv_heads):
@@ -178,7 +206,12 @@ def _prefill_qh8_kernel_choice(device, total_q, batch, max_query_len,
     sm = _sm_count(device)
     if sm not in _PREFILL_TUNED_SM_COUNTS:
         return "fork"
-    if total_q * num_kv_heads <= sm:
+    # The launch is (max_query_len, num_kv_heads, batch), so that product -- not
+    # total_q -- is what competes for SM slots. A ragged batch can hold few
+    # query tokens and still launch far more than one wave of CTAs (b=4 with
+    # query lengths [1, 1, 1, 125] is 128 tokens but a 500-CTA grid), and the
+    # CTAs that return early still occupy a slot while they do.
+    if max_query_len * num_kv_heads * batch <= sm:
         return "prefetch"
     uniform = total_q == batch * max_query_len
     if uniform and (batch, max_query_len,
@@ -1189,6 +1222,7 @@ def _gqa_sparse_fwd_tle_upstream_kernel(
     USE_FP8: tl.constexpr,
     KV_SCALE_MODE: tl.constexpr,
     USE_HALF_KV_PIPE: tl.constexpr,
+    WAR_BARRIER: tl.constexpr = True,
 ):
     if USE_TL_DOT_PATH:
         _gqa_sparse_fwd_kernel(
@@ -1305,11 +1339,15 @@ def _gqa_sparse_fwd_tle_upstream_kernel(
             scope=tle.gpu.smem,
         )
         kv_stage_bytes: tl.constexpr = HALF_K * BLOCK_SIZE_D * 2
-        kv_empty = tle.gpu.alloc_barriers(
-            num_barriers=2,
-            arrive_count=1,
-            init=tle.gpu.READY,
-        )
+        # WAR_BARRIER=False drops this write-after-read handshake; see the
+        # per-slot argument at the two overwrite sites below. Kept as a
+        # constexpr so WAR_BARRIER=True still emits upstream's exact PTX.
+        if WAR_BARRIER:
+            kv_empty = tle.gpu.alloc_barriers(
+                num_barriers=2,
+                arrive_count=1,
+                init=tle.gpu.READY,
+            )
         kv_full = tle.gpu.alloc_barriers(
             num_barriers=2,
             arrive_count=1,
@@ -1329,7 +1367,8 @@ def _gqa_sparse_fwd_tle_upstream_kernel(
             first_row = (first_page * num_kv_heads + pid_kh) * BLOCK_SIZE_K
             cur_kv_row = first_row
             cur_c = first_blk * BLOCK_SIZE_K
-            tle.gpu.barrier_wait(kv_empty[0], phaseIdx=0)
+            if WAR_BARRIER:
+                tle.gpu.barrier_wait(kv_empty[0], phaseIdx=0)
             tle.gpu.copy(
                 kv_cache_desc,
                 kv_smem.slot(0),
@@ -1366,8 +1405,13 @@ def _gqa_sparse_fwd_tle_upstream_kernel(
             )
 
             # Reuse this slot for V while the other slot receives the next K.
-            tle.gpu.barrier_arrive(kv_empty[buf_idx], phaseIdx=k_phase)
-            tle.gpu.barrier_wait(kv_empty[buf_idx], phaseIdx=v_phase)
+            # No handshake needed: the `wgmma_wait(0)` above drained the QK that
+            # read this slot as its A operand, so the V copy cannot clobber a
+            # live operand. This is the same property the single-stage and
+            # prefetch loops in this file already rely on.
+            if WAR_BARRIER:
+                tle.gpu.barrier_arrive(kv_empty[buf_idx], phaseIdx=k_phase)
+                tle.gpu.barrier_wait(kv_empty[buf_idx], phaseIdx=v_phase)
             tle.gpu.copy(
                 kv_cache_desc,
                 kv_smem.slot(buf_idx),
@@ -1391,9 +1435,13 @@ def _gqa_sparse_fwd_tle_upstream_kernel(
                     next_page * num_kv_heads + pid_kh
                 ) * BLOCK_SIZE_K + next_half_idx * HALF_K
                 next_c = next_blk * BLOCK_SIZE_K + next_half_idx * HALF_K
-                tle.gpu.barrier_wait(
-                    kv_empty[next_buf_idx], phaseIdx=next_k_phase
-                )
+                # The other slot was last read by the previous tile's PV, whose
+                # `wgmma_wait(0)` ran before this iteration started; on the
+                # first tile it has never been read at all.
+                if WAR_BARRIER:
+                    tle.gpu.barrier_wait(
+                        kv_empty[next_buf_idx], phaseIdx=next_k_phase
+                    )
                 tle.gpu.copy(
                     kv_cache_desc,
                     kv_smem.slot(next_buf_idx),
@@ -1430,7 +1478,8 @@ def _gqa_sparse_fwd_tle_upstream_kernel(
                 trans_b=True,
             )
             acc_o_t = tle.gpu.wgmma_wait(0, acc_o_t)
-            tle.gpu.barrier_arrive(kv_empty[buf_idx], phaseIdx=v_phase)
+            if WAR_BARRIER:
+                tle.gpu.barrier_arrive(kv_empty[buf_idx], phaseIdx=v_phase)
 
             l_i = tl.math.fma(l_i, alpha, l_ij)
             m_i = m_ij
@@ -2463,6 +2512,8 @@ def minimax_m3_sparse_attn(
             USE_FP8=use_fp8,
             KV_SCALE_MODE=kv_scale_mode,
             USE_HALF_KV_PIPE=True,
+            WAR_BARRIER=not _prefill_drop_war_barrier(
+                total_q, batch, max_query_len, num_kv_heads),
             num_warps=4,
             num_stages=1,
         )
