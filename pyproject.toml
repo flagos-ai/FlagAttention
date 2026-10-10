@@ -99,9 +99,6 @@ markers = [
     "parallel_nsa_compression: native sparse attention compression",
     "parallel_wall_attn: Wall-Attention correctness and performance tests",
     "sage_attention: SageAttention tests and benchmarks",
-]
-
-markers = [
     "gpu: requires CUDA GPU",
     "performance: performance benchmark",
     "benchmark: benchmark entry point",
