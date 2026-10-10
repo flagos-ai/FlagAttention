@@ -46,6 +46,7 @@ from flag_attn.minimax_sparse_attention import (
     minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode,
 )
 
+from flag_attn.rotary import rotary_embedding  # noqa: F401
 from flag_attn import testing  # noqa: F401
 
 _FLA_EXPORTS = {
@@ -118,6 +119,7 @@ __all__ = [
     "flash_attention_split_kv",
     "paged_attention",
     "chunk_log_linear_attn",
+    "rotary_embedding",
     "chunk_gated_delta_rule",
     "chunk_gla",
     "chunk_gdn2",
