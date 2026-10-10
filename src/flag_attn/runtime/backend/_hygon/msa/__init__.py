@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .index_topk import (
+    SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode,
     minimax_m3_index_decode_score,
     minimax_m3_index_score,
@@ -21,6 +22,7 @@ from .index_topk import (
 from .sparse_attn import minimax_m3_sparse_attn, minimax_m3_sparse_attn_decode
 
 __all__ = [
+    "SPARSE_BLOCK_SIZE",
     "minimax_m3_index_decode",
     "minimax_m3_index_decode_score",
     "minimax_m3_index_score",

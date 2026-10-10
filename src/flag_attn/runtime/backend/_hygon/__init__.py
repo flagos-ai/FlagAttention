@@ -45,6 +45,10 @@ _OPERATOR_EXPORTS = {
     "minimax_m3_index_score": (".msa", "minimax_m3_index_score"),
     "minimax_m3_index_topk": (".msa", "minimax_m3_index_topk"),
     "minimax_m3_sparse_attn": (".msa", "minimax_m3_sparse_attn"),
+    # The public minimax_m3_sparse_attn is a stage facade that resolves its
+    # prefill primitive under this private name, so the plain key above never
+    # reaches the prefill path on its own.
+    "_minimax_m3_sparse_attn_prefill": (".msa", "minimax_m3_sparse_attn"),
     "minimax_m3_sparse_attn_decode": (".msa", "minimax_m3_sparse_attn_decode"),
 }
 
