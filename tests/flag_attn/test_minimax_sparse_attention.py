@@ -34,6 +34,7 @@ from flag_attn.minimax_sparse_attention import (
 )
 
 index_topk_module = importlib.import_module(minimax_m3_index_topk.__module__)
+sparse_attn_module = importlib.import_module(minimax_m3_sparse_attn.__module__)
 
 triton.knobs.autotuning.adjust_block_size = False
 BLOCK = SPARSE_BLOCK_SIZE
@@ -728,6 +729,14 @@ PREFILL_CASES = [
     ((4096, 2048, 1025), (0, 256, 128), 4, 4, 8, 1, 2),
 ]
 
+# group_size == 8, i.e. the shapes that reach _prefill_qh8_kernel_choice.
+PREFILL_QH8_CASES = [
+    PREFILL_CASES[1],
+    # Ragged/prefix selection at GQA 8, so the diagonal and tail masks and a
+    # one-page loop are all covered on whichever kernel is forced.
+    ((4096, 2048, 1025), (0, 256, 128), 4, 8, 8, 1, 2),
+]
+
 DECODE_CASES = [
     # Boundary and selection: 512 tokens -> 4 blocks, topk=3.
     ((512,), 1, 16, 3, 1, 2, 1),
@@ -754,6 +763,32 @@ DECODE_K16_CASES = [
 @pytest.mark.minimax_sparse_attention_prefill
 @pytest.mark.minimax_m3_sparse_attn
 def test_prefill_bf16(case: tuple) -> None:
+    _run_prefill(case, "bf16")
+
+
+@pytest.mark.skipif(
+    not hasattr(sparse_attn_module, "_prefill_qh8_kernel_choice"),
+    reason="requires a backend with the QH == 8 prefill kernel choice",
+)
+@pytest.mark.parametrize("choice", ("fork", "prefetch", "upstream"))
+@pytest.mark.parametrize(
+    "case", PREFILL_QH8_CASES, ids=("selection", "long_ragged")
+)
+@pytest.mark.minimax_sparse_attention_prefill
+@pytest.mark.minimax_m3_sparse_attn
+def test_prefill_bf16_qh8_kernel_choices(
+    case: tuple, choice: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All three QH == 8 prefill loops, whichever one this device dispatches to.
+
+    `_prefill_qh8_kernel_choice` picks per shape and SM count, so on any given
+    device two of the three kernels are never reached by the tests above.
+    """
+    monkeypatch.setattr(
+        sparse_attn_module,
+        "_prefill_qh8_kernel_choice",
+        lambda *args, **kwargs: choice,
+    )
     _run_prefill(case, "bf16")
 
 
