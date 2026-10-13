@@ -57,7 +57,9 @@ OPTIONAL_VARS = [
 def check_env_vars() -> bool:
     """Validate environment variables. Return True if valid, False to skip."""
     # Check Feishu credentials first — missing means "not configured", not an error
-    missing_feishu = [v for v in FEISHU_VARS if not os.environ.get(v, "").strip()]
+    missing_feishu = [
+        v for v in FEISHU_VARS if not os.environ.get(v, "").strip()
+    ]
     if missing_feishu:
         print(
             f"::notice::Feishu notification skipped — "
@@ -96,7 +98,9 @@ def main():
 
     # GitHub default environment variables (always available on runners)
     # Override vars take precedence — used when called from workflow_run context
-    workflow = os.environ.get("OVERRIDE_WORKFLOW") or os.environ["GITHUB_WORKFLOW"]
+    workflow = (
+        os.environ.get("OVERRIDE_WORKFLOW") or os.environ["GITHUB_WORKFLOW"]
+    )
     repo = os.environ["GITHUB_REPOSITORY"]
     ref = os.environ.get("OVERRIDE_REF") or os.environ["GITHUB_REF_NAME"]
     sha = os.environ.get("OVERRIDE_SHA") or os.environ["GITHUB_SHA"]
@@ -167,7 +171,10 @@ def main():
                     },
                     {
                         "is_short": True,
-                        "text": {"tag": "lark_md", "content": f"**Branch:** {ref}"},
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"**Branch:** {ref}",
+                        },
                     },
                     {
                         "is_short": True,
@@ -247,7 +254,9 @@ def main():
         result = json.loads(resp.read())
 
     if result.get("code", -1) != 0:
-        print(f"::warning::Feishu API returned error: {result}", file=sys.stderr)
+        print(
+            f"::warning::Feishu API returned error: {result}", file=sys.stderr
+        )
         sys.exit(1)
 
     print("Feishu notification sent successfully.")
