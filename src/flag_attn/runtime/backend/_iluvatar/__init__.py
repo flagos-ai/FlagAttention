@@ -11,3 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Lazy MiniMax M3 sparse attention exports for the Iluvatar backend."""
+
+import importlib
+
+_OPERATOR_EXPORTS = {
+    "SPARSE_BLOCK_SIZE": (".minimax_sparse_attention.index_topk", "SPARSE_BLOCK_SIZE"),
+    "minimax_m3_index_decode": (".minimax_sparse_attention", "minimax_m3_index_decode"),
+    "minimax_m3_index_decode_score": (".minimax_sparse_attention", "minimax_m3_index_decode_score"),
+    "minimax_m3_index_score": (".minimax_sparse_attention", "minimax_m3_index_score"),
+    "minimax_m3_index_topk": (".minimax_sparse_attention", "minimax_m3_index_topk"),
+    "minimax_m3_sparse_attn": (".minimax_sparse_attention", "minimax_m3_sparse_attn"),
+    "_minimax_m3_sparse_attn_prefill": (".minimax_sparse_attention", "minimax_m3_sparse_attn"),
+    "minimax_m3_sparse_attn_decode": (".minimax_sparse_attention", "minimax_m3_sparse_attn_decode"),
+}
+
+
+def __getattr__(name: str):
+    try:
+        module, symbol = _OPERATOR_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(importlib.import_module(module, __name__), symbol)
+    globals()[name] = value
+    return value
+
+
+__all__ = sorted(_OPERATOR_EXPORTS)
