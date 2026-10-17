@@ -6,10 +6,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gdn2
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
 from flag_attn.gdn2.native.output import chunk_gla_fwd_kernel_o
+from flag_attn.testing import backend as test_backend
 
 ASSERT_RATIO = 0.01
 
@@ -39,6 +39,10 @@ def _cuda_available() -> bool:
 
 pytestmark = [
     pytest.mark.skipif(not _cuda_available(), reason="chunk_gdn2 tests require CUDA"),
+    pytest.mark.skipif(
+        test_backend.runtime.device.vendor_name == "ascend",
+        reason="CUDA native/TLE resource comparisons; Ascend recurrence coverage is in test_ascend_attention.py",
+    ),
 ]
 
 

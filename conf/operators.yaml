@@ -92,6 +92,8 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/flag_attn/test_gdn2.py
+      - tests/flag_attn/test_ascend_attention.py::test_gdn2_recurrence
+      - tests/flag_attn/test_ascend_attention.py::test_gdn2_rejects_unsupported_chunk_size
     benchmark: benchmark/test_gdn2_benchmark.py
   - id: chunk_gla
     description: Run fixed-length, state-v-first, and variable-length chunked gated linear attention.
@@ -109,6 +111,7 @@ ops:
       - tests/flag_attn/test_chunk_gla.py::test_chunk
       - tests/flag_attn/test_chunk_gla.py::test_chunk_state_v_first
       - tests/flag_attn/test_chunk_gla.py::test_chunk_varlen
+      - tests/flag_attn/test_ascend_attention.py::test_gla_forward
     benchmark: benchmark/test_chunk_gla_benchmark.py
   - id: chunk_kda
     description: Run Kimi Delta Attention inference on the selected backend against its recurrent reference.
@@ -125,6 +128,7 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/test_FLA/test_chunk_kda.py
+      - tests/flag_attn/test_ascend_attention.py::test_kda_recurrence
     benchmark: benchmark/test_FLA/bench_chunk_kda.py
   - id: chunk_kda_enflame
     description: Run Enflame Kimi Delta Attention accuracy tests and its pytest benchmark.
@@ -259,6 +263,7 @@ ops:
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_k16_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_identity_out_and_score_out_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_fp8
+      - tests/flag_attn/test_ascend_attention.py::test_minimax_prefill_stage_and_index
     benchmark: benchmark/test_minimax_sparse_attention_benchmark.py
   - id: parallel_moba
     description: Run variable-length parallel MoBA attention.
