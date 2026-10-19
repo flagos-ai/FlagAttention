@@ -39,7 +39,7 @@ try:
 except ImportError:
     tle = None
 
-from flag_attn.utils import current_platform
+from flag_attn.utils import current_platform, has_triton_tle
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -2303,6 +2303,26 @@ _KV_SCALE_NONE = 0
 _KV_SCALE_SCALAR = 1
 _KV_SCALE_PER_TOKEN_HEAD = 2
 
+# Route prefill to the kv-outer path once the per-request query count
+# (``max_query_len`` == the KV-reuse knob) is large enough for KV reuse to pay
+# back its CSR build + merge. Measured crossover vs this q-outer kernel
+# (topk16, kvh1, g8, H100): seq 8192 -> kv-outer/q-outer 1.06x (loses),
+# 9216 -> 1.00x (tie), 10240 -> 0.91x (wins), 14336 -> 0.79x. Switch at the
+# clean-win point so the overhead is always recovered.
+_KV_OUTER_MIN_QUERY_LEN = 10240
+
+
+def _should_use_kv_outer_prefill(kv_cache, max_query_len, k_scale, v_scale) -> bool:
+    """kv-outer prefill is BF16-only, unscaled, needs TLE, and only wins on long
+    prompts. Anything else keeps the q-outer body."""
+    if max_query_len < _KV_OUTER_MIN_QUERY_LEN:
+        return False
+    if kv_cache.dtype != torch.bfloat16:
+        return False
+    if k_scale is not None or v_scale is not None:
+        return False
+    return has_triton_tle()
+
 
 def _kv_scale_args(
     output: torch.Tensor,
@@ -2341,6 +2361,1170 @@ def _kv_scale_args(
     )
 
 
+
+# ---------------------------------------------------------------------------
+# KV-outer prefill (long-prompt path). Physical KV page loaded once per CTA
+# via TLE and reused across the queries that selected it (build_k2q_csr),
+# then an LSE merge. Selected by minimax_m3_sparse_attn for long BF16 prompts.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Host-side k2q CSR builder (q2k -> k2q), the analog of MiniMax build_k2q_csr.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def build_k2q_csr(
+    topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk] int, -1 == unused
+    cu_seqlens_q: torch.Tensor,  # [batch + 1] int32
+    prefix_lens: torch.Tensor,  # [batch] int32
+    block_table: torch.Tensor,  # [batch, max_blocks] int32
+    num_pages: int,
+):
+    """Invert per-query top-k (q2k) into a per-(page, kv_head) CSR (k2q).
+
+    Rows are keyed by the *physical* KV page (as in the CuTe build_k2q_csr,
+    which consumes the page table), so every entry in a row references exactly
+    one physical KV location and the kernel can load that block once. A query's
+    logical top-k block is mapped to its physical page through ``block_table``
+    using the query's batch.
+
+      row_ptr   : [num_pages * num_kv_heads + 1] int32  prefix sum of counts
+      q_global  : [nnz] int32   global query id of each entry
+      q_abs     : [nnz] int32   absolute query position (prefix + local)
+      kv_block  : [nnz] int32   logical block index (for causal key positions)
+      slot      : [nnz] int32   which of the query's top-k this block is
+      num_rows  : int           num_pages * num_kv_heads
+
+    row index == physical_page * num_kv_heads + kv_head.
+    """
+    num_kv_heads, total_q, topk = topk_idx.shape
+    device = topk_idx.device
+    num_rows = num_pages * num_kv_heads
+
+    # Per-query absolute position and batch id.
+    batch = cu_seqlens_q.numel() - 1
+    q_abs_all = torch.empty(total_q, device=device, dtype=torch.int64)
+    q_batch_all = torch.empty(total_q, device=device, dtype=torch.int64)
+    cu = cu_seqlens_q.to(torch.int64)
+    pf = prefix_lens.to(torch.int64)
+    for b in range(batch):
+        s = int(cu[b].item())
+        e = int(cu[b + 1].item())
+        if e > s:
+            q_abs_all[s:e] = pf[b] + torch.arange(e - s, device=device, dtype=torch.int64)
+            q_batch_all[s:e] = b
+
+    ti = topk_idx.to(torch.int64)
+    kh = torch.arange(num_kv_heads, device=device).view(num_kv_heads, 1, 1)
+    qg = torch.arange(total_q, device=device).view(1, total_q, 1)
+    slot = torch.arange(topk, device=device).view(1, 1, topk)
+
+    valid = ti >= 0
+    flat_valid = valid.reshape(-1)
+    block = ti.reshape(-1)[flat_valid]
+    kh_e = kh.expand_as(ti).reshape(-1)[flat_valid]
+    q_global = qg.expand_as(ti).reshape(-1)[flat_valid]
+    slot_e = slot.expand_as(ti).reshape(-1)[flat_valid]
+    q_abs_e = q_abs_all[q_global]
+    q_batch_e = q_batch_all[q_global]
+
+    # Logical block -> physical page via the query's batch row of block_table.
+    bt = block_table.to(torch.int64)
+    page_e = bt[q_batch_e, block]
+    row = page_e * num_kv_heads + kh_e
+
+    # Sort entries by row so each row is contiguous; stable keeps (q, slot) order.
+    order = torch.argsort(row, stable=True)
+    row_s = row[order]
+    q_global_s = q_global[order].to(torch.int32)
+    q_abs_s = q_abs_e[order].to(torch.int32)
+    kv_block_s = block[order].to(torch.int32)
+    slot_s = slot_e[order].to(torch.int32)
+
+    counts = torch.bincount(row_s, minlength=num_rows)
+    row_ptr = torch.zeros(num_rows + 1, device=device, dtype=torch.int32)
+    row_ptr[1:] = torch.cumsum(counts, 0).to(torch.int32)
+
+    return {
+        "row_ptr": row_ptr,
+        "q_global": q_global_s.contiguous(),
+        "q_abs": q_abs_s.contiguous(),
+        "kv_block": kv_block_s.contiguous(),
+        "slot": slot_s.contiguous(),
+        "num_rows": num_rows,
+        "num_pages": num_pages,
+        "num_kv_heads": num_kv_heads,
+        "nnz": int(q_global_s.numel()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# KV-outer attend (TLE): one program per (row work-tile, page, kv_head). The
+# physical KV page is staged into shared memory ONCE via a TMA copy and reused
+# by every query in the tile through WGMMA -- the structural point of kv-outer
+# and the analog of the CuTe fmha_sm100 mainloop (K/V loaded once per CTA, Q
+# gathered from the CSR row). The scattered query ids cannot be TMA-loaded, so
+# Q is gathered with a normal load and staged into SMEM, then fed to WGMMA as
+# the transposed B operand -- exactly as the q-outer TLE kernel stages Q.
+#
+# WGMMA layout (matches _gqa_sparse_fwd_tle_kernel):
+#   QK:  wgmma(kv_smem[K, D], q_smem[QH, D], trans_b=True) -> [K, QH]
+#   PV:  wgmma(kv_smem[K, D], p_smem[K, QH], trans_a=True)  -> [D, QH]
+# where QH = Q_TILE * BLOCK_SIZE_H is the flattened (query, group-head) axis.
+# N == QH must be >= 16 (an N<16 transposed-A WGMMA is silently wrong), so
+# Q_TILE * BLOCK_SIZE_H >= 16 is required; with group_size 16 any Q_TILE works.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _kv_block_attn_tle_kernel(
+    q_ptr,  # [total_q, num_heads, head_dim]
+    kv_cache_ptr,  # [num_blocks, num_kv_heads, 128, 2*head_dim]
+    kv_cache_desc,  # TMA view: [num_blocks*num_kv_heads*128, 2*head_dim]
+    row_ptr,  # [num_rows + 1] int32  CSR row offsets
+    csr_q_global,  # [nnz] int32
+    csr_q_abs,  # [nnz] int32
+    csr_kv_block,  # [nnz] int32  logical block (for causal key positions)
+    csr_slot,  # [nnz] int32
+    q_batch_ptr,  # [total_q] int32
+    seq_lens,  # [batch] int32
+    partial_o_ptr,  # [total_q, num_heads, max_topk, head_dim]
+    partial_lse_ptr,  # [total_q, num_heads, max_topk] fp32 (log2 domain)
+    sched_row_ptr,  # [num_work]
+    sched_q_lo_ptr,  # [num_work]
+    num_kv_heads,
+    gqa_group_size,
+    head_dim,
+    max_topk,
+    sm_scale,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_po_n,
+    stride_po_h,
+    stride_po_s,
+    stride_po_d,
+    stride_pl_n,
+    stride_pl_h,
+    stride_pl_s,
+    Q_TILE: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,  # next_pow2(gqa_group_size)
+):
+    sm_scale_log2e = sm_scale * 1.4426950409
+    QH: tl.constexpr = Q_TILE * BLOCK_SIZE_H
+
+    pid_w = tl.program_id(0)
+    pid_row = tl.load(sched_row_ptr + pid_w)
+    q_lo = tl.load(sched_q_lo_ptr + pid_w)
+    page = (pid_row // num_kv_heads).to(tl.int32)
+    pid_kh = pid_row % num_kv_heads
+    pid_h = pid_kh * gqa_group_size
+
+    row_end = tl.load(row_ptr + pid_row + 1)
+    n_q = min(Q_TILE, row_end - q_lo)
+
+    off_n = tl.arange(0, BLOCK_SIZE_K)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    off_h = tl.arange(0, BLOCK_SIZE_H)
+    off_qt = tl.arange(0, Q_TILE)
+    d_mask = off_d < head_dim
+    h_mask = off_h < gqa_group_size
+    qt_mask = off_qt < n_q
+
+    # CSR entries for this tile.
+    ent = q_lo + off_qt
+    q_global = tl.load(csr_q_global + ent, mask=qt_mask, other=0).to(tl.int32)
+    q_abs = tl.load(csr_q_abs + ent, mask=qt_mask, other=0).to(tl.int32)
+    kv_block = tl.load(csr_kv_block + ent, mask=qt_mask, other=0).to(tl.int32)
+    slot = tl.load(csr_slot + ent, mask=qt_mask, other=0).to(tl.int32)
+    batch_id = tl.load(q_batch_ptr + q_global, mask=qt_mask, other=0).to(tl.int32)
+    seq_len = tl.load(seq_lens + batch_id, mask=qt_mask, other=0).to(tl.int32)
+
+    # Gather Q [QH, D] for the (query, head) pairs and stage into SMEM once.
+    q_rows = (q_global[:, None] * stride_qn) + (pid_h + off_h)[None, :] * stride_qh
+    q_rows = tl.reshape(q_rows, QH)
+    qh_mask = tl.reshape(qt_mask[:, None] & h_mask[None, :], QH)
+    q = tl.load(
+        q_ptr + q_rows[:, None] + off_d[None, :] * stride_qd,
+        mask=qh_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )  # [QH, D]
+
+    q_smem = tle.gpu.alloc(
+        [1, QH, BLOCK_SIZE_D], dtype=q_ptr.dtype.element_ty, layout=None, scope=tle.gpu.smem
+    )
+    tl.store(tle.gpu.local_ptr(q_smem.slot(0)), q)
+
+    # Stage the physical KV page ONCE (K then V) -- reused by every query.
+    kv_smem = tle.gpu.alloc(
+        [1, BLOCK_SIZE_K, BLOCK_SIZE_D],
+        dtype=kv_cache_ptr.dtype.element_ty,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    p_smem = tle.gpu.alloc(
+        [1, BLOCK_SIZE_K, QH],
+        dtype=kv_cache_ptr.dtype.element_ty,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    kv_stage_bytes: tl.constexpr = BLOCK_SIZE_K * BLOCK_SIZE_D * 2
+    kv_full = tle.gpu.alloc_barriers(
+        num_barriers=1, arrive_count=1, expect_bytes=kv_stage_bytes
+    )
+
+    kv_row = (page * num_kv_heads + pid_kh) * BLOCK_SIZE_K  # int32 for TMA offset
+    # K tile.
+    tle.gpu.copy(
+        kv_cache_desc, kv_smem.slot(0), [BLOCK_SIZE_K, BLOCK_SIZE_D], [kv_row, 0],
+        barrier=kv_full[0],
+    )
+    tle.gpu.barrier_wait(kv_full[0], phaseIdx=0)
+
+    qk_t = tle.gpu.wgmma(
+        kv_smem.slot(0), q_smem.slot(0), out_dtype=tl.float32, trans_b=True
+    )  # [K, QH]
+    qk_t = tle.gpu.wgmma_wait(0, qk_t)
+    qk_t *= sm_scale_log2e
+
+    # V tile into the same slot (QK's WGMMA has drained the K read).
+    tle.gpu.copy(
+        kv_cache_desc, kv_smem.slot(0), [BLOCK_SIZE_K, BLOCK_SIZE_D],
+        [kv_row, BLOCK_SIZE_D], barrier=kv_full[0],
+    )
+
+    # Causal + sequence mask per (key, query). key_abs = kv_block*128 + off_n,
+    # broadcast across the QH queries (each query carries its own kv_block/q_abs,
+    # expanded to the group heads). qk_t is [K, QH].
+    key_abs = kv_block[None, :] * BLOCK_SIZE_K + off_n[:, None]  # [K, Q_TILE]
+    q_abs_qh = tl.reshape(
+        tl.broadcast_to(q_abs[:, None], (Q_TILE, BLOCK_SIZE_H)), QH
+    )  # [QH]
+    seq_qh = tl.reshape(
+        tl.broadcast_to(seq_len[:, None], (Q_TILE, BLOCK_SIZE_H)), QH
+    )
+    kb_qh = tl.reshape(
+        tl.broadcast_to(kv_block[:, None], (Q_TILE, BLOCK_SIZE_H)), QH
+    )
+    key_abs_qh = kb_qh[None, :] * BLOCK_SIZE_K + off_n[:, None]  # [K, QH]
+    allowed = (q_abs_qh[None, :] >= key_abs_qh) & (key_abs_qh < seq_qh[None, :])
+    qk_t = tl.where(allowed, qk_t, float("-inf"))
+
+    m = tl.max(qk_t, axis=0)  # [QH]
+    p = tl.exp2(qk_t - m[None, :])  # [K, QH]
+    l = tl.sum(p, axis=0)  # [QH]
+    tl.store(tle.gpu.local_ptr(p_smem.slot(0)), p.to(kv_cache_ptr.dtype.element_ty))
+
+    tle.gpu.barrier_wait(kv_full[0], phaseIdx=1)
+    tl.debug_barrier()
+    # acc[D, QH] = V^T @ P, V=[K, D] in kv_smem, P=[K, QH] in p_smem (K-major).
+    acc_o_t = tl.zeros((BLOCK_SIZE_D, QH), dtype=tl.float32)
+    acc_o_t = tle.gpu.wgmma(kv_smem.slot(0), p_smem.slot(0), acc_o_t, trans_a=True)
+    acc_o_t = tle.gpu.wgmma_wait(0, acc_o_t)
+
+    inv_l = tl.where(l > 0, 1.0 / l, 0.0)
+    acc_o_t *= inv_l[None, :]  # [D, QH] normalized partial
+    acc = tl.trans(acc_o_t)  # [QH, D]
+    acc = tl.reshape(acc, Q_TILE, BLOCK_SIZE_H, BLOCK_SIZE_D)
+
+    lse = tl.where(l > 0, m + tl.log2(l), float("-inf"))  # [QH]
+    lse = tl.reshape(lse, Q_TILE, BLOCK_SIZE_H)
+
+    # Scatter partials to [q_global, head, slot].
+    po_base = (
+        partial_o_ptr
+        + q_global[:, None, None] * stride_po_n
+        + (pid_h + off_h)[None, :, None] * stride_po_h
+        + slot[:, None, None] * stride_po_s
+        + off_d[None, None, :] * stride_po_d
+    )
+    po_mask = qt_mask[:, None, None] & h_mask[None, :, None] & d_mask[None, None, :]
+    tl.store(po_base, acc.to(partial_o_ptr.dtype.element_ty), mask=po_mask)
+    pl_base = (
+        partial_lse_ptr
+        + q_global[:, None] * stride_pl_n
+        + (pid_h + off_h)[None, :] * stride_pl_h
+        + slot[:, None] * stride_pl_s
+    )
+    tl.store(pl_base, lse, mask=qt_mask[:, None] & h_mask[None, :])
+
+
+# ---------------------------------------------------------------------------
+# KV-outer attend (warp-specialized + pipelined), the closest analog of the
+# CuTe fmha_sm100 mainloop reachable on SM90. A persistent grid of CTAs each
+# drains a contiguous slice of the flattened work-tile schedule; within a CTA,
+# a KV-load warp (producer) streams each work-tile's physical KV page into a
+# multi-slot SMEM ring via TMA while the MMA/softmax warpgroup (consumer)
+# runs QK WGMMA -> single-block softmax -> PV WGMMA and writes the partial.
+# Load and compute overlap across work-tiles; the ``empty``/``*_full`` barrier
+# pair is the producer/consumer handshake (cf. FLA/wall_attn/parallel_fwd.py).
+#
+# Each work-tile is an independent (page, kv_head, query-chunk) unit, so unlike
+# a single query's causal sweep the consumer keeps NO running softmax across
+# tiles: every tile produces one self-contained single-block partial, exactly
+# as the non-pipelined TLE kernel does. The pipeline only overlaps I/O with
+# math across the CTA's assigned work-tiles.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _kv_outer_ws_producer(
+    kv_cache_desc,
+    kv_stages,
+    kv_full,
+    empty,
+    sched_row_ptr,
+    sched_q_lo_ptr,  # unused by producer but keeps a uniform metadata view
+    row_ptr,
+    num_kv_heads,
+    work_lo,
+    work_hi,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    CAPACITY: tl.constexpr,
+):
+    # Two TMA copies (K then V) per work-tile, each into its own ring slot pair.
+    i = 0
+    for w in range(work_lo, work_hi):
+        pid_row = tl.load(sched_row_ptr + w)
+        page = (pid_row // num_kv_heads).to(tl.int32)
+        pid_kh = pid_row % num_kv_heads
+        kv_row = (page * num_kv_heads + pid_kh) * BLOCK_SIZE_K
+
+        k_slot = (2 * i) % CAPACITY
+        gen_k = (2 * i) // CAPACITY
+        tle.gpu.barrier_wait(empty[k_slot], phaseIdx=gen_k)
+        tle.gpu.copy(
+            kv_cache_desc, kv_stages.slot(k_slot), [BLOCK_SIZE_K, BLOCK_SIZE_D],
+            [kv_row, 0], barrier=kv_full[k_slot],
+        )
+        v_slot = (2 * i + 1) % CAPACITY
+        gen_v = (2 * i + 1) // CAPACITY
+        tle.gpu.barrier_wait(empty[v_slot], phaseIdx=gen_v)
+        tle.gpu.copy(
+            kv_cache_desc, kv_stages.slot(v_slot), [BLOCK_SIZE_K, BLOCK_SIZE_D],
+            [kv_row, BLOCK_SIZE_D], barrier=kv_full[v_slot],
+        )
+        i += 1
+
+
+@triton.jit
+def _kv_outer_ws_consumer(
+    q_ptr,
+    kv_stages,
+    kv_full,
+    empty,
+    row_ptr,
+    sched_row_ptr,
+    sched_q_lo_ptr,
+    csr_q_global,
+    csr_q_abs,
+    csr_kv_block,
+    csr_slot,
+    q_batch_ptr,
+    seq_lens,
+    partial_o_ptr,
+    partial_lse_ptr,
+    num_kv_heads,
+    gqa_group_size,
+    head_dim,
+    sm_scale,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_po_n,
+    stride_po_h,
+    stride_po_s,
+    stride_po_d,
+    stride_pl_n,
+    stride_pl_h,
+    stride_pl_s,
+    work_lo,
+    work_hi,
+    Q_TILE: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    CAPACITY: tl.constexpr,
+):
+    sm_scale_log2e = sm_scale * 1.4426950409
+    QH: tl.constexpr = Q_TILE * BLOCK_SIZE_H
+    off_n = tl.arange(0, BLOCK_SIZE_K)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    off_h = tl.arange(0, BLOCK_SIZE_H)
+    off_qt = tl.arange(0, Q_TILE)
+    d_mask = off_d < head_dim
+    h_mask = off_h < gqa_group_size
+
+    q_smem = tle.gpu.alloc(
+        [1, QH, BLOCK_SIZE_D], dtype=q_ptr.dtype.element_ty, layout=None, scope=tle.gpu.smem
+    )
+    p_smem = tle.gpu.alloc(
+        [1, BLOCK_SIZE_K, QH], dtype=q_ptr.dtype.element_ty, layout=None, scope=tle.gpu.smem
+    )
+
+    i = 0
+    for w in range(work_lo, work_hi):
+        pid_row = tl.load(sched_row_ptr + w)
+        q_lo = tl.load(sched_q_lo_ptr + w)
+        pid_kh = pid_row % num_kv_heads
+        pid_h = pid_kh * gqa_group_size
+        row_end = tl.load(row_ptr + pid_row + 1)
+        n_q = min(Q_TILE, row_end - q_lo)
+        qt_mask = off_qt < n_q
+
+        ent = q_lo + off_qt
+        q_global = tl.load(csr_q_global + ent, mask=qt_mask, other=0).to(tl.int32)
+        q_abs = tl.load(csr_q_abs + ent, mask=qt_mask, other=0).to(tl.int32)
+        kv_block = tl.load(csr_kv_block + ent, mask=qt_mask, other=0).to(tl.int32)
+        slot_id = tl.load(csr_slot + ent, mask=qt_mask, other=0).to(tl.int32)
+        batch_id = tl.load(q_batch_ptr + q_global, mask=qt_mask, other=0).to(tl.int32)
+        seq_len = tl.load(seq_lens + batch_id, mask=qt_mask, other=0).to(tl.int32)
+
+        # Gather Q [QH, D] (scattered query ids cannot be TMA-loaded).
+        q_rows = (q_global[:, None] * stride_qn) + (pid_h + off_h)[None, :] * stride_qh
+        q_rows = tl.reshape(q_rows, QH)
+        qh_mask = tl.reshape(qt_mask[:, None] & h_mask[None, :], QH)
+        q = tl.load(
+            q_ptr + q_rows[:, None] + off_d[None, :] * stride_qd,
+            mask=qh_mask[:, None] & d_mask[None, :], other=0.0,
+        )
+        tl.store(tle.gpu.local_ptr(q_smem.slot(0)), q)
+
+        k_slot = (2 * i) % CAPACITY
+        gen_k = (2 * i) // CAPACITY
+        tle.gpu.barrier_wait(kv_full[k_slot], phaseIdx=gen_k)
+        qk_t = tle.gpu.wgmma(
+            kv_stages.slot(k_slot), q_smem.slot(0), out_dtype=tl.float32, trans_b=True
+        )  # [K, QH]
+        qk_t = tle.gpu.wgmma_wait(0, qk_t)
+        qk_t *= sm_scale_log2e
+
+        kb_qh = tl.reshape(tl.broadcast_to(kv_block[:, None], (Q_TILE, BLOCK_SIZE_H)), QH)
+        q_abs_qh = tl.reshape(tl.broadcast_to(q_abs[:, None], (Q_TILE, BLOCK_SIZE_H)), QH)
+        seq_qh = tl.reshape(tl.broadcast_to(seq_len[:, None], (Q_TILE, BLOCK_SIZE_H)), QH)
+        key_abs_qh = kb_qh[None, :] * BLOCK_SIZE_K + off_n[:, None]
+        allowed = (q_abs_qh[None, :] >= key_abs_qh) & (key_abs_qh < seq_qh[None, :])
+        qk_t = tl.where(allowed, qk_t, float("-inf"))
+
+        m = tl.max(qk_t, axis=0)
+        p = tl.exp2(qk_t - m[None, :])
+        l = tl.sum(p, axis=0)
+        tl.store(tle.gpu.local_ptr(p_smem.slot(0)), p.to(q_ptr.dtype.element_ty))
+
+        v_slot = (2 * i + 1) % CAPACITY
+        gen_v = (2 * i + 1) // CAPACITY
+        tle.gpu.barrier_wait(kv_full[v_slot], phaseIdx=gen_v)
+        acc_o_t = tl.zeros((BLOCK_SIZE_D, QH), dtype=tl.float32)
+        acc_o_t = tle.gpu.wgmma(kv_stages.slot(v_slot), p_smem.slot(0), acc_o_t, trans_a=True)
+        acc_o_t = tle.gpu.wgmma_wait(0, acc_o_t)
+        tle.gpu.barrier_arrive(empty[k_slot], phaseIdx=gen_k)
+        tle.gpu.barrier_arrive(empty[v_slot], phaseIdx=gen_v)
+
+        inv_l = tl.where(l > 0, 1.0 / l, 0.0)
+        acc_o_t *= inv_l[None, :]
+        acc = tl.reshape(tl.trans(acc_o_t), Q_TILE, BLOCK_SIZE_H, BLOCK_SIZE_D)
+        lse = tl.reshape(tl.where(l > 0, m + tl.log2(l), float("-inf")), Q_TILE, BLOCK_SIZE_H)
+
+        po_base = (
+            partial_o_ptr
+            + q_global[:, None, None] * stride_po_n
+            + (pid_h + off_h)[None, :, None] * stride_po_h
+            + slot_id[:, None, None] * stride_po_s
+            + off_d[None, None, :] * stride_po_d
+        )
+        po_mask = qt_mask[:, None, None] & h_mask[None, :, None] & d_mask[None, None, :]
+        tl.store(po_base, acc.to(partial_o_ptr.dtype.element_ty), mask=po_mask)
+        pl_base = (
+            partial_lse_ptr
+            + q_global[:, None] * stride_pl_n
+            + (pid_h + off_h)[None, :] * stride_pl_h
+            + slot_id[:, None] * stride_pl_s
+        )
+        tl.store(pl_base, lse, mask=qt_mask[:, None] & h_mask[None, :])
+        i += 1
+
+
+@triton.jit
+def _kv_block_attn_ws_kernel(
+    q_ptr,
+    kv_cache_ptr,
+    kv_cache_desc,
+    row_ptr,
+    csr_q_global,
+    csr_q_abs,
+    csr_kv_block,
+    csr_slot,
+    q_batch_ptr,
+    seq_lens,
+    partial_o_ptr,
+    partial_lse_ptr,
+    sched_row_ptr,
+    sched_q_lo_ptr,
+    num_work,
+    num_kv_heads,
+    gqa_group_size,
+    head_dim,
+    sm_scale,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_po_n,
+    stride_po_h,
+    stride_po_s,
+    stride_po_d,
+    stride_pl_n,
+    stride_pl_h,
+    stride_pl_s,
+    Q_TILE: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+    WORKER_WARPS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    # Static, contiguous partition of the work-tile schedule across CTAs.
+    per = (num_work + NUM_CTAS - 1) // NUM_CTAS
+    work_lo = pid * per
+    work_hi = min(work_lo + per, num_work)
+
+    kv_stages = tle.gpu.alloc(
+        (CAPACITY, BLOCK_SIZE_K, BLOCK_SIZE_D),
+        dtype=kv_cache_ptr.dtype.element_ty, layout=None, scope=tle.gpu.smem,
+        nv_mma_shared_layout=True,
+    )
+    kv_full = tle.gpu.alloc_barriers(
+        num_barriers=CAPACITY, expect_bytes=BLOCK_SIZE_K * BLOCK_SIZE_D * 2
+    )
+    empty = tle.gpu.alloc_barriers(
+        num_barriers=CAPACITY, arrive_count=1, init=tle.gpu.READY
+    )
+
+    tle.gpu.warp_specialize(
+        [
+            (
+                _kv_outer_ws_consumer,
+                (
+                    q_ptr, kv_stages, kv_full, empty, row_ptr, sched_row_ptr,
+                    sched_q_lo_ptr, csr_q_global, csr_q_abs, csr_kv_block, csr_slot,
+                    q_batch_ptr, seq_lens, partial_o_ptr, partial_lse_ptr,
+                    num_kv_heads, gqa_group_size, head_dim, sm_scale,
+                    stride_qn, stride_qh, stride_qd,
+                    stride_po_n, stride_po_h, stride_po_s, stride_po_d,
+                    stride_pl_n, stride_pl_h, stride_pl_s,
+                    work_lo, work_hi,
+                    Q_TILE, BLOCK_SIZE_K, BLOCK_SIZE_D, BLOCK_SIZE_H, CAPACITY,
+                ),
+            ),
+            (
+                _kv_outer_ws_producer,
+                (
+                    kv_cache_desc, kv_stages, kv_full, empty, sched_row_ptr,
+                    sched_q_lo_ptr, row_ptr, num_kv_heads, work_lo, work_hi,
+                    BLOCK_SIZE_K, BLOCK_SIZE_D, CAPACITY,
+                ),
+            ),
+        ],
+        worker_num_warps=[1],
+        worker_num_regs=[32],
+    )
+
+
+# ---------------------------------------------------------------------------
+# KV-outer attend (plain Triton reference): one program per (row_tile, kv_head).
+# Loads the KV block with tl.load and emits a single-block softmax partial for a
+# tile of its queries. Kept as the correctness oracle / fallback for the TLE
+# kernel above.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _kv_block_attn_kernel(
+    q_ptr,  # [total_q, num_heads, head_dim]
+    kv_cache_ptr,  # [num_blocks, num_kv_heads, 128, 2*head_dim]
+    row_ptr,  # [num_rows + 1] int32  CSR row offsets
+    csr_q_global,  # [nnz] int32
+    csr_q_abs,  # [nnz] int32
+    csr_kv_block,  # [nnz] int32  logical block (for causal key positions)
+    csr_slot,  # [nnz] int32
+    q_batch_ptr,  # [total_q] int32  batch id of each query (for seq_len)
+    seq_lens,  # [batch] int32
+    partial_o_ptr,  # [total_q, num_heads, max_topk, head_dim] fp32
+    partial_lse_ptr,  # [total_q, num_heads, max_topk] fp32 (log2 domain)
+    num_kv_heads,
+    gqa_group_size,
+    head_dim,
+    max_topk,
+    sm_scale,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_kv_blk,
+    stride_kv_h,
+    stride_kv_pos,
+    stride_kv_d,
+    stride_po_n,
+    stride_po_h,
+    stride_po_s,
+    stride_po_d,
+    stride_pl_n,
+    stride_pl_h,
+    stride_pl_s,
+    sched_row_ptr,  # [num_work + 1]: per work-tile, the CSR row it belongs to
+    sched_q_lo_ptr,  # [num_work]: per work-tile, the absolute CSR entry offset
+    Q_TILE: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,  # next_pow2(gqa_group_size)
+):
+    sm_scale_log2e = sm_scale * 1.4426950409
+    # Flattened work-tile schedule (CuTe-style): one program per (row, q_tile)
+    # actually-populated work unit, so no program early-returns on an empty row
+    # and long rows are split into balanced Q_TILE chunks.
+    pid_w = tl.program_id(0)
+    pid_row = tl.load(sched_row_ptr + pid_w)  # flattened (physical_page, kv_head)
+    q_lo = tl.load(sched_q_lo_ptr + pid_w)  # absolute CSR entry offset
+    page = (pid_row // num_kv_heads).to(tl.int64)
+    pid_kh = pid_row % num_kv_heads
+    pid_h = pid_kh * gqa_group_size
+
+    row_end = tl.load(row_ptr + pid_row + 1)
+    n_q = min(Q_TILE, row_end - q_lo)
+
+    off_n = tl.arange(0, BLOCK_SIZE_K)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    off_h = tl.arange(0, BLOCK_SIZE_H)
+    off_qt = tl.arange(0, Q_TILE)
+    d_mask = off_d < head_dim
+    h_mask = off_h < gqa_group_size
+    qt_mask = off_qt < n_q
+
+    # CSR entries for this tile. All entries in a row share the physical page
+    # (row key), so one KV load serves the whole tile; kv_block is the logical
+    # block index and sets the key positions for causal masking.
+    ent = q_lo + off_qt
+    ent_mask = off_qt < n_q
+    q_global = tl.load(csr_q_global + ent, mask=ent_mask, other=0).to(tl.int32)
+    q_abs = tl.load(csr_q_abs + ent, mask=ent_mask, other=0).to(tl.int32)
+    kv_block = tl.load(csr_kv_block + ent, mask=ent_mask, other=0).to(tl.int32)
+    slot = tl.load(csr_slot + ent, mask=ent_mask, other=0).to(tl.int32)
+    batch_id = tl.load(q_batch_ptr + q_global, mask=ent_mask, other=0).to(tl.int32)
+    seq_len = tl.load(seq_lens + batch_id, mask=ent_mask, other=0).to(tl.int32)
+
+    # Key positions: logical block is identical across a row (same page implies
+    # same logical block within a batch; across batches the block table is a
+    # permutation, so a physical page maps to one logical block per batch, and
+    # entries sharing a page share the logical block). Use the tile's first.
+    c = kv_block * BLOCK_SIZE_K  # [Q_TILE], per-entry logical key offset
+    pos = off_n  # [BLOCK_SIZE_K] within-block key position
+
+    # Load this physical KV page once (the row key guarantees a single page).
+    k = tl.load(
+        kv_cache_ptr
+        + page * stride_kv_blk
+        + pid_kh * stride_kv_h
+        + off_n[None, :] * stride_kv_pos
+        + off_d[:, None] * stride_kv_d,
+        mask=d_mask[:, None],
+        other=0.0,
+    )  # [BLOCK_SIZE_D, BLOCK_SIZE_K]
+    v = tl.load(
+        kv_cache_ptr
+        + page * stride_kv_blk
+        + pid_kh * stride_kv_h
+        + off_n[:, None] * stride_kv_pos
+        + (head_dim + off_d[None, :]) * stride_kv_d,
+        mask=d_mask[None, :],
+        other=0.0,
+    )  # [BLOCK_SIZE_K, BLOCK_SIZE_D]
+
+    # Gather Q for the query tile and every group head: [Q_TILE*H, D].
+    q_rows = (q_global[:, None] * stride_qn) + (pid_h + off_h)[None, :] * stride_qh
+    q_rows = q_rows.reshape(Q_TILE * BLOCK_SIZE_H)
+    q = tl.load(
+        q_ptr + q_rows[:, None] + off_d[None, :] * stride_qd,
+        mask=(qt_mask[:, None] & h_mask[None, :]).reshape(Q_TILE * BLOCK_SIZE_H)[:, None]
+        & d_mask[None, :],
+        other=0.0,
+    )  # [Q_TILE*H, D]
+
+    qk = tl.dot(q, k)  # [Q_TILE*H, BLOCK_SIZE_K]
+    qk = qk.reshape(Q_TILE, BLOCK_SIZE_H, BLOCK_SIZE_K) * sm_scale_log2e
+
+    # Causal + sequence masks per (query, key). Absolute key position is the
+    # entry's logical block offset plus the within-block index. q attends key
+    # pos p iff q_abs >= p and p < seq_len.
+    key_abs = c[:, None] + pos[None, :]  # [Q_TILE, BLOCK_SIZE_K]
+    allowed = (q_abs[:, None] >= key_abs) & (key_abs < seq_len[:, None])
+    qk = tl.where(allowed[:, None, :], qk, float("-inf"))
+
+    m = tl.max(qk, axis=2)  # [Q_TILE, H]
+    p = tl.exp2(qk - m[:, :, None])  # [Q_TILE, H, K]
+    l = tl.sum(p, axis=2)  # [Q_TILE, H]
+    p = tl.reshape(p, Q_TILE * BLOCK_SIZE_H, BLOCK_SIZE_K)
+    acc = tl.dot(p.to(v.dtype), v)  # [Q_TILE*H, D]  (unnormalized)
+    acc = tl.reshape(acc, Q_TILE, BLOCK_SIZE_H, BLOCK_SIZE_D)
+
+    # Normalize the partial by this block's l, matching the flash-decode merge
+    # convention (o_chunk is softmax-normalized within the chunk; the LSE carries
+    # the cross-chunk weight). Empty rows (l == 0) store 0 and an -inf LSE.
+    inv_l = tl.where(l > 0, 1.0 / l, 0.0)
+    acc = acc * inv_l[:, :, None]
+
+    # log2-domain LSE for this single block; empty rows (m == -inf) -> -inf.
+    lse = tl.where(l > 0, m + tl.log2(l), float("-inf"))  # [Q_TILE, H]
+
+    # Scatter partials to [q_global, head, slot].
+    po_base = (
+        partial_o_ptr
+        + q_global[:, None, None] * stride_po_n
+        + (pid_h + off_h)[None, :, None] * stride_po_h
+        + slot[:, None, None] * stride_po_s
+        + off_d[None, None, :] * stride_po_d
+    )
+    po_mask = (
+        qt_mask[:, None, None] & h_mask[None, :, None] & d_mask[None, None, :]
+    )
+    tl.store(po_base, acc, mask=po_mask)
+    pl_base = (
+        partial_lse_ptr
+        + q_global[:, None] * stride_pl_n
+        + (pid_h + off_h)[None, :] * stride_pl_h
+        + slot[:, None] * stride_pl_s
+    )
+    tl.store(pl_base, lse, mask=qt_mask[:, None] & h_mask[None, :])
+
+
+# ---------------------------------------------------------------------------
+# Merge: LSE-weighted combine over a query's slots. Mirrors the decode split-K
+# merge (log2 domain, empty slots contribute weight 0).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _kv_outer_merge_kernel(
+    partial_o_ptr,  # [total_q, num_heads, max_topk, head_dim] fp32
+    partial_lse_ptr,  # [total_q, num_heads, max_topk] fp32 log2
+    out_ptr,  # [total_q, num_heads, head_dim]
+    head_dim,
+    max_topk,
+    stride_po_n,
+    stride_po_h,
+    stride_po_s,
+    stride_po_d,
+    stride_pl_n,
+    stride_pl_h,
+    stride_pl_s,
+    stride_out_n,
+    stride_out_h,
+    stride_out_d,
+    MAX_TOPK: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    pid_n = tl.program_id(0)  # query
+    pid_h = tl.program_id(1)  # head
+    off_s = tl.arange(0, MAX_TOPK)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    s_mask = off_s < max_topk
+    d_mask = off_d < head_dim
+
+    lse = tl.load(
+        partial_lse_ptr + pid_n * stride_pl_n + pid_h * stride_pl_h + off_s * stride_pl_s,
+        mask=s_mask,
+        other=float("-inf"),
+    )
+    o = tl.load(
+        partial_o_ptr
+        + pid_n * stride_po_n
+        + pid_h * stride_po_h
+        + off_s[:, None] * stride_po_s
+        + off_d[None, :] * stride_po_d,
+        mask=s_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )  # [MAX_TOPK, D]
+    lse_max = tl.max(lse, axis=0)
+    valid = lse > float("-inf")
+    weights = tl.where(valid, tl.exp2(lse - lse_max), 0.0)
+    wsum = tl.sum(weights, axis=0)
+    inv = tl.where(wsum > 0, 1.0 / wsum, 0.0)
+    # Zero partials from empty slots so uninitialized memory cannot create NaNs
+    # (weight is 0 there, but 0 * inf == nan).
+    o = tl.where(valid[:, None], o.to(tl.float32), 0.0)
+    o_merged = tl.sum(o * weights[:, None], axis=0) * inv
+    tl.store(
+        out_ptr + pid_n * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d,
+        o_merged.to(out_ptr.dtype.element_ty),
+        mask=d_mask,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fused merge: processes N_TILE queries (all heads) per program. The per-(q,h)
+# merge above launches total_q*num_heads tiny programs each reading only
+# topk*head_dim bytes -- it is latency-bound, not bandwidth-bound. Widening the
+# tile to N_TILE queries x one head amortizes launch/addressing over a bigger
+# contiguous read and lets each program keep more memory in flight.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _kv_outer_merge_tiled_kernel(
+    partial_o_ptr,  # [total_q, num_heads, max_topk, head_dim]
+    partial_lse_ptr,  # [total_q, num_heads, max_topk] fp32 log2
+    out_ptr,  # [total_q, num_heads, head_dim]
+    total_q,
+    head_dim,
+    max_topk,
+    stride_po_n,
+    stride_po_h,
+    stride_po_s,
+    stride_po_d,
+    stride_pl_n,
+    stride_pl_h,
+    stride_pl_s,
+    stride_out_n,
+    stride_out_h,
+    stride_out_d,
+    MAX_TOPK: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    N_TILE: tl.constexpr,
+):
+    pid_nt = tl.program_id(0)  # query tile
+    pid_h = tl.program_id(1)  # head
+    off_q = pid_nt * N_TILE + tl.arange(0, N_TILE)
+    off_s = tl.arange(0, MAX_TOPK)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    q_mask = off_q < total_q
+    s_mask = off_s < max_topk
+    d_mask = off_d < head_dim
+
+    # lse: [N_TILE, MAX_TOPK]
+    lse = tl.load(
+        partial_lse_ptr
+        + off_q[:, None] * stride_pl_n
+        + pid_h * stride_pl_h
+        + off_s[None, :] * stride_pl_s,
+        mask=q_mask[:, None] & s_mask[None, :],
+        other=float("-inf"),
+    )
+    lse_max = tl.max(lse, axis=1)  # [N_TILE]
+    valid = lse > float("-inf")
+    weights = tl.where(valid, tl.exp2(lse - lse_max[:, None]), 0.0)  # [N_TILE, S]
+    wsum = tl.sum(weights, axis=1)  # [N_TILE]
+    inv = tl.where(wsum > 0, 1.0 / wsum, 0.0)
+
+    # o: [N_TILE, MAX_TOPK, D] -> weighted sum over S
+    o = tl.load(
+        partial_o_ptr
+        + off_q[:, None, None] * stride_po_n
+        + pid_h * stride_po_h
+        + off_s[None, :, None] * stride_po_s
+        + off_d[None, None, :] * stride_po_d,
+        mask=q_mask[:, None, None] & s_mask[None, :, None] & d_mask[None, None, :],
+        other=0.0,
+    )
+    o = tl.where(valid[:, :, None], o.to(tl.float32), 0.0)
+    o_merged = tl.sum(o * weights[:, :, None], axis=1) * inv[:, None]  # [N_TILE, D]
+    tl.store(
+        out_ptr
+        + off_q[:, None] * stride_out_n
+        + pid_h * stride_out_h
+        + off_d[None, :] * stride_out_d,
+        o_merged.to(out_ptr.dtype.element_ty),
+        mask=q_mask[:, None] & d_mask[None, :],
+    )
+
+
+@torch.no_grad()
+def _build_schedule(row_ptr: torch.Tensor, q_tile: int):
+    """Flatten (row, q_tile-chunk) work units into two parallel arrays.
+
+    For CSR row r with ``count`` entries, emit ``ceil(count / q_tile)`` work
+    units, each tagged with its row id and absolute CSR entry offset. Empty
+    rows emit nothing. Returns (sched_row [num_work] int32, sched_q_lo
+    [num_work] int32).
+    """
+    device = row_ptr.device
+    counts = (row_ptr[1:] - row_ptr[:-1]).to(torch.int64)
+    tiles_per_row = (counts + q_tile - 1) // q_tile  # [num_rows]
+    num_work = int(tiles_per_row.sum().item())
+    if num_work == 0:
+        empty = torch.zeros(0, device=device, dtype=torch.int32)
+        return empty, empty
+    # Row id of each work unit via repeat_interleave, then the within-row tile
+    # index via a grouped arange.
+    rows = torch.arange(row_ptr.numel() - 1, device=device, dtype=torch.int64)
+    sched_row = torch.repeat_interleave(rows, tiles_per_row)
+    # within-row tile index 0..tiles-1 for each unit
+    starts = torch.cumsum(tiles_per_row, 0) - tiles_per_row
+    within = torch.arange(num_work, device=device, dtype=torch.int64) - starts[sched_row]
+    sched_q_lo = row_ptr[:-1].to(torch.int64)[sched_row] + within * q_tile
+    return sched_row.to(torch.int32), sched_q_lo.to(torch.int32)
+
+
+def _q_batch_index(cu_seqlens_q: torch.Tensor, total_q: int) -> torch.Tensor:
+    """Map each global query id to its batch index."""
+    batch = cu_seqlens_q.numel() - 1
+    out = torch.empty(total_q, device=cu_seqlens_q.device, dtype=torch.int32)
+    cu = cu_seqlens_q.to(torch.int64)
+    for b in range(batch):
+        s = int(cu[b].item())
+        e = int(cu[b + 1].item())
+        if e > s:
+            out[s:e] = b
+    return out
+
+
+@torch.no_grad()
+def _minimax_m3_sparse_attn_kv_outer(
+    q: torch.Tensor,  # [total_q, num_heads, head_dim]
+    kv_cache: torch.Tensor,  # [num_blocks, num_kv_heads, 128, 2*head_dim]
+    topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk]
+    block_table: torch.Tensor,  # [batch, max_blocks]
+    cu_seqlens_q: torch.Tensor,  # [batch + 1] int32
+    seq_lens: torch.Tensor,  # [batch] int32
+    prefix_lens: torch.Tensor,  # [batch] int32
+    max_query_len: int,
+    num_kv_heads: int,
+    sm_scale: float,
+    output: torch.Tensor,  # [total_q, num_heads, head_dim]
+    *,
+    q_tile: int | None = None,
+    csr: dict | None = None,
+    return_csr: bool = False,
+    use_tle: bool | None = None,
+    kernel: str | None = None,
+    capacity: int = 2,
+    num_ctas: int | None = None,
+    maxnreg: int | None = 128,
+):
+    """KV-outer BF16 block-sparse prefill (block_size_q == 1).
+
+    Pass a prebuilt ``csr`` (from ``build_k2q_csr``) to exclude the CSR build
+    from timing; otherwise it is built here. Set ``return_csr`` to also return
+    the CSR for reuse.
+
+    ``kernel`` selects the attend implementation:
+      - ``"ws"``   : warp-specialized + pipelined TLE (producer streams KV via
+                     TMA into a multi-slot ring, consumer runs WGMMA) -- closest
+                     to the CuTe fmha_sm100 mainloop. Default when TLE is present.
+      - ``"tle"``  : single-stage TLE (KV staged once per work-tile, no overlap).
+      - ``"plain"``: plain-Triton reference (tl.load/tl.dot), correctness oracle.
+    ``use_tle`` is kept for back-compat: True -> "tle", False -> "plain".
+    """
+    if kv_cache.dtype != torch.bfloat16:
+        raise NotImplementedError("kv-outer v1 supports BF16 prefill only")
+    if kernel is None:
+        if use_tle is None:
+            kernel = "ws" if tle is not None else "plain"
+        else:
+            kernel = "tle" if use_tle else "plain"
+    if kernel in ("ws", "tle") and tle is None:
+        raise RuntimeError(f"kernel={kernel!r} needs triton TLE, which is not importable")
+    use_tle = kernel in ("ws", "tle")
+    if q_tile is None:
+        # TLE stages Q [Q_TILE*H, D] and P [K, Q_TILE*H] in SMEM; Q_TILE*H is the
+        # WGMMA N and must be >= 16. q_tile 4 (N=64 at group 16) is the measured
+        # sweet spot -- larger tiles blow up SMEM/registers and cut occupancy.
+        # The plain-Triton reference has no SMEM ceiling and prefers a wider tile.
+        q_tile = 4 if use_tle else 32
+    total_q, num_heads, head_dim = q.shape
+    topk = topk_idx.shape[-1]
+    gqa_group_size = num_heads // num_kv_heads
+    max_blocks = block_table.shape[1]
+
+    num_pages = kv_cache.shape[0]
+    if csr is None:
+        csr = build_k2q_csr(topk_idx, cu_seqlens_q, prefix_lens, block_table, num_pages)
+    q_batch = _q_batch_index(cu_seqlens_q, total_q)
+
+    block_size_d = triton.next_power_of_2(head_dim)
+    block_size_h = triton.next_power_of_2(gqa_group_size)
+
+    # partial_o is bf16 (halves the HBM round-trip of the two-pass split/merge,
+    # which dominates on this problem size). The LSE gates empty slots, so
+    # partial_o need not be pre-zeroed; partial_lse must be -inf-initialized.
+    partial_o = torch.empty(
+        (total_q, num_heads, topk, head_dim), device=q.device, dtype=torch.bfloat16
+    )
+    partial_lse = torch.full(
+        (total_q, num_heads, topk), float("-inf"), device=q.device, dtype=torch.float32
+    )
+
+    # Flattened work-tile schedule: each (row, q_tile) chunk that actually has
+    # queries becomes one program. This balances long/short rows and avoids the
+    # empty-program waste of a static 2-D grid (the CuTe scheduler's role).
+    sched_row, sched_q_lo = _build_schedule(csr["row_ptr"], q_tile)
+    num_work = sched_row.numel()
+
+    grid = (max(1, num_work),)
+    if kernel == "ws":
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        triton.set_allocator(_tma_allocator)
+        kv_cache_2d = kv_cache.view(-1, 2 * head_dim)
+        kv_cache_desc = TensorDescriptor(
+            kv_cache_2d,
+            shape=[kv_cache_2d.shape[0], kv_cache_2d.shape[1]],
+            strides=[kv_cache_2d.stride(0), kv_cache_2d.stride(1)],
+            block_shape=[SPARSE_BLOCK_SIZE, head_dim],
+        )
+        if num_ctas is None:
+            num_ctas = 2 * torch.cuda.get_device_properties(q.device).multi_processor_count
+        num_ctas = max(1, min(num_ctas, num_work)) if num_work else 1
+        ws_grid = (num_ctas,)
+        _kv_block_attn_ws_kernel[ws_grid](
+            q,
+            kv_cache,
+            kv_cache_desc,
+            csr["row_ptr"],
+            csr["q_global"],
+            csr["q_abs"],
+            csr["kv_block"],
+            csr["slot"],
+            q_batch,
+            seq_lens,
+            partial_o,
+            partial_lse,
+            sched_row,
+            sched_q_lo,
+            num_work,
+            num_kv_heads,
+            gqa_group_size,
+            head_dim,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            partial_o.stride(0),
+            partial_o.stride(1),
+            partial_o.stride(2),
+            partial_o.stride(3),
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            partial_lse.stride(2),
+            Q_TILE=q_tile,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            BLOCK_SIZE_D=block_size_d,
+            BLOCK_SIZE_H=block_size_h,
+            CAPACITY=capacity,
+            NUM_CTAS=num_ctas,
+            WORKER_WARPS=1,
+            num_warps=4,
+            num_stages=1,
+            **({"maxnreg": maxnreg} if maxnreg is not None else {}),
+        )
+    elif kernel == "tle":
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        triton.set_allocator(_tma_allocator)
+        kv_cache_2d = kv_cache.view(-1, 2 * head_dim)
+        kv_cache_desc = TensorDescriptor(
+            kv_cache_2d,
+            shape=[kv_cache_2d.shape[0], kv_cache_2d.shape[1]],
+            strides=[kv_cache_2d.stride(0), kv_cache_2d.stride(1)],
+            block_shape=[SPARSE_BLOCK_SIZE, head_dim],
+        )
+        _kv_block_attn_tle_kernel[grid](
+            q,
+            kv_cache,
+            kv_cache_desc,
+            csr["row_ptr"],
+            csr["q_global"],
+            csr["q_abs"],
+            csr["kv_block"],
+            csr["slot"],
+            q_batch,
+            seq_lens,
+            partial_o,
+            partial_lse,
+            sched_row,
+            sched_q_lo,
+            num_kv_heads,
+            gqa_group_size,
+            head_dim,
+            topk,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            partial_o.stride(0),
+            partial_o.stride(1),
+            partial_o.stride(2),
+            partial_o.stride(3),
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            partial_lse.stride(2),
+            Q_TILE=q_tile,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            BLOCK_SIZE_D=block_size_d,
+            BLOCK_SIZE_H=block_size_h,
+            num_warps=4,
+            num_stages=1,
+        )
+    else:
+        _kv_block_attn_kernel[grid](
+            q,
+            kv_cache,
+            csr["row_ptr"],
+            csr["q_global"],
+            csr["q_abs"],
+            csr["kv_block"],
+            csr["slot"],
+            q_batch,
+            seq_lens,
+            partial_o,
+            partial_lse,
+            num_kv_heads,
+            gqa_group_size,
+            head_dim,
+            topk,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            kv_cache.stride(3),
+            partial_o.stride(0),
+            partial_o.stride(1),
+            partial_o.stride(2),
+            partial_o.stride(3),
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            partial_lse.stride(2),
+            sched_row,
+            sched_q_lo,
+            Q_TILE=q_tile,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            BLOCK_SIZE_D=block_size_d,
+            BLOCK_SIZE_H=block_size_h,
+        )
+
+    # N_TILE queries x MAX_TOPK x head_dim fp32 lives in registers per program;
+    # scale it down as topk grows so the tile stays register-resident.
+    max_topk_pow2 = triton.next_power_of_2(topk)
+    n_tile = max(1, min(16, 256 // max_topk_pow2))
+    merge_grid = (triton.cdiv(total_q, n_tile), num_heads)
+    _kv_outer_merge_tiled_kernel[merge_grid](
+        partial_o,
+        partial_lse,
+        output,
+        total_q,
+        head_dim,
+        topk,
+        partial_o.stride(0),
+        partial_o.stride(1),
+        partial_o.stride(2),
+        partial_o.stride(3),
+        partial_lse.stride(0),
+        partial_lse.stride(1),
+        partial_lse.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        MAX_TOPK=triton.next_power_of_2(topk),
+        BLOCK_SIZE_D=block_size_d,
+        N_TILE=n_tile,
+    )
+    if return_csr:
+        return output, csr
+    return output
+
+
 @torch.no_grad()
 def minimax_m3_sparse_attn(
     q: torch.Tensor,
@@ -2357,7 +3541,22 @@ def minimax_m3_sparse_attn(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> None:
-    """GQA block-sparse attention over the selected blocks. block_size_q == 1."""
+    """GQA block-sparse attention over the selected blocks. block_size_q == 1.
+
+    For long BF16 prompts the work is routed to the kv-outer implementation
+    (physical KV page loaded once per CTA and reused across the queries that
+    selected it, then an LSE merge), which beats this q-outer path once the
+    per-request query count makes KV reuse pay back the CSR build + merge.
+    Short prompts, fp8 KV, scaled KV, and TLE-less builds keep the q-outer body
+    below. The public signature and semantics are unchanged.
+    """
+    if _should_use_kv_outer_prefill(kv_cache, max_query_len, k_scale, v_scale):
+        _minimax_m3_sparse_attn_kv_outer(
+            q, kv_cache, topk_idx, block_table, cu_seqlens_q, seq_lens,
+            prefix_lens, max_query_len, num_kv_heads, sm_scale, output,
+        )
+        return
+
     total_q, num_heads, head_dim = q.shape
     batch = cu_seqlens_q.shape[0] - 1
     topk = topk_idx.shape[-1]
