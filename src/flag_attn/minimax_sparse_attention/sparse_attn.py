@@ -2367,6 +2367,194 @@ def _kv_scale_args(
 # via TLE and reused across the queries that selected it (build_k2q_csr),
 # then an LSE merge. Selected by minimax_m3_sparse_attn for long BF16 prompts.
 # ---------------------------------------------------------------------------
+# Fused GPU k2q CSR builder. The host builder below (build_k2q_csr) is a chain
+# of ~40 tiny torch ops (nonzero/argsort/bincount/gathers) whose launch latency
+# -- not compute -- dominated the whole prefill at small query_len. These two
+# Triton kernels collapse that chain into a count pass + a scatter pass:
+#
+#   pass 1 (_k2q_count_kernel):   one program per (kv_head, query); for each
+#       valid top-k slot, atomic-increment the physical-page row's counter.
+#       -> row_counts[num_rows]; a host cumsum turns it into row_ptr.
+#   pass 2 (_k2q_scatter_kernel): same grid; atomic-bump a per-row write cursor
+#       to claim a slot and scatter (q_global, q_abs, kv_block, slot) there.
+#
+# Row-internal order does NOT matter: every CSR entry yields an independent
+# single-page partial that the LSE merge combines order-independently, so no
+# stable sort is needed (that argsort was the top host cost at high nnz).
+# q_abs and q_batch are derived on-device from cu_seqlens/prefix_lens, so the
+# whole build stays on the GPU with no .item() sync -- which also lets the full
+# prefill (build + attend + merge) be captured in a single CUDA graph.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _k2q_count_kernel(
+    topk_idx_ptr,  # [num_kv_heads, total_q, topk] int (-1 == unused)
+    block_table_ptr,  # [batch, max_blocks] int32
+    q_batch_ptr,  # [total_q] int32  (query -> batch)
+    row_counts_ptr,  # [num_rows] int32  (atomic output)
+    total_q,
+    topk,
+    num_kv_heads,
+    max_blocks,
+    stride_tk_h,
+    stride_tk_q,
+    stride_tk_s,
+    stride_bt_b,
+    stride_bt_m,
+    BLOCK_SIZE_T: tl.constexpr,  # next_pow2(topk)
+):
+    pid = tl.program_id(0)  # flattened (kv_head, query)
+    kh = pid // total_q
+    q = pid % total_q
+    batch_id = tl.load(q_batch_ptr + q)
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    t_mask = off_t < topk
+    blocks = tl.load(
+        topk_idx_ptr + kh * stride_tk_h + q * stride_tk_q + off_t * stride_tk_s,
+        mask=t_mask,
+        other=-1,
+    )
+    valid = t_mask & (blocks >= 0)
+    # logical block -> physical page via this query's batch row of block_table
+    pages = tl.load(
+        block_table_ptr + batch_id * stride_bt_b + blocks * stride_bt_m,
+        mask=valid,
+        other=0,
+    )
+    rows = pages * num_kv_heads + kh
+    tl.atomic_add(row_counts_ptr + rows, 1, mask=valid)
+
+
+@triton.jit
+def _k2q_scatter_kernel(
+    topk_idx_ptr,  # [num_kv_heads, total_q, topk] int
+    block_table_ptr,  # [batch, max_blocks] int32
+    q_batch_ptr,  # [total_q] int32
+    cu_seqlens_ptr,  # [batch + 1] int32
+    prefix_lens_ptr,  # [batch] int32
+    row_ptr_ptr,  # [num_rows + 1] int32  (prefix sum, read-only)
+    cursor_ptr,  # [num_rows] int32  (atomic per-row write cursor)
+    out_q_global_ptr,  # [nnz_cap] int32
+    out_q_abs_ptr,  # [nnz_cap] int32
+    out_kv_block_ptr,  # [nnz_cap] int32
+    out_slot_ptr,  # [nnz_cap] int32
+    total_q,
+    topk,
+    num_kv_heads,
+    max_blocks,
+    stride_tk_h,
+    stride_tk_q,
+    stride_tk_s,
+    stride_bt_b,
+    stride_bt_m,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    kh = pid // total_q
+    q = pid % total_q
+    batch_id = tl.load(q_batch_ptr + q)
+    batch_start = tl.load(cu_seqlens_ptr + batch_id)
+    prefix = tl.load(prefix_lens_ptr + batch_id)
+    q_abs = prefix + (q - batch_start)  # absolute query position
+    # Scatter each valid slot. A serial loop over topk keeps the atomic cursor
+    # bumps correct (vectorized atomics to the same row would race on offset).
+    for t in range(topk):
+        block = tl.load(topk_idx_ptr + kh * stride_tk_h + q * stride_tk_q + t * stride_tk_s)
+        if block >= 0:
+            page = tl.load(block_table_ptr + batch_id * stride_bt_b + block * stride_bt_m)
+            row = page * num_kv_heads + kh
+            base = tl.load(row_ptr_ptr + row)
+            off = tl.atomic_add(cursor_ptr + row, 1)
+            pos = base + off
+            tl.store(out_q_global_ptr + pos, q)
+            tl.store(out_q_abs_ptr + pos, q_abs)
+            tl.store(out_kv_block_ptr + pos, block)
+            tl.store(out_slot_ptr + pos, t)
+
+
+@torch.no_grad()
+def build_k2q_csr_fused(
+    topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk] int, -1 == unused
+    cu_seqlens_q: torch.Tensor,  # [batch + 1] int32
+    prefix_lens: torch.Tensor,  # [batch] int32
+    block_table: torch.Tensor,  # [batch, max_blocks] int32
+    num_pages: int,
+):
+    """GPU-only k2q CSR builder (count + scatter), no host sync.
+
+    Output layout matches ``build_k2q_csr`` EXCEPT entries within a row are in
+    scatter (nondeterministic) order rather than stable (q, slot) order -- the
+    LSE merge is order-independent so the attend/merge result is identical.
+
+    The payload arrays are sized to the dense upper bound
+    ``num_kv_heads * total_q * topk`` so no ``nnz`` readback is needed; the
+    attend kernel only reads within ``row_ptr`` bounds, so the unused tail is
+    never touched. ``nnz`` is returned as a device tensor (``nnz_dev``) to keep
+    the build sync-free; it is not required by the attend/merge path.
+    """
+    num_kv_heads, total_q, topk = topk_idx.shape
+    device = topk_idx.device
+    num_rows = num_pages * num_kv_heads
+    max_blocks = block_table.shape[1]
+    nnz_cap = num_kv_heads * total_q * topk
+
+    # query -> batch via searchsorted: q_batch[i] = #{b : cu[b+1] <= i}. This
+    # has a FIXED output size (total_q) unlike repeat_interleave (whose output
+    # size depends on the cu values and forces a device sync), so the whole
+    # build is CUDA-graph capturable.
+    cu = cu_seqlens_q.to(torch.int32)
+    pf = prefix_lens.to(torch.int32)
+    q_ids = torch.arange(total_q, device=device, dtype=torch.int32)
+    q_batch = torch.searchsorted(cu[1:].contiguous(), q_ids, right=True).to(torch.int32)
+
+    ti = topk_idx.contiguous()
+    bt = block_table.to(torch.int32).contiguous()
+    block_t = triton.next_power_of_2(topk)
+    grid = (num_kv_heads * total_q,)
+
+    # pass 1: count entries per physical-page row.
+    row_counts = torch.zeros(num_rows, device=device, dtype=torch.int32)
+    _k2q_count_kernel[grid](
+        ti, bt, q_batch, row_counts,
+        total_q, topk, num_kv_heads, max_blocks,
+        ti.stride(0), ti.stride(1), ti.stride(2),
+        bt.stride(0), bt.stride(1),
+        BLOCK_SIZE_T=block_t,
+    )
+
+    # row_ptr = [0, cumsum(row_counts)]  (single device cumsum, no readback).
+    row_ptr = torch.zeros(num_rows + 1, device=device, dtype=torch.int32)
+    row_ptr[1:] = torch.cumsum(row_counts, 0, dtype=torch.int32)
+
+    # pass 2: scatter payloads into each row's slice.
+    cursor = torch.zeros(num_rows, device=device, dtype=torch.int32)
+    out_q_global = torch.empty(nnz_cap, device=device, dtype=torch.int32)
+    out_q_abs = torch.empty(nnz_cap, device=device, dtype=torch.int32)
+    out_kv_block = torch.empty(nnz_cap, device=device, dtype=torch.int32)
+    out_slot = torch.empty(nnz_cap, device=device, dtype=torch.int32)
+    _k2q_scatter_kernel[grid](
+        ti, bt, q_batch, cu, pf, row_ptr, cursor,
+        out_q_global, out_q_abs, out_kv_block, out_slot,
+        total_q, topk, num_kv_heads, max_blocks,
+        ti.stride(0), ti.stride(1), ti.stride(2),
+        bt.stride(0), bt.stride(1),
+        BLOCK_SIZE_T=block_t,
+    )
+
+    return {
+        "row_ptr": row_ptr,
+        "q_global": out_q_global,
+        "q_abs": out_q_abs,
+        "kv_block": out_kv_block,
+        "slot": out_slot,
+        "q_batch": q_batch,
+        "num_rows": num_rows,
+        "num_pages": num_pages,
+        "num_kv_heads": num_kv_heads,
+        "nnz_cap": nnz_cap,
+    }
+
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Host-side k2q CSR builder (q2k -> k2q), the analog of MiniMax build_k2q_csr.
 # ---------------------------------------------------------------------------
@@ -2399,30 +2587,31 @@ def build_k2q_csr(
     device = topk_idx.device
     num_rows = num_pages * num_kv_heads
 
-    # Per-query absolute position and batch id.
+    # Per-query absolute position and batch id, fully vectorized (no host loop
+    # or per-batch .item() sync -- that construction cost dominated at small
+    # query_len, dwarfing the attend/merge kernels themselves).
     batch = cu_seqlens_q.numel() - 1
-    q_abs_all = torch.empty(total_q, device=device, dtype=torch.int64)
-    q_batch_all = torch.empty(total_q, device=device, dtype=torch.int64)
     cu = cu_seqlens_q.to(torch.int64)
     pf = prefix_lens.to(torch.int64)
-    for b in range(batch):
-        s = int(cu[b].item())
-        e = int(cu[b + 1].item())
-        if e > s:
-            q_abs_all[s:e] = pf[b] + torch.arange(e - s, device=device, dtype=torch.int64)
-            q_batch_all[s:e] = b
+    counts = cu[1:] - cu[:-1]  # queries per batch [batch]
+    q_batch_all = torch.repeat_interleave(
+        torch.arange(batch, device=device, dtype=torch.int64), counts
+    )  # [total_q]
+    # within-batch local query index = global id - batch start
+    q_local = torch.arange(total_q, device=device, dtype=torch.int64) - cu[q_batch_all]
+    q_abs_all = pf[q_batch_all] + q_local
 
     ti = topk_idx.to(torch.int64)
-    kh = torch.arange(num_kv_heads, device=device).view(num_kv_heads, 1, 1)
-    qg = torch.arange(total_q, device=device).view(1, total_q, 1)
-    slot = torch.arange(topk, device=device).view(1, 1, topk)
+    flat_ti = ti.reshape(-1)
 
-    valid = ti >= 0
-    flat_valid = valid.reshape(-1)
-    block = ti.reshape(-1)[flat_valid]
-    kh_e = kh.expand_as(ti).reshape(-1)[flat_valid]
-    q_global = qg.expand_as(ti).reshape(-1)[flat_valid]
-    slot_e = slot.expand_as(ti).reshape(-1)[flat_valid]
+    # Flat layout of topk_idx is [num_kv_heads, total_q, topk]; the (kv_head,
+    # query, slot) of each entry is pure arithmetic on its flat position, so a
+    # single nonzero() + 3 divmods replaces three expand+masked_select passes.
+    flat_pos = (flat_ti >= 0).nonzero(as_tuple=True)[0]  # valid flat indices
+    block = flat_ti[flat_pos]
+    kh_e = flat_pos // (total_q * topk)
+    q_global = (flat_pos // topk) % total_q
+    slot_e = flat_pos % topk
     q_abs_e = q_abs_all[q_global]
     q_batch_e = q_batch_all[q_global]
 
@@ -2431,13 +2620,16 @@ def build_k2q_csr(
     page_e = bt[q_batch_e, block]
     row = page_e * num_kv_heads + kh_e
 
-    # Sort entries by row so each row is contiguous; stable keeps (q, slot) order.
+    # Sort entries by row so each row is contiguous; stable keeps (q, slot)
+    # order. Stack the four per-entry payloads so one index_select reorders all
+    # of them (four separate gathers = four launches otherwise).
     order = torch.argsort(row, stable=True)
     row_s = row[order]
-    q_global_s = q_global[order].to(torch.int32)
-    q_abs_s = q_abs_e[order].to(torch.int32)
-    kv_block_s = block[order].to(torch.int32)
-    slot_s = slot_e[order].to(torch.int32)
+    payload = torch.stack((q_global, q_abs_e, block, slot_e)).index_select(1, order)
+    q_global_s = payload[0].to(torch.int32)
+    q_abs_s = payload[1].to(torch.int32)
+    kv_block_s = payload[2].to(torch.int32)
+    slot_s = payload[3].to(torch.int32)
 
     counts = torch.bincount(row_s, minlength=num_rows)
     row_ptr = torch.zeros(num_rows + 1, device=device, dtype=torch.int32)
@@ -2449,6 +2641,9 @@ def build_k2q_csr(
         "q_abs": q_abs_s.contiguous(),
         "kv_block": kv_block_s.contiguous(),
         "slot": slot_s.contiguous(),
+        # q_batch_all is already materialized here; hand it back so the caller
+        # need not recompute the same repeat_interleave via _q_batch_index.
+        "q_batch": q_batch_all.to(torch.int32),
         "num_rows": num_rows,
         "num_pages": num_pages,
         "num_kv_heads": num_kv_heads,
@@ -2857,7 +3052,7 @@ def _kv_block_attn_ws_kernel(
     partial_lse_ptr,
     sched_row_ptr,
     sched_q_lo_ptr,
-    num_work,
+    num_work_ptr,
     num_kv_heads,
     gqa_group_size,
     head_dim,
@@ -2881,7 +3076,11 @@ def _kv_block_attn_ws_kernel(
     WORKER_WARPS: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    # Static, contiguous partition of the work-tile schedule across CTAs.
+    # num_work arrives as a 1-element device tensor so the host never syncs on
+    # it (required for CUDA-graph capture of the full build+attend+merge path).
+    num_work = tl.load(num_work_ptr)
+    # Static, contiguous partition of the work-tile schedule across CTAs. CTAs
+    # past the work boundary get work_lo >= work_hi and fall straight through.
     per = (num_work + NUM_CTAS - 1) // NUM_CTAS
     work_lo = pid * per
     work_hi = min(work_lo + per, num_work)
@@ -3254,17 +3453,65 @@ def _build_schedule(row_ptr: torch.Tensor, q_tile: int):
     return sched_row.to(torch.int32), sched_q_lo.to(torch.int32)
 
 
+@triton.jit
+def _build_schedule_kernel(
+    row_ptr_ptr,  # [num_rows + 1] int32
+    tile_off_ptr,  # [num_rows + 1] int32  prefix sum of tiles_per_row
+    sched_row_ptr,  # [cap] int32  (over-allocated output)
+    sched_q_lo_ptr,  # [cap] int32
+    num_rows,
+    q_tile: tl.constexpr,
+):
+    r = tl.program_id(0)  # one program per CSR row
+    if r < num_rows:
+        base = tl.load(row_ptr_ptr + r)
+        row_end = tl.load(row_ptr_ptr + r + 1)
+        count = row_end - base
+        n_tiles = (count + q_tile - 1) // q_tile
+        dst = tl.load(tile_off_ptr + r)  # where this row's tiles start
+        for t in range(n_tiles):
+            tl.store(sched_row_ptr + dst + t, r)
+            tl.store(sched_q_lo_ptr + dst + t, base + t * q_tile)
+
+
+@torch.no_grad()
+def _build_schedule_fused(row_ptr: torch.Tensor, q_tile: int, nnz_cap: int):
+    """Sync-free schedule build: device-only, no ``.item()`` readback.
+
+    The work-tile count has the host-known dense upper bound
+    ``num_rows + nnz_cap // q_tile`` (each row contributes at most
+    ``ceil(count/q_tile) <= count/q_tile + 1`` tiles). Allocating the sched
+    arrays to that cap lets the whole build stay on the GPU; ``num_work`` is
+    returned as a device scalar tensor so no CPU sync is forced. The ws attend
+    kernel reads ``num_work`` in-kernel and only touches valid tiles, so the
+    over-allocated tail is never used. Keeping this sync-free is what lets the
+    full prefill be captured in one CUDA graph.
+    """
+    device = row_ptr.device
+    num_rows = row_ptr.numel() - 1
+    counts = row_ptr[1:] - row_ptr[:-1]
+    tiles_per_row = (counts + (q_tile - 1)) // q_tile  # int32
+    tile_off = torch.zeros(num_rows + 1, device=device, dtype=torch.int32)
+    tile_off[1:] = torch.cumsum(tiles_per_row, 0, dtype=torch.int32)
+    num_work = tile_off[num_rows:]  # device scalar view [1], == total tiles
+
+    cap = num_rows + nnz_cap // q_tile + 1
+    sched_row = torch.zeros(cap, device=device, dtype=torch.int32)
+    sched_q_lo = torch.zeros(cap, device=device, dtype=torch.int32)
+    _build_schedule_kernel[(num_rows,)](
+        row_ptr, tile_off, sched_row, sched_q_lo, num_rows, q_tile=q_tile
+    )
+    return sched_row, sched_q_lo, num_work
+
+
 def _q_batch_index(cu_seqlens_q: torch.Tensor, total_q: int) -> torch.Tensor:
-    """Map each global query id to its batch index."""
+    """Map each global query id to its batch index (vectorized, no host sync)."""
     batch = cu_seqlens_q.numel() - 1
-    out = torch.empty(total_q, device=cu_seqlens_q.device, dtype=torch.int32)
     cu = cu_seqlens_q.to(torch.int64)
-    for b in range(batch):
-        s = int(cu[b].item())
-        e = int(cu[b + 1].item())
-        if e > s:
-            out[s:e] = b
-    return out
+    counts = cu[1:] - cu[:-1]
+    return torch.repeat_interleave(
+        torch.arange(batch, device=cu_seqlens_q.device, dtype=torch.int32), counts
+    )
 
 
 @torch.no_grad()
@@ -3289,6 +3536,7 @@ def _minimax_m3_sparse_attn_kv_outer(
     capacity: int = 2,
     num_ctas: int | None = None,
     maxnreg: int | None = 128,
+    use_fused_csr: bool = True,
 ):
     """KV-outer BF16 block-sparse prefill (block_size_q == 1).
 
@@ -3307,8 +3555,15 @@ def _minimax_m3_sparse_attn_kv_outer(
     if kv_cache.dtype != torch.bfloat16:
         raise NotImplementedError("kv-outer v1 supports BF16 prefill only")
     if kernel is None:
+        # Both "tle" and "ws" are TLE kernels; "tle" is single-stage (KV staged
+        # once per work-tile), "ws" adds a producer/consumer ring buffer. ncu
+        # shows the ring buffer costs 64KB extra SMEM + more registers, pinning
+        # occupancy at 2 block/SM (SM throughput 27%), while single-stage TLE
+        # runs at 49KB/72reg -> 4-7 block/SM, 52% throughput, ~1.7x faster. The
+        # ring never pays off because kv-outer work-tiles are tiny (one KV page
+        # per program, nothing to pipeline across). So default to single-stage.
         if use_tle is None:
-            kernel = "ws" if tle is not None else "plain"
+            kernel = "tle" if tle is not None else "plain"
         else:
             kernel = "tle" if use_tle else "plain"
     if kernel in ("ws", "tle") and tle is None:
@@ -3316,9 +3571,11 @@ def _minimax_m3_sparse_attn_kv_outer(
     use_tle = kernel in ("ws", "tle")
     if q_tile is None:
         # TLE stages Q [Q_TILE*H, D] and P [K, Q_TILE*H] in SMEM; Q_TILE*H is the
-        # WGMMA N and must be >= 16. q_tile 4 (N=64 at group 16) is the measured
-        # sweet spot -- larger tiles blow up SMEM/registers and cut occupancy.
-        # The plain-Triton reference has no SMEM ceiling and prefers a wider tile.
+        # WGMMA N and must be >= 16. ncu q_tile sweep (single-stage TLE, seq16384)
+        # measured q_tile=4 as the optimum for BOTH group 8 (N=32, 1575us) and
+        # group 16 (N=64, 2385us): q_tile 2 underfills the MMA, q_tile>=8 inflates
+        # SMEM/registers and regresses. The plain-Triton reference has no SMEM
+        # ceiling and prefers a wider tile.
         q_tile = 4 if use_tle else 32
     total_q, num_heads, head_dim = q.shape
     topk = topk_idx.shape[-1]
@@ -3327,8 +3584,13 @@ def _minimax_m3_sparse_attn_kv_outer(
 
     num_pages = kv_cache.shape[0]
     if csr is None:
-        csr = build_k2q_csr(topk_idx, cu_seqlens_q, prefix_lens, block_table, num_pages)
-    q_batch = _q_batch_index(cu_seqlens_q, total_q)
+        builder = build_k2q_csr_fused if use_fused_csr else build_k2q_csr
+        csr = builder(topk_idx, cu_seqlens_q, prefix_lens, block_table, num_pages)
+    # build_k2q_csr already computes the per-query batch index; reuse it to avoid
+    # a redundant repeat_interleave launch (q_batch missing on older prebuilt csr).
+    q_batch = csr.get("q_batch")
+    if q_batch is None:
+        q_batch = _q_batch_index(cu_seqlens_q, total_q)
 
     block_size_d = triton.next_power_of_2(head_dim)
     block_size_h = triton.next_power_of_2(gqa_group_size)
@@ -3346,10 +3608,23 @@ def _minimax_m3_sparse_attn_kv_outer(
     # Flattened work-tile schedule: each (row, q_tile) chunk that actually has
     # queries becomes one program. This balances long/short rows and avoids the
     # empty-program waste of a static 2-D grid (the CuTe scheduler's role).
-    sched_row, sched_q_lo = _build_schedule(csr["row_ptr"], q_tile)
-    num_work = sched_row.numel()
+    #
+    # The ws kernel partitions work statically across a fixed CTA grid and reads
+    # num_work in-kernel, so it uses the sync-free fused schedule (device scalar
+    # num_work, over-allocated arrays) -- no .item(). The tle/plain paths launch
+    # a grid of num_work programs and need the host count, so they keep the
+    # host schedule builder.
+    if kernel == "ws" and "nnz_cap" in csr:
+        sched_row, sched_q_lo, num_work_dev = _build_schedule_fused(
+            csr["row_ptr"], q_tile, csr["nnz_cap"]
+        )
+        num_work = None  # deferred to device; do not sync
+    else:
+        sched_row, sched_q_lo = _build_schedule(csr["row_ptr"], q_tile)
+        num_work = sched_row.numel()
+        num_work_dev = torch.tensor([num_work], device=q.device, dtype=torch.int32)
 
-    grid = (max(1, num_work),)
+    grid = (max(1, num_work if num_work is not None else 1),)
     if kernel == "ws":
         from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -3363,7 +3638,9 @@ def _minimax_m3_sparse_attn_kv_outer(
         )
         if num_ctas is None:
             num_ctas = 2 * torch.cuda.get_device_properties(q.device).multi_processor_count
-        num_ctas = max(1, min(num_ctas, num_work)) if num_work else 1
+        # Launch a fixed CTA grid; CTAs beyond the work boundary exit early.
+        # Capping at num_work would force a host sync, defeating graph capture.
+        num_ctas = max(1, num_ctas)
         ws_grid = (num_ctas,)
         _kv_block_attn_ws_kernel[ws_grid](
             q,
@@ -3380,7 +3657,7 @@ def _minimax_m3_sparse_attn_kv_outer(
             partial_lse,
             sched_row,
             sched_q_lo,
-            num_work,
+            num_work_dev,
             num_kv_heads,
             gqa_group_size,
             head_dim,
