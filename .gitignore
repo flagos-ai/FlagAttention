@@ -135,3 +135,6 @@ venv.bak/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Optional Ascend MLA implementation; kept locally for reference only.
+src/flag_attn/runtime/backend/_ascend/flash_mla/

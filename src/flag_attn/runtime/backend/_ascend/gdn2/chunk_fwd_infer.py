@@ -870,6 +870,13 @@ def chunk_gdn2_fwd_infer(
     """
     if cp_context is not None:
         raise NotImplementedError("chunk_gdn2_fwd_infer currently does not support context parallelism.")
+    tensors = (q, k, v, g, b, w)
+    if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise TypeError("q, k, v, g, b, and w must be torch.Tensor instances")
+    if q.device.type != "npu":
+        raise ValueError("Ascend GDN2 requires NPU tensors")
+    if any(tensor.device != q.device for tensor in tensors):
+        raise ValueError("q, k, v, g, b, and w must use the same NPU device")
     if disable_recompute:
         # Kept for signature compatibility; inference does not use recompute.
         pass

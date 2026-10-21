@@ -1,0 +1,8 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+# Correctness-first candidate from the locked upstream NVIDIA configuration.
+# This is not an Ascend performance tuning claim; validate on 910B.
+chunk_fwd_kernel_h:
+  - META: {BK: 32, BV: 32}
+    num_warps: 4
+    num_stages: 3
