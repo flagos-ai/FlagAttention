@@ -38,7 +38,6 @@ from flag_attn.testing import backend as test_backend
 from flag_attn.hpc_ops_attention.decode.dynamic.bf16_dynamic import (  # noqa: E402
     DynamicBF16Inputs,
     bf16_dynamic_workspace_is_reset,
-    prepare_dynamic_bf16_workspace,
 )
 from flag_attn.hpc_ops_attention.decode import HAS_TLE  # noqa: E402
 from flag_attn.hpc_ops_attention.decode.static.bf16_static import (  # noqa: E402
@@ -46,9 +45,8 @@ from flag_attn.hpc_ops_attention.decode.static.bf16_static import (  # noqa: E40
     HEAD_DIM,
     OFFICIAL_CASES,
     StaticBF16Inputs,
-    prepare_static_bf16_workspace,
 )
-from flag_attn import hy3_attention
+from flag_attn import hy3_attention, hy3_attention_prepare
 
 
 # Fixed pytest benchmark matrix.  Use pytest node IDs or ``-k`` to select a
@@ -351,7 +349,7 @@ def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
         inputs = StaticBF16Inputs(
             panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens, layout,
         )
-        workspace = prepare_static_bf16_workspace(inputs)
+        workspace = hy3_attention_prepare(inputs, variant="bf16_static")
         cuda_task_map = None
         cuda_call = (
             None if hpc is None else lambda: hpc.attention_decode_bf16(
@@ -365,7 +363,7 @@ def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
         inputs = DynamicBF16Inputs(
             panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens, layout,
         )
-        workspace = prepare_dynamic_bf16_workspace(inputs)
+        workspace = hy3_attention_prepare(inputs, variant="bf16_dynamic")
         if HAS_TLE:
             assert getattr(workspace, "mtp", None) == mtp
             assert getattr(workspace, "route", "")
@@ -394,7 +392,8 @@ def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
             torch.testing.assert_close(expected, reference, atol=0.016, rtol=1e-5)
             torch.testing.assert_close(actual, expected, atol=0.032, rtol=1e-5)
         if method == "dynamic":
-            assert bf16_dynamic_workspace_is_reset(workspace)
+            assert (workspace.is_reset() if hasattr(workspace, "is_reset")
+                    else bf16_dynamic_workspace_is_reset(workspace))
 
     calls = {"triton+tle": tle_call}
     if cuda_call is not None:

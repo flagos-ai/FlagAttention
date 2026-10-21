@@ -34,7 +34,7 @@ except (ImportError, AttributeError):
 else:
     HAS_TLE = True
 
-USE_TLE = HAS_TLE
+USE_TLE = HAS_TLE and hasattr(tle, "device_mesh")
 
 
 @dataclass
