@@ -1,0 +1,28 @@
+{
+  "chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel": [
+    {"META": {"BK": 64}, "num_warps": 8, "num_stages": 4},
+    {"META": {"BK": 32}, "num_warps": 2, "num_stages": 3},
+    {"META": {"BK": 64}, "num_warps": 2, "num_stages": 4},
+    {"META": {"BK": 128}, "num_warps": 2, "num_stages": 3},
+    {"META": {"BK": 64}, "num_warps": 8, "num_stages": 3}
+  ],
+  "recompute_w_u_fwd_kernel": [
+    {"META": {}, "num_warps": 8, "num_stages": 2},
+    {"META": {}, "num_warps": 2, "num_stages": 3},
+    {"META": {}, "num_warps": 2, "num_stages": 2}
+  ],
+  "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": [
+    {"META": {"BV": 32}, "num_warps": 4, "num_stages": 3},
+    {"META": {"BV": 32}, "num_warps": 4, "num_stages": 2},
+    {"META": {"BV": 64}, "num_warps": 4, "num_stages": 2},
+    {"META": {"BV": 32}, "num_warps": 2, "num_stages": 2}
+  ],
+  "chunk_fwd_kernel_o": [
+    {"META": {"BK": 64, "BV": 64}, "num_warps": 8, "num_stages": 3},
+    {"META": {"BK": 64, "BV": 64}, "num_warps": 2, "num_stages": 4},
+    {"META": {"BK": 128, "BV": 128}, "num_warps": 4, "num_stages": 3},
+    {"META": {"BK": 128, "BV": 128}, "num_warps": 4, "num_stages": 2},
+    {"META": {"BK": 64, "BV": 128}, "num_warps": 8, "num_stages": 3},
+    {"META": {"BK": 64, "BV": 64}, "num_warps": 2, "num_stages": 2}
+  ]
+}
