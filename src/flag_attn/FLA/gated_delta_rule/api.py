@@ -1045,6 +1045,44 @@ def chunk_gated_delta_rule(
         q_seq = _l2_normalize_last_dim(q_seq)
         k_seq = _l2_normalize_last_dim(k_seq)
 
+    # Keep the recurrent dependency chain within one compute worker. Independent
+    # producers prefetch inputs through pipes; no intermediate storage is aliased.
+    if (
+        HAS_TLE_CHUNK_GATED_DELTA_RULE
+        and hasattr(tle, "pipe")
+        and os.environ.get("FLAG_ATTN_CHUNK_GDR_FUSED_TLE", "1").lower() not in {"0", "false", "off", "no"}
+        and _can_use_tle_chunk_gated_delta_rule(
+            q_seq,
+            k_seq,
+            v_seq,
+            beta_seq,
+            g_seq,
+            initial_state,
+            output_final_state,
+            cu_seqlens,
+        )
+        and torch.cuda.get_device_capability(q_seq.device)[0] == 9
+    ):
+        from flag_attn.FLA.gated_delta_rule.chunk_fused_tle import (
+            _tle_chunk_gated_delta_rule_fwd as fused_tle_fwd,
+        )
+
+        q_tle, k_tle, v_tle, beta_tle, g_tle = map(_direct_contiguous, (q_seq, k_seq, v_seq, beta_seq, g_seq))
+        _set_tle_descriptor_allocator(q_tle.device)
+        from flag_attn.FLA.gated_delta_rule.chunk_fused_tle_prepare import prepare_fused_tle_inputs
+
+        g_cumsum, a = prepare_fused_tle_inputs(k_tle, g_tle, beta_tle)
+        o, final_state = fused_tle_fwd(
+            q_tle,
+            k_tle,
+            v_tle,
+            g_cumsum,
+            beta_tle,
+            a,
+            scale=float(scale),
+        )
+        return (o.transpose(1, 2) if head_first else o), final_state
+
     use_two_kernel_fused_forward = can_use_two_kernel_fused_forward(
         q=q_seq,
         k=k_seq,
