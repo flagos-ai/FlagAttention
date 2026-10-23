@@ -19,7 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.gated_delta_rule.compat import has_triton_tle
+from flag_attn.runtime.backend._hygon.utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
     try:

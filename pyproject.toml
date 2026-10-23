@@ -69,6 +69,7 @@ namespaces = false
 addopts = "--import-mode=importlib"
 testpaths = [
     "tests",
+    "benchmark",
 ]
 
 pythonpath = [

@@ -52,13 +52,6 @@ FP8_ATOL = 6e-2
 FP8_RTOL = 8e-2
 
 
-def _supports_fp8() -> bool:
-    if FP8_DTYPE is None or not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")):
-        return False
-    # NVIDIA FP8 Tensor Core support starts with Ada (8.9) and Hopper (9.0).
-    return not test_backend.is_nvidia() or test_backend.cuda_capability() >= (8, 9)
-
-
 pytestmark = pytest.mark.skipif(
     not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")), reason="requires an available accelerator"
 )
@@ -142,7 +135,7 @@ def make_data(
 ) -> MSAData:
     if mode not in {"bf16", "fp8_index", "fp8_kv", "fp8_full"}:
         raise ValueError(f"unsupported mode: {mode}")
-    if mode != "bf16" and not _supports_fp8():
+    if mode != "bf16" and not test_backend.supports_msa_fp8():
         pytest.skip("FP8 tests require accelerator FP8 support")
     if not seq_lens or any(length <= 0 for length in seq_lens):
         raise ValueError("seq_lens must contain positive lengths")
@@ -685,7 +678,7 @@ def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
 
 
 @pytest.mark.skipif(
-    not index_topk_module._HAS_TLE_RADIX,
+    not getattr(index_topk_module, "_HAS_TLE_RADIX", False),
     reason="requires a backend with TLE radix top-k support",
 )
 @pytest.mark.minimax_m3_sparse_attn
@@ -890,7 +883,7 @@ def test_decode_topk_identity_out_and_score_out_bf16() -> None:
 
 
 @pytest.mark.skipif(
-    not _supports_fp8(),
+    not test_backend.supports_msa_fp8(),
     reason="FP8 tests require accelerator FP8 support",
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
@@ -902,7 +895,7 @@ def test_prefill_fp8(mode: str, case: tuple) -> None:
 
 
 @pytest.mark.skipif(
-    not _supports_fp8(),
+    not test_backend.supports_msa_fp8(),
     reason="FP8 tests require accelerator FP8 support",
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
