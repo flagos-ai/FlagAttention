@@ -65,6 +65,11 @@ include = [
 ]
 namespaces = false
 
+[tool.setuptools.package-data]
+"flag_attn.runtime.backend._nvidia" = [
+    "tune_configs_gdn2.yaml",
+]
+
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
 testpaths = [

@@ -1,6 +1,9 @@
 # Server-local baselines and speedup measurements
 /BaselineBenchmark/
 
+# Local GDN2 tuning notes
+/src/flag_attn/runtime/backend/_nvidia/tune_configs_gdn2.md
+
 # results of benchmark
 benchmark/results*/
 playground/

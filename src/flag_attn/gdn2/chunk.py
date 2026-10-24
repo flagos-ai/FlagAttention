@@ -12,6 +12,8 @@ otherwise Triton.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -20,6 +22,7 @@ import triton.language as tl
 # 此仓库的pre index的入口参数没有BT，不支持varlen
 from flag_attn.utils import has_triton_tle
 from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
+from flag_attn.runtime.configs_loader import TunedConfigLoader
 
 from .native.chunk_fwd import chunk_gdn2_fwd
 from .triton_ops_helper import autotune_cache_kwargs, exp2
@@ -44,6 +47,12 @@ __all__ = ["chunk_gdn2"]
 
 K1_TLE_MAXNREG_CANDIDATES = (64, 72, 96)
 K1_TLE_SMEM_REUSE_MIN_K = 256
+
+_gdn2_config_loader = TunedConfigLoader(
+    config_filename=os.environ.get(
+        "FLAG_ATTN_GDN2_TUNE_CONFIG", "tune_configs_gdn2.yaml"
+    )
+)
 
 
 def _generate_constraints(num_pack):
@@ -531,7 +540,7 @@ if HAS_TLE_GDN2:
         Aqk = torch.empty(B, T_len, H, BT, device=q.device, dtype=q.dtype)
         Akk = torch.empty(B, T_len, H, BT, device=q.device, dtype=q.dtype)
 
-        _chunk_gdn2_fwd_intra_infer_kernel[grid](
+        launch_arguments = dict(
             q=q,
             k=k,
             v=v,
@@ -560,6 +569,12 @@ if HAS_TLE_GDN2:
             V=V,
             BT=BT,
         )
+        kernel = _gdn2_config_loader.get_workload_kernel(
+            "_chunk_gdn2_fwd_intra_infer_kernel",
+            _chunk_gdn2_fwd_intra_infer_kernel,
+            launch_arguments,
+        )
+        kernel[grid](**launch_arguments)
         return w_wy, u_wy, qg, kg, Aqk, Akk, g_out
 
     # =============================================================================
@@ -1322,7 +1337,7 @@ if HAS_TLE_GDN2:
         def grid(meta):
             return (triton.cdiv(V, meta["BV"]), N * H)
 
-        _chunk_gdn2_fwd_h_o_infer_kernel[grid](
+        launch_arguments = dict(
             kg=kg,
             w_wy=w_wy,
             u_wy=u_wy,
@@ -1343,6 +1358,12 @@ if HAS_TLE_GDN2:
             BT=BT,
             STATE_V_FIRST=state_v_first,
         )
+        kernel = _gdn2_config_loader.get_workload_kernel(
+            "_chunk_gdn2_fwd_h_o_infer_kernel",
+            _chunk_gdn2_fwd_h_o_infer_kernel,
+            launch_arguments,
+        )
+        kernel[grid](**launch_arguments)
 
         if return_intermediate_states:
             return o, final_state, h
