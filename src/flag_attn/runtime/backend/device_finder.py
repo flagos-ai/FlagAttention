@@ -27,6 +27,7 @@ _VENDOR_DEVICES = {
     "hygon": "cuda",
     "iluvatar": "cuda",
     "metax": "cuda",
+    "thead": "cuda",
     "enflame": "gcu",
     "ascend": "npu",
     "cambricon": "mlu",
@@ -73,6 +74,7 @@ def _cuda_vendor() -> str:
         ("metax", ("metax", "曦云")),
         ("hygon", ("hygon", "dcu")),
         ("iluvatar", ("iluvatar", "天数")),
+        ("thead", ("ppu", "thead", "t-head", "zw810", "alixpu")),
     ):
         if any(token in name for token in names):
             return vendor
