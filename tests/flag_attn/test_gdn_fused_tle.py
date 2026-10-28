@@ -4,6 +4,8 @@ import torch
 from flag_attn.FLA.gated_delta_rule import chunk_gated_delta_rule
 from flag_attn.utils import has_triton_tle
 
+pytestmark = [pytest.mark.gdn_forward, pytest.mark.chunk_gated_delta_rule]
+
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not has_triton_tle(3, 6, 0), reason="requires CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
