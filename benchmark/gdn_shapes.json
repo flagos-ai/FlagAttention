@@ -1,0 +1,333 @@
+{
+  "version": 2,
+  "status": "frozen_static_suite_pending_runtime_route_audit",
+  "created_date": "2026-10-27",
+  "target": {
+    "repository": "flagos-ai/FlagAttention",
+    "gpu": "NVIDIA H100",
+    "scope": "unified forward inference: chunk prefill, indexed recurrent/MTP, fused-gate packed decode",
+    "operators": [
+      "chunk_gated_delta_rule_fwd",
+      "fused_recurrent_gated_delta_rule_fwd",
+      "fused_recurrent_gated_delta_rule_packed_decode"
+    ]
+  },
+  "sources": [
+    {
+      "id": "qwen_next",
+      "url": "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json",
+      "global_key_heads": 16,
+      "global_value_heads": 32,
+      "key_dim": 128,
+      "value_dim": 128
+    },
+    {
+      "id": "qwen36_35b",
+      "url": "https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/main/config.json",
+      "global_key_heads": 16,
+      "global_value_heads": 32,
+      "key_dim": 128,
+      "value_dim": 128
+    },
+    {
+      "id": "qwen35_9b",
+      "url": "https://huggingface.co/Qwen/Qwen3.5-9B/blob/main/config.json",
+      "global_key_heads": 16,
+      "global_value_heads": 32,
+      "key_dim": 128,
+      "value_dim": 128
+    },
+    {
+      "id": "qwen35_27b",
+      "url": "https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/config.json",
+      "global_key_heads": 16,
+      "global_value_heads": 48,
+      "key_dim": 128,
+      "value_dim": 128
+    },
+    {
+      "id": "qwen35_397b",
+      "url": "https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/main/config.json",
+      "global_key_heads": 16,
+      "global_value_heads": 64,
+      "key_dim": 128,
+      "value_dim": 128
+    },
+    {
+      "id": "flashinfer_harness",
+      "url": "https://github.com/flashinfer-ai/flashinfer/blob/07cc0d60a9ba1aca87b7b803ab1810ca5e3738d6/benchmarks/bench_gdn_decode.py",
+      "role": "shape and harness reference; adapt gate/state semantics"
+    }
+  ],
+  "presets": [
+    {
+      "id": "g2_tp1",
+      "source": "qwen35_9b",
+      "tp": 1,
+      "H": 16,
+      "HV": 32
+    },
+    {
+      "id": "g2_tp2",
+      "source": "qwen36_35b",
+      "tp": 2,
+      "H": 8,
+      "HV": 16
+    },
+    {
+      "id": "g2_tp4",
+      "source": "qwen_next",
+      "tp": 4,
+      "H": 4,
+      "HV": 8
+    },
+    {
+      "id": "g2_tp8",
+      "source": "qwen_next",
+      "tp": 8,
+      "H": 2,
+      "HV": 4
+    },
+    {
+      "id": "g3_tp1",
+      "source": "qwen35_27b",
+      "tp": 1,
+      "H": 16,
+      "HV": 48
+    },
+    {
+      "id": "g3_tp2",
+      "source": "qwen35_27b",
+      "tp": 2,
+      "H": 8,
+      "HV": 24
+    },
+    {
+      "id": "g3_tp4",
+      "source": "qwen35_27b",
+      "tp": 4,
+      "H": 4,
+      "HV": 12
+    },
+    {
+      "id": "g4_tp4",
+      "source": "qwen35_397b",
+      "tp": 4,
+      "H": 4,
+      "HV": 16
+    },
+    {
+      "id": "g4_tp8",
+      "source": "qwen35_397b",
+      "tp": 8,
+      "H": 2,
+      "HV": 8
+    }
+  ],
+  "common": {
+    "K": 128,
+    "V": 128,
+    "qkv_dtype": "bfloat16",
+    "state_dtype": "float32",
+    "state_layout": "V_K",
+    "initial_state": "nonzero",
+    "qk_l2norm": true,
+    "scale": "1/sqrt(K)",
+    "g_beta": "precomputed outside recurrent timing; match pinned vLLM gate dtypes and formulas",
+    "input_layout": "actual post-convolution split QKV views from pinned model path",
+    "state_pool": "distinct valid request slots, noncontiguous permutation, capacity at least max(1024, required slots plus reserved slots)",
+    "padding": "primary suite all valid; graph padding in regression suite"
+  },
+  "suites": {
+    "ordinary_decode": {
+      "priority": 0,
+      "presets": "all",
+      "request_counts": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256
+      ],
+      "tokens_per_request": [
+        1
+      ],
+      "state_semantics": "load historical cache; write updated state and output; preserve unrelated slots",
+      "shape_count": 81
+    },
+    "speculative_decode": {
+      "priority": 1,
+      "presets": "all",
+      "request_counts": [
+        1,
+        4,
+        16,
+        64,
+        128
+      ],
+      "tokens_per_request": [
+        2,
+        3,
+        4,
+        8
+      ],
+      "state_semantics": "select prior state using accepted-token metadata and preserve all per-token snapshots required by target ABI",
+      "shape_count": 180
+    },
+    "batch_extensions": {
+      "priority": 2,
+      "presets": "all",
+      "request_counts": [
+        24,
+        48,
+        96,
+        192,
+        512
+      ],
+      "tokens_per_request": [
+        1
+      ],
+      "include_in_primary_geomean": false
+    },
+    "regression": {
+      "priority": 2,
+      "cases": [
+        "per-request lengths 1/2/3/4/8 mixed",
+        "L=16",
+        "graph padded slots with -1 and reserved 0 according to pinned ABI",
+        "different accepted-token counts including supported boundaries",
+        "contiguous QKV versus actual strided QKV",
+        "unmodified cache slots checked with sentinels",
+        "multiple consecutive calls and one-shot versus stepwise outputs/states",
+        "float16 inputs and bfloat16 state where supported",
+        "G3 TP8: H=2 HV=6",
+        "K/V=64 or 256 and K!=V where public API promises support"
+      ],
+      "include_in_primary_geomean": false
+    }
+  },
+  "measurement": {
+    "providers": [
+      "pinned vLLM target recurrent kernel",
+      "FlagAttention candidate",
+      "FLA on equivalent common semantics only"
+    ],
+    "separate_measurements": [
+      "preallocated device pipeline",
+      "complete public call",
+      "CUDA graph replay",
+      "non-graph execution"
+    ],
+    "cache_regimes": "report warm and cold separately; do not assert either is a measured production distribution",
+    "rounds": 7,
+    "do_bench_warmup_ms": 1000,
+    "do_bench_rep_ms": 100,
+    "state_mutation": "identical starting states for correctness; audit replay/tuner mutation and use same explicit state lifecycle for each provider",
+    "precision": "preserve target state precision; do not lower precision for speed"
+  },
+  "reporting": {
+    "primary": "ordinary decode and speculative decode reported separately, grouped by model-head ratio and TP; show each latency and worst regression",
+    "no_unmeasured_probability_weights": true,
+    "trace_weighted_speedup": "sum(count_i * baseline_latency_i) / sum(count_i * candidate_latency_i)",
+    "trace_fields": [
+      "actual selected kernel/provider",
+      "N_active",
+      "N_capture",
+      "tokens_per_request histogram",
+      "H",
+      "HV",
+      "K",
+      "V",
+      "tensor dtypes/strides",
+      "padding fraction",
+      "state store mode"
+    ],
+    "trace_note": "Static source proves model geometry, not deployment market share or runtime frequency. Representative service traces determine probabilities and call coverage."
+  },
+  "preconditions": [
+    "pin model config revisions and library commits before runs",
+    "verify each chosen deployment's TP sharding and model dtype/quantization feasibility separately from per-rank kernel microbenchmark",
+    "audit whether target operator is actually called; separately fused/packed paths must not be attributed to pure recurrent speedups",
+    "all correctness assertions pass before timing",
+    "freeze and checksum expanded case list before tuning; append cases rather than remove regressions"
+  ],
+  "updated_date": "2026-10-28",
+  "prefill": {
+    "model_geometry": {
+      "batch_sequence_pairs": [
+        [
+          1,
+          512
+        ],
+        [
+          1,
+          2048
+        ],
+        [
+          4,
+          2048
+        ],
+        [
+          1,
+          8192
+        ]
+      ],
+      "presets": "all"
+    },
+    "historical_shapes": [
+      [
+        1,
+        8192,
+        96,
+        96,
+        128,
+        128
+      ],
+      [
+        2,
+        16384,
+        16,
+        16,
+        128,
+        128
+      ],
+      [
+        4,
+        2048,
+        16,
+        16,
+        128,
+        128
+      ],
+      [
+        4,
+        4096,
+        64,
+        64,
+        128,
+        128
+      ],
+      [
+        8,
+        1024,
+        8,
+        8,
+        64,
+        64
+      ],
+      [
+        8,
+        2048,
+        32,
+        32,
+        256,
+        256
+      ]
+    ],
+    "notes": "No production-frequency weighting. Include short/small-head and dimension fallback cases; fast path requires existing Hopper guard."
+  }
+}

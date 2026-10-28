@@ -14,14 +14,13 @@
 
 """Gated delta rule speedup benchmark against the FLA implementation."""
 
-
 import os
+import json
 from contextlib import contextmanager, nullcontext
 from typing import Callable
 
 import pytest
 import torch
-import triton
 
 try:
     from benchmark.recording import BenchmarkRecorder
@@ -70,9 +69,7 @@ def _cuda_tle_available() -> bool:
 
 def _require_fla_reference():
     if FLA_CHUNK_GDN is None:
-        raise RuntimeError(
-            f"external FLA GDN implementation is unavailable: {FLA_IMPORT_ERROR}"
-        )
+        raise RuntimeError(f"external FLA GDN implementation is unavailable: {FLA_IMPORT_ERROR}")
     return FLA_CHUNK_GDN
 
 
@@ -152,10 +149,7 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
     assert not torch.isnan(actual).any(), f"{name}: NaN detected in actual"
     assert not torch.isnan(expected).any(), f"{name}: NaN detected in baseline"
     ratio = _err_ratio(expected, actual)
-    assert ratio < ASSERT_RATIO, (
-        f"{name} diff: abs={absolute_error:.6f} ratio={ratio:.6f} "
-        f"limit={ASSERT_RATIO}"
-    )
+    assert ratio < ASSERT_RATIO, f"{name} diff: abs={absolute_error:.6f} ratio={ratio:.6f} limit={ASSERT_RATIO}"
 
 
 @torch.inference_mode()
@@ -166,7 +160,9 @@ def _benchmark_case(dtype: torch.dtype, shape: tuple[int, int, int, int, int]):
     fla_ms = None
     if compare_fla:
         expected_o, expected_final_state = _call_fla_reference(inputs)
-        fla_ms = test_backend.do_bench(lambda: _call_fla_reference(inputs), warmup=WARMUP, rep=REPETITIONS, return_mode="median")
+        fla_ms = test_backend.do_bench(
+            lambda: _call_fla_reference(inputs), warmup=WARMUP, rep=REPETITIONS, return_mode="median"
+        )
     with _use_optimized_tle() if _cuda_tle_available() else nullcontext():
         actual_o, actual_final_state = _call_flag_attn(inputs)
         if compare_fla:
@@ -175,7 +171,9 @@ def _benchmark_case(dtype: torch.dtype, shape: tuple[int, int, int, int, int]):
         else:
             assert torch.isfinite(actual_o).all()
             assert torch.isfinite(actual_final_state).all()
-        flag_attn_ms = test_backend.do_bench(lambda: _call_flag_attn(inputs), warmup=WARMUP, rep=REPETITIONS, return_mode="median")
+        flag_attn_ms = test_backend.do_bench(
+            lambda: _call_flag_attn(inputs), warmup=WARMUP, rep=REPETITIONS, return_mode="median"
+        )
     return fla_ms, flag_attn_ms
 
 
@@ -194,10 +192,7 @@ def _speedup(fla_ms: float | None, flag_attn_ms: float):
 def _print_header() -> None:
     print(f"\n{'=' * 92}")
     print("  chunk_gated_delta_rule benchmark — FWD ONLY")
-    print(
-        "  provider: fla_chunk_gated_delta_rule vs "
-        "flag_attn_chunk_gated_delta_rule"
-    )
+    print("  provider: fla_chunk_gated_delta_rule vs flag_attn_chunk_gated_delta_rule")
     print(f"  warmup={WARMUP}ms  rep={REPETITIONS}ms")
     print(f"{'=' * 92}")
     print(
@@ -211,7 +206,9 @@ def _print_row(dtype, shape, fla_ms, flag_attn_ms) -> None:
     baseline = "N/A" if fla_ms is None else f"{fla_ms:.3f}"
     ratio = _speedup(fla_ms, flag_attn_ms)
     speedup = "N/A" if ratio is None else f"{ratio:.2f}x"
-    print(f"{B:>3} {T:>6} {H:>4} {K:>4} {V:>4} {_dtype_name(dtype):>8} {baseline:>10} {flag_attn_ms:>14.3f} {speedup:>14}")
+    print(
+        f"{B:>3} {T:>6} {H:>4} {K:>4} {V:>4} {_dtype_name(dtype):>8} {baseline:>10} {flag_attn_ms:>14.3f} {speedup:>14}"
+    )
 
 
 def _print_footer() -> None:
@@ -236,10 +233,45 @@ def _record_result(
 
 
 @pytest.mark.chunk_gated_delta_rule
-@pytest.mark.skipif(not test_backend.supports_operator("chunk_gated_delta_rule"), reason="requires an available accelerator")
+@pytest.mark.skipif(
+    not test_backend.supports_operator("chunk_gated_delta_rule"), reason="requires an available accelerator"
+)
 def test_chunk_gated_delta_rule_benchmark(
     record_property: Callable[[str, object], None],
+    tmp_path,
 ) -> None:
+    # H100 uses the same sampler as both decode entries. Other backends retain
+    # their existing benchmark and operator dispatch.
+    if _cuda_tle_available() and torch.cuda.get_device_capability()[0] == 9 and FLA_CHUNK_GDN is not None:
+        from benchmark.bench_gdn_forward import chunk_main
+        from benchmark.recording import benchmark_metric, record_benchmark_result
+
+        for dtype in DTYPES:
+            name = _dtype_name(dtype)
+            output = tmp_path / ("chunk_" + name + ".json")
+            chunk_main(["--historical-only", "--dtype", name, "--output", str(output)])
+            data = json.loads(output.read_text())
+            metrics = [
+                benchmark_metric(
+                    case_id=row["case_id"],
+                    shape_detail={key: row[key] for key in ("B", "T", "H", "HV", "K", "V")},
+                    latency=row["tle_us"] / 1000,
+                    latency_base=row["fla_us"] / 1000,
+                    speedup=row["fla_speedup"],
+                    accuracy=row["correctness"],
+                )
+                for row in data["results"]
+            ]
+            record_benchmark_result(
+                record_property,
+                op_name="chunk_gated_delta_rule",
+                dtype=name,
+                mode="raw_forward_graph",
+                result=metrics,
+                provenance=data["provenance"],
+            )
+            assert len(metrics) == len(SHAPES)
+        return
     run_benchmark(record_property)
 
 

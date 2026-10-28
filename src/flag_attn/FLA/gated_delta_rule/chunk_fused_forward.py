@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from flag_attn.FLA.compat import libentry, libtuner
+from flag_attn.FLA.utils import SUPPRESS_LEVEL
 from flag_attn.utils import has_triton_tle
 
 TWO_KERNEL_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_TWO_KERNEL_TLE"
@@ -35,6 +36,8 @@ def can_use_two_kernel_fused_forward(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None,
 ) -> bool:
+    if SUPPRESS_LEVEL >= 3:
+        return False
     enabled = os.environ.get(TWO_KERNEL_TLE_ENV, "1").lower()
     if not (HAS_TWO_KERNEL_TLE and enabled not in {"0", "false", "off", "no"}):
         return False
@@ -51,6 +54,14 @@ def can_use_two_kernel_fused_forward(
 
     B, T, Hg, K = q.shape
     H, V = v.shape[2:]
+    # Wide-key state updates are substantially slower in this fused route on
+    # Hopper. Keep them on the staged path; the new pipeline covers K=128.
+    if (
+        K > 128
+        and triton.runtime.driver.active.get_current_target().backend == "cuda"
+        and torch.cuda.get_device_capability(q.device)[0] == 9
+    ):
+        return False
     return (
         k.shape == (B, T, Hg, K)
         and v.shape[:2] == (B, T)
@@ -154,9 +165,7 @@ if HAS_TWO_KERNEL_TLE:
             b_u = tl.dot(b_inv, b_v_beta, allow_tf32=False)
             b_v_new = b_u.to(v.dtype.element_ty).to(tl.float32)
 
-            p_k1 = tl.make_block_ptr(
-                k, (T, K), (Hg * K, 1), (i_t * BT, 0), (BT, 64), (1, 0)
-            )
+            p_k1 = tl.make_block_ptr(k, (T, K), (Hg * K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
             b_k1 = tle.load(p_k1, boundary_check=(0, 1), is_async=True)
             b_kb1 = b_k1 * b_beta[:, None] * b_g_exp[:, None]
             b_w1 = tl.dot(b_inv, b_kb1.to(b_k1.dtype))
@@ -217,12 +226,8 @@ if HAS_TWO_KERNEL_TLE:
             b_o = tl.zeros([BT, BV], dtype=tl.float32)
             b_qk = tl.zeros([BT, BT], dtype=tl.float32)
 
-            p_q1 = tl.make_block_ptr(
-                q, (T, K), (Hg * K, 1), (i_t * BT, 0), (BT, 64), (1, 0)
-            )
-            p_kt1 = tl.make_block_ptr(
-                k, (K, T), (1, Hg * K), (0, i_t * BT), (64, BT), (0, 1)
-            )
+            p_q1 = tl.make_block_ptr(q, (T, K), (Hg * K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
+            p_kt1 = tl.make_block_ptr(k, (K, T), (1, Hg * K), (0, i_t * BT), (64, BT), (0, 1))
             b_q1 = tle.load(p_q1, boundary_check=(0, 1), is_async=True)
             b_kt1 = tle.load(p_kt1, boundary_check=(0, 1), is_async=True)
             b_o += tl.dot(b_q1, b_h1.to(b_q1.dtype))

@@ -9,10 +9,35 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_attn.FLA.index import prepare_chunk_indices
+
 
 @triton.jit
 def exp2(x):
     return tl.exp2(x)
+
+
+@triton.jit
+def _store_gated_block(
+    AG,
+    block,
+    prefix,
+    start,
+    row: tl.constexpr,
+    col: tl.constexpr,
+    HV: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    T,
+):
+    ri = row * BC + tl.arange(0, BC)
+    ci = col * BC + tl.arange(0, BC)
+    gr = tl.gather(prefix, ri, 0)
+    gc = tl.gather(prefix, ci, 0)
+    lower = ri[:, None] >= ci[None, :]
+    difference = tl.where(lower, gr[:, None] - gc[None, :], 0.0)
+    gated = tl.where(lower, block * tl.exp(difference), 0.0)
+    tl.store(AG + (start + ri[:, None]) * HV * BT + ci[None, :], gated, mask=(start + ri[:, None] < T))
 
 
 @triton.heuristics(
@@ -23,7 +48,7 @@ def exp2(x):
 )
 @triton.autotune(
     configs=[triton.Config({"BK": BK}, num_warps=num_warps) for BK in [32, 64] for num_warps in [1, 2, 4]],
-    key=["H", "HV", "K", "BC"],
+    key=["H", "HV", "K", "BC", "OUTPUT_GATED", "MERGE_PRECISION"],
 )
 @triton.jit(do_not_specialize=["T"])
 def _prepare_kernel(
@@ -32,6 +57,7 @@ def _prepare_kernel(
     g_out,
     beta,
     A,
+    AG,
     cu_seqlens,
     chunk_indices,
     T,
@@ -43,6 +69,8 @@ def _prepare_kernel(
     BK: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    OUTPUT_GATED: tl.constexpr,
+    MERGE_PRECISION: tl.constexpr,
 ):
     """
     Fused kernel: compute beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass.
@@ -71,8 +99,9 @@ def _prepare_kernel(
         return
 
     gg = tl.arange(0, BT)
-    gv = tl.load(g + (i_b * T + i_t * BT + gg) * HV + i_h).to(tl.float32)
-    tl.store(g_out + (i_b * T + i_t * BT + gg) * HV + i_h, tl.cumsum(gv))
+    gv = tl.load(g + (bos + i_t * BT + gg) * HV + i_h, mask=i_t * BT + gg < T, other=0).to(tl.float32)
+    prefix = tl.cumsum(gv)
+    tl.store(g_out + (bos + i_t * BT + gg) * HV + i_h, prefix, mask=i_t * BT + gg < T)
 
     i_tc0 = i_t * BT
     i_tc1 = i_t * BT + BC
@@ -93,10 +122,10 @@ def _prepare_kernel(
     p_b1 = tl.make_block_ptr(beta + bos * HV + i_h, (T,), (HV,), (i_tc1,), (BC,), (0,))
     p_b2 = tl.make_block_ptr(beta + bos * HV + i_h, (T,), (HV,), (i_tc2,), (BC,), (0,))
     p_b3 = tl.make_block_ptr(beta + bos * HV + i_h, (T,), (HV,), (i_tc3,), (BC,), (0,))
-    b_b0 = tl.load(p_b0, boundary_check=(0,)).to(tl.float32)
-    b_b1 = tl.load(p_b1, boundary_check=(0,)).to(tl.float32)
-    b_b2 = tl.load(p_b2, boundary_check=(0,)).to(tl.float32)
-    b_b3 = tl.load(p_b3, boundary_check=(0,)).to(tl.float32)
+    b_b0 = tl.load(p_b0, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    b_b1 = tl.load(p_b1, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    b_b2 = tl.load(p_b2, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    b_b3 = tl.load(p_b3, boundary_check=(0,), padding_option="zero").to(tl.float32)
 
     # load gate if used
     if USE_G:
@@ -105,10 +134,10 @@ def _prepare_kernel(
         p_g2 = tl.make_block_ptr(g + bos * HV + i_h, (T,), (HV,), (i_tc2,), (BC,), (0,))
         p_g3 = tl.make_block_ptr(g + bos * HV + i_h, (T,), (HV,), (i_tc3,), (BC,), (0,))
 
-        b_g0 = tl.load(p_g0, boundary_check=(0,)).to(tl.float32)
-        b_g1 = tl.load(p_g1, boundary_check=(0,)).to(tl.float32)
-        b_g2 = tl.load(p_g2, boundary_check=(0,)).to(tl.float32)
-        b_g3 = tl.load(p_g3, boundary_check=(0,)).to(tl.float32)
+        b_g0 = tl.load(p_g0, boundary_check=(0,), padding_option="zero").to(tl.float32)
+        b_g1 = tl.load(p_g1, boundary_check=(0,), padding_option="zero").to(tl.float32)
+        b_g2 = tl.load(p_g2, boundary_check=(0,), padding_option="zero").to(tl.float32)
+        b_g3 = tl.load(p_g3, boundary_check=(0,), padding_option="zero").to(tl.float32)
 
     ############################################################################
     # Step 1: compute all 10 lower-triangular [BC, BC] blocks of K @ K^T
@@ -130,13 +159,13 @@ def _prepare_kernel(
 
     for i_k in range(tl.cdiv(K, BK)):
         p_k0 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
-        b_k0 = tl.load(p_k0, boundary_check=(0, 1))
+        b_k0 = tl.load(p_k0, boundary_check=(0, 1), padding_option="zero")
         # diagonal block 0
         b_A00 += tl.dot(b_k0, tl.trans(b_k0))
 
         if i_tc1 < T:
             p_k1 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
-            b_k1 = tl.load(p_k1, boundary_check=(0, 1))
+            b_k1 = tl.load(p_k1, boundary_check=(0, 1), padding_option="zero")
             # diagonal block 1
             b_A11 += tl.dot(b_k1, tl.trans(b_k1))
             # off-diagonal (1,0)
@@ -144,7 +173,7 @@ def _prepare_kernel(
 
             if i_tc2 < T:
                 p_k2 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
-                b_k2 = tl.load(p_k2, boundary_check=(0, 1))
+                b_k2 = tl.load(p_k2, boundary_check=(0, 1), padding_option="zero")
                 # diagonal block 2
                 b_A22 += tl.dot(b_k2, tl.trans(b_k2))
                 # off-diagonal (2,0), (2,1)
@@ -153,7 +182,7 @@ def _prepare_kernel(
 
                 if i_tc3 < T:
                     p_k3 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
-                    b_k3 = tl.load(p_k3, boundary_check=(0, 1))
+                    b_k3 = tl.load(p_k3, boundary_check=(0, 1), padding_option="zero")
                     # diagonal block 3
                     b_A33 += tl.dot(b_k3, tl.trans(b_k3))
                     # off-diagonal (3,0), (3,1), (3,2)
@@ -247,26 +276,26 @@ def _prepare_kernel(
     # Step 4: block merge -> full (I + A)^{-1}
     ############################################################################
 
-    b_Ai10 = -tl.dot(tl.dot(b_Ai11, b_A10, input_precision="tf32"), b_Ai00, input_precision="tf32")
-    b_Ai21 = -tl.dot(tl.dot(b_Ai22, b_A21, input_precision="tf32"), b_Ai11, input_precision="tf32")
-    b_Ai32 = -tl.dot(tl.dot(b_Ai33, b_A32, input_precision="tf32"), b_Ai22, input_precision="tf32")
+    b_Ai10 = -tl.dot(tl.dot(b_Ai11, b_A10, input_precision=MERGE_PRECISION), b_Ai00, input_precision=MERGE_PRECISION)
+    b_Ai21 = -tl.dot(tl.dot(b_Ai22, b_A21, input_precision=MERGE_PRECISION), b_Ai11, input_precision=MERGE_PRECISION)
+    b_Ai32 = -tl.dot(tl.dot(b_Ai33, b_A32, input_precision=MERGE_PRECISION), b_Ai22, input_precision=MERGE_PRECISION)
 
     b_Ai20 = -tl.dot(
         b_Ai22,
-        tl.dot(b_A20, b_Ai00, input_precision="tf32") + tl.dot(b_A21, b_Ai10, input_precision="tf32"),
-        input_precision="tf32",
+        tl.dot(b_A20, b_Ai00, input_precision=MERGE_PRECISION) + tl.dot(b_A21, b_Ai10, input_precision=MERGE_PRECISION),
+        input_precision=MERGE_PRECISION,
     )
     b_Ai31 = -tl.dot(
         b_Ai33,
-        tl.dot(b_A31, b_Ai11, input_precision="tf32") + tl.dot(b_A32, b_Ai21, input_precision="tf32"),
-        input_precision="tf32",
+        tl.dot(b_A31, b_Ai11, input_precision=MERGE_PRECISION) + tl.dot(b_A32, b_Ai21, input_precision=MERGE_PRECISION),
+        input_precision=MERGE_PRECISION,
     )
     b_Ai30 = -tl.dot(
         b_Ai33,
-        tl.dot(b_A30, b_Ai00, input_precision="tf32")
-        + tl.dot(b_A31, b_Ai10, input_precision="tf32")
-        + tl.dot(b_A32, b_Ai20, input_precision="tf32"),
-        input_precision="tf32",
+        tl.dot(b_A30, b_Ai00, input_precision=MERGE_PRECISION)
+        + tl.dot(b_A31, b_Ai10, input_precision=MERGE_PRECISION)
+        + tl.dot(b_A32, b_Ai20, input_precision=MERGE_PRECISION),
+        input_precision=MERGE_PRECISION,
     )
 
     ############################################################################
@@ -295,28 +324,52 @@ def _prepare_kernel(
     tl.store(p_A32, b_Ai32.to(A.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_A33, b_Ai33.to(A.dtype.element_ty), boundary_check=(0, 1))
 
+    if OUTPUT_GATED:
+        # The raw forward API returns the gated inverse as an auxiliary output.
+        # Restore it from FP32 register blocks before A_0 is rounded for storage.
+        AG += (bos * HV + i_h) * BT
+        _store_gated_block(AG, b_Ai00, prefix, i_tc0, 0, 0, HV, BT, BC, T)
+        _store_gated_block(AG, b_Ai10, prefix, i_tc0, 1, 0, HV, BT, BC, T)
+        _store_gated_block(AG, b_Ai11, prefix, i_tc0, 1, 1, HV, BT, BC, T)
+        _store_gated_block(AG, b_Ai20, prefix, i_tc0, 2, 0, HV, BT, BC, T)
+        _store_gated_block(AG, b_Ai21, prefix, i_tc0, 2, 1, HV, BT, BC, T)
+        _store_gated_block(AG, b_Ai22, prefix, i_tc0, 2, 2, HV, BT, BC, T)
+        _store_gated_block(AG, b_Ai30, prefix, i_tc0, 3, 0, HV, BT, BC, T)
+        _store_gated_block(AG, b_Ai31, prefix, i_tc0, 3, 1, HV, BT, BC, T)
+        _store_gated_block(AG, b_Ai32, prefix, i_tc0, 3, 2, HV, BT, BC, T)
+        _store_gated_block(AG, b_Ai33, prefix, i_tc0, 3, 3, HV, BT, BC, T)
 
-def prepare_fused_tle_inputs(k, g, beta):
-    """Prepare ungated inverse tiles without an intermediate global KKT tensor."""
+
+def prepare_fused_tle_inputs(k, g, beta, output_gated=False, cu_seqlens=None, merge_precision="ieee"):
+    """Shared chunk preparation; keep KKT and inverse subtiles in registers."""
+    if merge_precision not in ("ieee", "tf32", "tf32x3"):
+        raise ValueError("unsupported inverse merge precision")
     B, T, Hg, K = k.shape
     H = beta.shape[-1]
     gc = torch.empty_like(g, dtype=torch.float32)
-    # The upper triangular tiles are not written by the block solve.
+    # Unwritten upper-triangular inverse tiles must remain zero.
     a = torch.zeros(B, T, H, 64, device=k.device, dtype=k.dtype)
-    _prepare_kernel[(T // 64, B * H)](
-        k=k,
-        g=g,
-        g_out=gc,
-        beta=beta,
-        A=a,
-        cu_seqlens=None,
-        chunk_indices=None,
-        T=T,
-        H=Hg,
-        HV=H,
-        K=K,
-        BT=64,
-        BC=16,
-        USE_G=False,
-    )
-    return gc, a
+    ag = torch.zeros_like(a) if output_gated else None
+    indices = prepare_chunk_indices(cu_seqlens, 64) if cu_seqlens is not None else None
+    chunks = triton.cdiv(T, 64) if indices is None else indices.shape[0]
+    if chunks:
+        _prepare_kernel[(chunks, B * H if indices is None else H)](
+            k=k,
+            g=g,
+            g_out=gc,
+            beta=beta,
+            A=a,
+            AG=ag,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=indices,
+            T=T,
+            H=Hg,
+            HV=H,
+            K=K,
+            BT=64,
+            BC=16,
+            USE_G=False,
+            OUTPUT_GATED=output_gated,
+            MERGE_PRECISION=merge_precision,
+        )
+    return (gc, a, ag) if output_gated else (gc, a)
