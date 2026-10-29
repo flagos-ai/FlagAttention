@@ -15,6 +15,7 @@
 """Hardware-specific attention operators grouped by execution phase."""
 
 from typing import Literal
+from importlib import import_module
 
 from flag_attn.runtime.backend import resolve_operator
 
@@ -28,6 +29,26 @@ _HY3_DECODE_IMPLEMENTATIONS = {
     "fp8_kv_static": ("static.fp8_qpertoken_perhead_kvpertensor_static", "attention_decode_fp8"),
     "fp8_kv_dynamic": ("dynamic.fp8_qpertoken_perhead_kvpertensor_dynamic", "attention_decode_fp8"),
 }
+
+
+def hy3_attention_prepare(inputs, *, stage: Literal["decode"] = "decode", variant):
+    """Prepare a decode workspace using the same backend as hy3_attention."""
+    if stage != "decode":
+        raise ValueError("Hy3 workspace preparation only supports stage='decode'")
+    if variant not in _HY3_DECODE_IMPLEMENTATIONS:
+        raise ValueError(f"Unsupported Hy3 decode variant: {variant!r}")
+    return resolve_operator(
+        "hy3_attention_prepare", __name__, "_generic_hy3_attention_prepare",
+    )(inputs, variant=variant)
+
+
+def _generic_hy3_attention_prepare(inputs, *, variant):
+    module_name, _ = _HY3_DECODE_IMPLEMENTATIONS[variant]
+    function_name = {
+        "bf16_static": "prepare_static_bf16_workspace",
+        "bf16_dynamic": "prepare_dynamic_bf16_workspace",
+    }.get(variant, "prepare_decode_workspace")
+    return getattr(import_module(f"{__name__}.decode.{module_name}"), function_name)(inputs)
 
 
 def hy3_attention(
@@ -70,4 +91,4 @@ def hy3_attention(
     return implementation(*args, **kwargs)
 
 
-__all__ = ["hy3_attention", "decode", "prefill"]
+__all__ = ["hy3_attention", "hy3_attention_prepare", "decode", "prefill"]
