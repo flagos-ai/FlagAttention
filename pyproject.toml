@@ -100,6 +100,7 @@ markers = [
     "performance: performance benchmark",
     "benchmark: benchmark entry point",
     "inkling_fa4_rel_attention: Inkling FA4 relative-attention operator tests",
+    "rotary_embedding: rotary positional embedding tests",
 ]
 
 [tool.ruff]
