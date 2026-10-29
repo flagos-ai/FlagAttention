@@ -11,6 +11,7 @@ from flag_attn.FLA.gated_delta_rule.chunk_gated_delta_direct import (
 )
 from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import can_use_two_kernel_fused_forward
 from flag_attn.FLA.compat import libentry
+from flag_attn.FLA.utils import SUPPRESS_LEVEL
 from flag_attn.utils import has_triton_tle
 from flag_attn.FLA.gated_delta_rule.fused_cumsum_kkt_solve_tril import (
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril,
@@ -76,9 +77,7 @@ def _tle_chunk_gdr_target_num_ctas(device: torch.device) -> int:
         return TLE_CHUNK_GDR_TARGET_NUM_CTAS
 
 
-def _tle_chunk_gdr_block_dv(
-    batch_size: int, num_value_heads: int, target_num_ctas: int
-) -> int:
+def _tle_chunk_gdr_block_dv(batch_size: int, num_value_heads: int, target_num_ctas: int) -> int:
     grid_size = batch_size * num_value_heads
     if grid_size >= target_num_ctas:
         return 128
@@ -118,8 +117,13 @@ def _can_use_tle_chunk_gated_delta_rule(
     initial_state: torch.Tensor | None,
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None,
+    *,
+    require_enabled: bool = True,
+    allow_fp32_gates: bool = False,
 ) -> bool:
-    if not (HAS_TLE_CHUNK_GATED_DELTA_RULE and _tle_chunk_gdr_enabled()):
+    if require_enabled and SUPPRESS_LEVEL >= 3:
+        return False
+    if not (HAS_TLE_CHUNK_GATED_DELTA_RULE and (not require_enabled or _tle_chunk_gdr_enabled())):
         return False
     if not output_final_state:
         return False
@@ -131,7 +135,10 @@ def _can_use_tle_chunk_gated_delta_rule(
         return False
     if q.dtype not in (torch.float16, torch.bfloat16):
         return False
-    if not all(x.dtype == q.dtype for x in (k, v, beta, g)):
+    if not all(x.dtype == q.dtype for x in (k, v)):
+        return False
+    gate_dtypes = (q.dtype, torch.float32) if allow_fp32_gates else (q.dtype,)
+    if any(x.dtype not in gate_dtypes for x in (beta, g)):
         return False
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         return False
@@ -292,9 +299,7 @@ if HAS_TLE_CHUNK_GATED_DELTA_RULE:
 
             gate_wait = gate_reader.wait(chunk)
             gate_slot = gate_wait.slot
-            g_last = tl.load(tle.gpu.local_ptr(gate_slot.g_exp, (CHUNK - 1,))).to(
-                tl.float32
-            )
+            g_last = tl.load(tle.gpu.local_ptr(gate_slot.g_exp, (CHUNK - 1,))).to(tl.float32)
             h_state *= g_last
             gate_reader.release(chunk)
 
@@ -309,12 +314,7 @@ if HAS_TLE_CHUNK_GATED_DELTA_RULE:
             data_reader.release(chunk)
 
         h_ptrs = (
-            final_state
-            + pid_b * h_batch_base
-            + pid_h * (DK * DV)
-            + offs_k[:, None] * DV
-            + block_v
-            + offs_v[None, :]
+            final_state + pid_b * h_batch_base + pid_h * (DK * DV) + offs_k[:, None] * DV + block_v + offs_v[None, :]
         )
         tl.store(h_ptrs, h_state)
 
@@ -339,9 +339,7 @@ if HAS_TLE_CHUNK_GATED_DELTA_RULE:
 
             g_vec = tl.load(tle.gpu.local_ptr(agamma_slot.g)).to(tl.float32)
             g_exp = tl.math.exp2(g_vec * 1.4426950408889634)
-            g_last = tl.load(tle.gpu.local_ptr(agamma_slot.g, (CHUNK - 1,))).to(
-                tl.float32
-            )
+            g_last = tl.load(tle.gpu.local_ptr(agamma_slot.g, (CHUNK - 1,))).to(tl.float32)
             g_rev_exp = tl.math.exp2((g_last - g_vec) * 1.4426950408889634)
 
             gate_slot = gate_writer.acquire(chunk)
@@ -903,21 +901,15 @@ def _validate_inputs(
             raise ValueError(f"{name} must have the same dtype as q")
 
     if (Bk, Tk, Hk, Kk) != (B, T, Hg, K):
-        raise ValueError(
-            "q and k must have matching [B, T, Hq, K] shapes after layout conversion"
-        )
+        raise ValueError("q and k must have matching [B, T, Hq, K] shapes after layout conversion")
     if (Bv, Tv) != (B, T):
         raise ValueError("v must have matching B and T dimensions with q/k")
     if H % Hg != 0:
         raise ValueError("the q/k head count must divide the v head count")
     if beta.shape != (B, T, H):
-        raise ValueError(
-            f"beta must have shape {(B, T, H)} after layout conversion, got {tuple(beta.shape)}"
-        )
+        raise ValueError(f"beta must have shape {(B, T, H)} after layout conversion, got {tuple(beta.shape)}")
     if g.shape != (B, T, H):
-        raise ValueError(
-            f"g must have shape {(B, T, H)} after layout conversion, got {tuple(g.shape)}"
-        )
+        raise ValueError(f"g must have shape {(B, T, H)} after layout conversion, got {tuple(g.shape)}")
     if cu_seqlens is not None:
         if not isinstance(cu_seqlens, torch.Tensor):
             raise TypeError("cu_seqlens must be a torch.Tensor")
@@ -938,9 +930,7 @@ def _validate_inputs(
         expected_n = B if cu_seqlens is None else cu_seqlens.numel() - 1
         expected_shape = (expected_n, H, K, V)
         if initial_state.shape != expected_shape:
-            raise ValueError(
-                f"initial_state must have shape {expected_shape}, got {tuple(initial_state.shape)}"
-            )
+            raise ValueError(f"initial_state must have shape {expected_shape}, got {tuple(initial_state.shape)}")
 
 
 def _direct_contiguous(x: torch.Tensor) -> torch.Tensor:
@@ -964,6 +954,28 @@ def _l2_normalize_last_dim(x: torch.Tensor) -> torch.Tensor:
         BLOCK_K=block_k,
     )
     return out
+
+
+def _can_use_fused_tle_chunk(q_seq, k_seq, v_seq, beta_seq, g_seq, initial_state, output_final_state, cu_seqlens):
+    return (
+        HAS_TLE_CHUNK_GATED_DELTA_RULE
+        and hasattr(tle, "pipe")
+        and SUPPRESS_LEVEL < 3
+        and os.environ.get("FLAG_ATTN_CHUNK_GDR_FUSED_TLE", "1").lower() not in {"0", "false", "off", "no"}
+        and _can_use_tle_chunk_gated_delta_rule(
+            q_seq,
+            k_seq,
+            v_seq,
+            beta_seq,
+            g_seq,
+            initial_state,
+            output_final_state,
+            cu_seqlens,
+            require_enabled=False,
+            allow_fp32_gates=True,
+        )
+        and torch.cuda.get_device_capability(q_seq.device)[0] == 9
+    )
 
 
 def chunk_gated_delta_rule(
@@ -1004,14 +1016,7 @@ def chunk_gated_delta_rule(
 
     B, T, Hg, K = q_seq.shape
     H, V = v_seq.shape[2], v_seq.shape[3]
-    if (
-        initial_state is None
-        and cu_seqlens is None
-        and T <= 128
-        and K <= 128
-        and V <= 128
-        and H % Hg == 0
-    ):
+    if initial_state is None and cu_seqlens is None and T <= 128 and K <= 128 and V <= 128 and H % Hg == 0:
         q_direct = _direct_contiguous(q_seq)
         k_direct = _direct_contiguous(k_seq)
         v_direct = _direct_contiguous(v_seq)
@@ -1044,6 +1049,29 @@ def chunk_gated_delta_rule(
     if use_qk_l2norm_in_kernel:
         q_seq = _l2_normalize_last_dim(q_seq)
         k_seq = _l2_normalize_last_dim(k_seq)
+
+    # Keep the recurrent dependency chain within one compute worker. Independent
+    # producers prefetch inputs through pipes; no intermediate storage is aliased.
+    if _can_use_fused_tle_chunk(q_seq, k_seq, v_seq, beta_seq, g_seq, initial_state, output_final_state, cu_seqlens):
+        from flag_attn.FLA.gated_delta_rule.chunk_fused_tle import (
+            _tle_chunk_gated_delta_rule_fwd as fused_tle_fwd,
+        )
+
+        q_tle, k_tle, v_tle, beta_tle, g_tle = map(_direct_contiguous, (q_seq, k_seq, v_seq, beta_seq, g_seq))
+        _set_tle_descriptor_allocator(q_tle.device)
+        from flag_attn.FLA.gated_delta_rule.chunk_fused_tle_prepare import prepare_fused_tle_inputs
+
+        g_cumsum, a = prepare_fused_tle_inputs(k_tle, g_tle, beta_tle)
+        o, final_state = fused_tle_fwd(
+            q_tle,
+            k_tle,
+            v_tle,
+            g_cumsum,
+            beta_tle,
+            a,
+            scale=float(scale),
+        )
+        return (o.transpose(1, 2) if head_first else o), final_state
 
     use_two_kernel_fused_forward = can_use_two_kernel_fused_forward(
         q=q_seq,

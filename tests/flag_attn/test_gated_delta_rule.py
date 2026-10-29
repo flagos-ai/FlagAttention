@@ -1,4 +1,3 @@
-
 import os
 from contextlib import contextmanager
 
@@ -11,7 +10,7 @@ from flag_attn import chunk_gated_delta_rule
 from flag_attn.FLA.gated_delta_rule import chunk_gated_delta_rule_fwd
 from flag_attn.utils import has_triton_tle
 
-pytestmark = pytest.mark.chunk_gated_delta_rule
+pytestmark = [pytest.mark.chunk_gated_delta_rule, pytest.mark.gdn_forward]
 
 ASSERT_RATIO = 0.01
 RECOMPUTE_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_RECOMPUTE_TLE"
@@ -45,6 +44,7 @@ GDN_EXTERNAL_TEST_SHAPES = [
     (8, 2048, 32, 256, 256),
 ]
 
+
 def _load_fla_reference():
     try:
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_chunk_gdn
@@ -75,6 +75,8 @@ def _set_gdn_tle(
     two_kernel_tle: bool,
     hybrid_tle: bool = False,
 ):
+    old_fused = os.environ.get("FLAG_ATTN_CHUNK_GDR_FUSED_TLE")
+    os.environ["FLAG_ATTN_CHUNK_GDR_FUSED_TLE"] = "1" if full_tle else "0"
     old_full = os.environ.get(FULL_TLE_ENV)
     old_recompute = os.environ.get(RECOMPUTE_TLE_ENV)
     old_two_kernel = os.environ.get(TWO_KERNEL_TLE_ENV)
@@ -86,6 +88,10 @@ def _set_gdn_tle(
     try:
         yield
     finally:
+        if old_fused is None:
+            os.environ.pop("FLAG_ATTN_CHUNK_GDR_FUSED_TLE", None)
+        else:
+            os.environ["FLAG_ATTN_CHUNK_GDR_FUSED_TLE"] = old_fused
         if old_full is None:
             os.environ.pop(FULL_TLE_ENV, None)
         else:
@@ -120,11 +126,7 @@ def _make_inputs(
     v = torch.randn(B, T, H, V, device=device, dtype=dtype)
     g = (-torch.rand(B, T, H, device=device, dtype=torch.float32) * 0.1).to(dtype)
     beta = torch.rand(B, T, H, device=device, dtype=dtype).sigmoid()
-    initial_state = (
-        torch.zeros(B, H, K, V, device=device, dtype=dtype)
-        if use_initial_state
-        else None
-    )
+    initial_state = torch.zeros(B, H, K, V, device=device, dtype=dtype) if use_initial_state else None
     return q, k, v, g, beta, K**-0.5, initial_state, True, None
 
 
@@ -194,14 +196,10 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
     assert not torch.isnan(actual).any(), f"{name}: NaN detected in actual"
     assert not torch.isnan(expected).any(), f"{name}: NaN detected in baseline"
     ratio = _err_ratio(expected, actual)
-    assert ratio < ASSERT_RATIO, (
-        f"{name} diff: abs={abs_err:.6f} ratio={ratio:.6f} " f"limit={ASSERT_RATIO}"
-    )
+    assert ratio < ASSERT_RATIO, f"{name} diff: abs={abs_err:.6f} ratio={ratio:.6f} limit={ASSERT_RATIO}"
 
 
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN recompute TLE tests require CUDA/TLE"
-)
+@pytest.mark.skipif(not _cuda_tle_available(), reason="GDN recompute TLE tests require CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", GDN_RECOMPUTE_TEST_SHAPES)
 @torch.inference_mode()
@@ -218,9 +216,7 @@ def test_chunk_gated_delta_rule_fwd_recompute_tle_matches_native(dtype, shape):
     _assert_close("final_state", actual[3], baseline[3])
 
 
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN fused TLE tests require CUDA/TLE"
-)
+@pytest.mark.skipif(not _cuda_tle_available(), reason="GDN fused TLE tests require CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", GDN_FUSED_FWD_TEST_SHAPES)
 @torch.inference_mode()
@@ -237,7 +233,9 @@ def test_chunk_gated_delta_rule_fwd_full_tle_matches_native(dtype, shape):
     _assert_close("final_state", actual[3], baseline[3])
 
 
-@pytest.mark.skipif(not test_backend.supports_operator("chunk_gated_delta_rule"), reason="requires an available accelerator")
+@pytest.mark.skipif(
+    not test_backend.supports_operator("chunk_gated_delta_rule"), reason="requires an available accelerator"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_chunk_gated_delta_rule_public_api_matches_native(dtype):
@@ -266,13 +264,21 @@ def test_chunk_gated_delta_rule_public_api_matches_native(dtype):
     _assert_close("final_state", final_state, baseline[3])
 
 
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN two-kernel tests require CUDA/TLE"
-)
+@pytest.mark.skipif(not _cuda_tle_available(), reason="GDN two-kernel tests require CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", GDN_TWO_KERNEL_TEST_SHAPES)
 @torch.inference_mode()
-def test_chunk_gated_delta_rule_fwd_two_kernel_matches_native(dtype, shape):
+def test_chunk_gated_delta_rule_fwd_two_kernel_matches_native(dtype, shape, monkeypatch):
+    import flag_attn.FLA.gated_delta_rule.chunk as implementation
+
+    calls = []
+    original = implementation.chunk_gdn_two_kernel_fwd
+
+    def tracked(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(implementation, "chunk_gdn_two_kernel_fwd", tracked)
     torch.manual_seed(42)
     args = _make_inputs(*shape, dtype=dtype, use_initial_state=False)
 
@@ -284,6 +290,8 @@ def test_chunk_gated_delta_rule_fwd_two_kernel_matches_native(dtype, shape):
         two_kernel_tle=True,
     )
 
+    wide_hopper = shape[3] > 128 and torch.cuda.get_device_capability()[0] == 9
+    assert len(calls) == (0 if wide_hopper else 1)
     _assert_close("g", actual[0], baseline[0])
     _assert_close("o", actual[1], baseline[1])
     _assert_close("A", actual[2], baseline[2])
@@ -306,9 +314,7 @@ def _two_kernel_configs():
     ]
 
 
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN autotune configurations require CUDA/TLE"
-)
+@pytest.mark.skipif(not _cuda_tle_available(), reason="GDN autotune configurations require CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("config", _two_kernel_configs())
 @torch.inference_mode()
@@ -326,18 +332,28 @@ def test_chunk_gated_delta_rule_two_kernel_configs(dtype, config):
     # Exercise every candidate: autotuning measures speed without validating
     # the recurrent state, so checking only the winner can hide bad configs.
     _chunk_gdn_two_kernel_fwd_kernel.fn[(triton.cdiv(128, config.kwargs["BV"]), 64)](
-        q=q, k=k, v=v, beta=beta, A=baseline[2], g=baseline[0],
-        o=output, final_state=final_state, scale=scale,
-        T=2048, H=16, Hg=16, K=128, V=128, BT=64,
+        q=q,
+        k=k,
+        v=v,
+        beta=beta,
+        A=baseline[2],
+        g=baseline[0],
+        o=output,
+        final_state=final_state,
+        scale=scale,
+        T=2048,
+        H=16,
+        Hg=16,
+        K=128,
+        V=128,
+        BT=64,
         **config.all_kwargs(),
     )
     _assert_close("o", output, baseline[1])
     _assert_close("final_state", final_state, baseline[3])
 
 
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN hybrid tests require CUDA/TLE"
-)
+@pytest.mark.skipif(not _cuda_tle_available(), reason="GDN hybrid tests require CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_chunk_gated_delta_rule_fwd_hybrid_matches_two_kernel(dtype):
@@ -364,9 +380,7 @@ def test_chunk_gated_delta_rule_fwd_hybrid_matches_two_kernel(dtype):
     _assert_close("final_state", actual[3], expected[3])
 
 
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN external comparison requires CUDA/TLE"
-)
+@pytest.mark.skipif(not _cuda_tle_available(), reason="GDN external comparison requires CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", GDN_EXTERNAL_TEST_SHAPES)
 @torch.inference_mode()
@@ -381,9 +395,7 @@ def test_chunk_gated_delta_rule_hybrid_matches_fla(dtype, shape):
     _assert_close("final_state", actual_final_state, expected_final_state)
 
 
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN public two-kernel test requires CUDA/TLE"
-)
+@pytest.mark.skipif(not _cuda_tle_available(), reason="GDN public two-kernel test requires CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_chunk_gated_delta_rule_public_api_uses_two_kernel(dtype):

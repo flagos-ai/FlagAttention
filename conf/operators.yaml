@@ -13,6 +13,36 @@
 # limitations under the License.
 
 ops:
+  - id: fused_recurrent_gated_delta_rule_packed_decode
+    description: TLE packed single-token GDN decode with fused gates and indexed state updates.
+    for:
+      - fused_recurrent_gated_delta_rule_packed_decode
+    labels:
+      - fused
+      - FLA
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_gdn_packed_decode.py
+    benchmark: benchmark/test_fused_recurrent_gdn_benchmark.py
+  - id: fused_recurrent_gated_delta_rule_fwd
+    description: TLE scalar GDN inference recurrence with indexed state snapshots on NVIDIA GPUs.
+    for:
+      - fused_recurrent_gated_delta_rule_fwd
+    labels:
+      - fused
+      - FLA
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_fused_recurrent_gdn.py
+    benchmark: benchmark/test_fused_recurrent_gdn_benchmark.py
   - id: parallel_wall_attn
     description: Run Wall-Attention correctness and performance tests on the selected backend.
     for:
@@ -70,6 +100,9 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_recompute_tle_matches_native
+      - tests/flag_attn/test_gdn_fused_tle.py
+      - tests/flag_attn/test_gdn_forward.py
+      - tests/flag_attn/test_gdn_preparation.py
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_full_tle_matches_native
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_public_api_matches_native
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_two_kernel_matches_native

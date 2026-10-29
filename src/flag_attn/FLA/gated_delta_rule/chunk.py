@@ -84,6 +84,18 @@ def chunk_gated_delta_rule_fwd(
     chunk_size = _chunk_size_for_sequence(q.shape[1], cu_seqlens is not None)
     maybe_set_tle_recompute_allocator(q.device, cu_seqlens)
 
+    from flag_attn.FLA.gated_delta_rule.api import _can_use_fused_tle_chunk
+
+    if _can_use_fused_tle_chunk(q, k, v, beta, g, initial_state, output_final_state, cu_seqlens):
+        from flag_attn.FLA.gated_delta_rule.api import _set_tle_descriptor_allocator
+        from flag_attn.FLA.gated_delta_rule.chunk_fused_tle import _tle_chunk_gated_delta_rule_fwd
+        from flag_attn.FLA.gated_delta_rule.chunk_fused_tle_prepare import prepare_fused_tle_inputs
+
+        _set_tle_descriptor_allocator(q.device)
+        g_tle, a_zero, a_gated = prepare_fused_tle_inputs(k, g, beta, output_gated=True)
+        o, final_state = _tle_chunk_gated_delta_rule_fwd(q, k, v, g_tle, beta, a_zero, scale=float(scale))
+        return g_tle, o, a_gated, final_state, None, None, None
+
     if initial_state is None and output_final_state:
         try:
             from flag_attn.FLA.gated_delta_rule.api import (

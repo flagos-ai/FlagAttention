@@ -77,6 +77,9 @@ pythonpath = [
     "tests/flag_attn",
 ]
 markers = [
+    "gdn_forward: unified GDN chunk, recurrent, and packed decode inference coverage",
+    "fused_recurrent_gated_delta_rule_packed_decode: TLE packed GDN single-token inference",
+    "fused_recurrent_gated_delta_rule_fwd: TLE scalar GDN recurrent inference tests and benchmarks",
     "hy3_attention: Hy3 prefill and BF16/FP8 static/dynamic decode tests and benchmarks",
     "fused_attnres: fused attention residual tests and benchmarks",
     "parallel_forgetting_attn: ACP-enabled forgetting attention tests and benchmarks",
