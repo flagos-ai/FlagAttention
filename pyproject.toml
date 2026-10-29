@@ -86,7 +86,7 @@ markers = [
     "log_linear_attn: log-linear attention tests and benchmarks",
     "diffkv_attention: DiffKV attention tests and benchmarks",
     "sm90: requires Hopper SM90 GPU",
-    "chunk_gated_delta_rule: chunked gated delta rule tests and benchmarks",
+    "chunk_gated_delta_rule: chunked and fused recurrent gated delta rule tests and benchmarks, including packed decode",
     "chunk_gdn2: chunked GDN2 tests and benchmarks",
     "chunk_gla: chunked gated linear attention tests and benchmarks",
     "chunk_kda: Kimi Delta Attention",
