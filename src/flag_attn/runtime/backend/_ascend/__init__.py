@@ -4,6 +4,7 @@
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "chunk_gated_delta_rule": (".FLA.gated_delta_rule.api", "chunk_gated_delta_rule"),
     "chunk_gdn2": (".gdn2", "chunk_gdn2"),
     "parallel_parallax": (".parallax", "parallel_parallax"),
     "parallax_decode": (".parallax", "parallax_decode"),
