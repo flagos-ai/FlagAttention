@@ -113,8 +113,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    _include_marked_benchmarks(config)
     if config.getoption("flag_attn_record") == "json":
-        _include_marked_benchmarks(config)
         output = config.getoption("flag_attn_output")
         if output is None:
             output = (
@@ -141,7 +141,7 @@ def _selected_operator_mark(config: pytest.Config) -> str | None:
 
 
 def _include_marked_benchmarks(config: pytest.Config) -> None:
-    """Make the path-free upload command collect benchmarks from the repo root."""
+    """Collect both suites for a path-free operator marker, with or without recording."""
 
     invocation_dir = Path(str(config.invocation_params.dir)).resolve()
     if (
@@ -150,7 +150,15 @@ def _include_marked_benchmarks(config: pytest.Config) -> None:
         and config.args == list(config.getini("testpaths"))
         and (config.rootpath / "benchmark").is_dir()
     ):
-        config.args.append("benchmark")
+        selected_mark = _selected_operator_mark(config)
+        if selected_mark:
+            config.args.extend(
+                str(path.relative_to(config.rootpath))
+                for path in sorted((config.rootpath / "benchmark").rglob("test_*.py"))
+                if _collection_matches_mark(str(path), selected_mark, config.rootpath)
+            )
+        else:
+            config.args.append("benchmark")
 
 
 def _operator_key(marks: list[str], selected_mark: str | None, default: str) -> str:
