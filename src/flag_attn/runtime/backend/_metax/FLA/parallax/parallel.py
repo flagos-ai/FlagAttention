@@ -2790,31 +2790,24 @@ def parallel_parallax_bwd(
 
 
 def _validate_parallel_parallax_inputs(q, r, k, v, window_size, cu_seqlens):
-    tensors = {"q": q, "r": r, "k": k, "v": v}
-    for name, tensor in tensors.items():
+    for name, tensor in (("q", q), ("r", r), ("k", k), ("v", v)):
         if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
+            raise TypeError(f"{name} must be a torch.Tensor")
         if tensor.ndim != 4:
-            raise ValueError(f"{name} must have shape [B, T, H, D], got {tuple(tensor.shape)}")
+            raise ValueError(f"{name} must have shape [B, T, H, D]")
         if tensor.device.type != "cuda":
-            raise ValueError(f"{name} must be a CUDA tensor, got device={tensor.device}")
+            raise ValueError(f"{name} must be a CUDA tensor")
 
-    if r.shape != q.shape:
-        raise ValueError(f"r shape {tuple(r.shape)} must match q shape {tuple(q.shape)}")
-    if v.shape != k.shape:
-        raise ValueError(f"v shape {tuple(v.shape)} must match k shape {tuple(k.shape)}")
+    if r.shape != q.shape or v.shape != k.shape:
+        raise ValueError("q/r and k/v must have matching shapes")
     if any(tensor.device != q.device for tensor in (r, k, v)):
         raise ValueError("q, r, k, and v must be on the same CUDA device")
-    if any(tensor.dtype != q.dtype for tensor in (r, k, v)):
-        raise TypeError("q, r, k, and v must have the same dtype")
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise TypeError(f"parallel_parallax requires bf16 or fp16 inputs, got q.dtype={q.dtype}")
+    if q.dtype not in (torch.bfloat16, torch.float16) or any(tensor.dtype != q.dtype for tensor in (r, k, v)):
+        raise TypeError("q, r, k, and v must have the same fp16 or bf16 dtype")
 
     B, T, HQ, K = q.shape
     if k.shape[0] != B or k.shape[1] != T or k.shape[3] != K:
-        raise ValueError(
-            f"k/v shape {tuple(k.shape)} is incompatible with q/r shape {tuple(q.shape)}; B, T, and D must match"
-        )
+        raise ValueError("q/r and k/v must have matching batch size, sequence length and head dimension")
     H = k.shape[2]
     if T <= 0 or H <= 0 or HQ <= 0:
         raise ValueError("sequence length and query/KV head counts must be positive")
@@ -2823,16 +2816,13 @@ def _validate_parallel_parallax_inputs(q, r, k, v, window_size, cu_seqlens):
     if not 16 <= K <= 256:
         raise ValueError(f"head dimension must be in [16, 256], got D={K}")
     if window_size is not None and (not isinstance(window_size, int) or window_size <= 0):
-        raise ValueError(f"window_size must be a positive integer or None, got {window_size!r}")
+        raise ValueError("window_size must be a positive integer or None")
 
     if cu_seqlens is not None:
         if not isinstance(cu_seqlens, torch.Tensor):
             raise TypeError("cu_seqlens must be a torch.Tensor or None")
         if B != 1:
-            raise ValueError(
-                f"The batch size is expected to be 1 rather than {B} when using cu_seqlens. "
-                "Flatten variable-length inputs before processing."
-            )
+            raise ValueError("cu_seqlens requires batch size 1")
         if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
             raise ValueError("cu_seqlens must be one-dimensional with at least two entries")
         if cu_seqlens.dtype not in (torch.int32, torch.int64):
