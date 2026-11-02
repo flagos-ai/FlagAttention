@@ -33,8 +33,6 @@ import triton
 import triton.language as tl
 from triton.testing import do_bench as _triton_do_bench
 
-from flag_attn.runtime import get_tuned_config
-
 from flag_attn.FLA.index import prepare_chunk_indices
 from flag_attn.FLA.utils import (
     get_num_sms,
@@ -42,6 +40,7 @@ from flag_attn.FLA.utils import (
     is_nvidia_blackwell_device,
     is_nvidia_hopper_device,
 )
+from flag_attn.runtime import get_tuned_config
 
 
 @triton.jit
@@ -87,7 +86,7 @@ def _bench_with_maca_resource_limit(fn, quantiles=None):
         return [float("inf")] * len(quantiles) if quantiles is not None else float("inf")
 
 
-def parallax_prune_configs(configs, named_args, **kwargs):
+def _prune_parallax_configs(configs, named_args, **kwargs):
     head_dim = _autotune_arg(named_args, kwargs, "K")
     if head_dim is None:
         q = _autotune_arg(named_args, kwargs, "q")
@@ -117,8 +116,8 @@ def parallax_prune_configs(configs, named_args, **kwargs):
     return _copy_autotune_configs(preferred or tile_matches)
 
 
-def parallax_prune_fwd_configs(configs, named_args, **kwargs):
-    valid = parallax_prune_configs(configs, named_args, **kwargs)
+def _prune_parallax_fwd_configs(configs, named_args, **kwargs):
+    valid = _prune_parallax_configs(configs, named_args, **kwargs)
     q = _autotune_arg(named_args, kwargs, "q")
     cu_seqlens = _autotune_arg(named_args, kwargs, "cu_seqlens")
     if q is not None and cu_seqlens is not None and 64 < q.shape[-1] <= 128:
@@ -150,8 +149,8 @@ def parallax_prune_fwd_configs(configs, named_args, **kwargs):
     return valid
 
 
-def parallax_prune_dqr_fused_configs(configs, named_args, **kwargs):
-    valid = parallax_prune_configs(configs, named_args, **kwargs)
+def _prune_parallax_dqr_fused_configs(configs, named_args, **kwargs):
+    valid = _prune_parallax_configs(configs, named_args, **kwargs)
     q = _autotune_arg(named_args, kwargs, "q")
     cu_seqlens = _autotune_arg(named_args, kwargs, "cu_seqlens")
     if q is not None and cu_seqlens is None and 32 < q.shape[-1] <= 64:
@@ -168,8 +167,8 @@ def parallax_prune_dqr_fused_configs(configs, named_args, **kwargs):
     return valid
 
 
-def parallax_prune_dkv_grouped_configs(configs, named_args, **kwargs):
-    valid = parallax_prune_configs(configs, named_args, **kwargs)
+def _prune_parallax_dkv_grouped_configs(configs, named_args, **kwargs):
+    valid = _prune_parallax_configs(configs, named_args, **kwargs)
     q = _autotune_arg(named_args, kwargs, "q")
     cu_seqlens = _autotune_arg(named_args, kwargs, "cu_seqlens")
     if q is not None and cu_seqlens is None and 32 < q.shape[-1] <= 64:
@@ -186,7 +185,7 @@ def parallax_prune_dkv_grouped_configs(configs, named_args, **kwargs):
     return valid
 
 
-def parallax_prune_dqr_varlen_configs(configs, named_args, **kwargs):
+def _prune_parallax_dqr_varlen_configs(configs, named_args, **kwargs):
     q = _autotune_arg(named_args, kwargs, "q")
     cu_seqlens = _autotune_arg(named_args, kwargs, "cu_seqlens")
     if q is not None and cu_seqlens is not None and 64 < q.shape[-1] <= 128:
@@ -204,10 +203,10 @@ def parallax_prune_dqr_varlen_configs(configs, named_args, **kwargs):
             if not selected:
                 raise RuntimeError("C550 varlen DQR resource candidate is missing")
             return _copy_autotune_configs(selected)
-    return parallax_prune_configs(configs, named_args, **kwargs)
+    return _prune_parallax_configs(configs, named_args, **kwargs)
 
 
-def parallax_prune_preprocess_configs(configs, named_args, **kwargs):
+def _prune_parallax_preprocess_configs(configs, named_args, **kwargs):
     cu_seqlens = _autotune_arg(named_args, kwargs, "cu_seqlens")
     if cu_seqlens is None:
         return _copy_autotune_configs(configs)
@@ -541,9 +540,9 @@ def parallel_parallax_fwd_kernel_c550_tiled(
 
 
 @triton.autotune(
-    configs=copy.deepcopy(get_tuned_config("parallel_parallax_fwd_kernel")),
+    configs=get_tuned_config("parallel_parallax_fwd_kernel"),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
-    prune_configs_by={"early_config_prune": parallax_prune_fwd_configs},
+    prune_configs_by={"early_config_prune": _prune_parallax_fwd_configs},
 )
 @triton.heuristics(
     {
@@ -1091,9 +1090,9 @@ def parallel_parallax_bwd_kernel_dkv_short_multi(
 
 
 @triton.autotune(
-    configs=copy.deepcopy(get_tuned_config("parallel_parallax_bwd_kernel_preprocess")),
+    configs=get_tuned_config("parallel_parallax_bwd_kernel_preprocess"),
     key=["T", "K", "IS_VARLEN"],
-    prune_configs_by={"early_config_prune": parallax_prune_preprocess_configs},
+    prune_configs_by={"early_config_prune": _prune_parallax_preprocess_configs},
 )
 @triton.heuristics(
     {
@@ -1335,10 +1334,10 @@ def _parallel_parallax_bwd_kernel_dqr(
 
 
 @triton.autotune(
-    configs=copy.deepcopy(get_tuned_config("parallel_parallax_bwd_kernel_dqr_fused")),
+    configs=get_tuned_config("parallel_parallax_bwd_kernel_dqr_fused"),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
     reset_to_zero=["grad_q", "grad_r"],
-    prune_configs_by={"early_config_prune": parallax_prune_dqr_fused_configs},
+    prune_configs_by={"early_config_prune": _prune_parallax_dqr_fused_configs},
 )
 @triton.heuristics(
     {
@@ -1408,11 +1407,11 @@ def parallel_parallax_bwd_kernel_dqr_fused(
 
 
 @triton.autotune(
-    configs=copy.deepcopy(get_tuned_config("parallel_parallax_bwd_kernel_dqr")),
+    configs=get_tuned_config("parallel_parallax_bwd_kernel_dqr"),
     do_bench=_bench_with_maca_resource_limit,
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
     reset_to_zero=["grad_q", "grad_r"],
-    prune_configs_by={"early_config_prune": parallax_prune_dqr_varlen_configs},
+    prune_configs_by={"early_config_prune": _prune_parallax_dqr_varlen_configs},
 )
 @triton.heuristics(
     {
@@ -1657,9 +1656,9 @@ def parallel_parallax_bwd_kernel_dkv_dense_aligned(
 
 
 @triton.autotune(
-    configs=copy.deepcopy(get_tuned_config("parallel_parallax_bwd_kernel_dkv")),
+    configs=get_tuned_config("parallel_parallax_bwd_kernel_dkv"),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
-    prune_configs_by={"early_config_prune": parallax_prune_configs},
+    prune_configs_by={"early_config_prune": _prune_parallax_configs},
     do_bench=_bench_with_maca_resource_limit,
 )
 @triton.heuristics(
@@ -1881,9 +1880,9 @@ def parallel_parallax_bwd_kernel_dkv(
 
 
 @triton.autotune(
-    configs=copy.deepcopy(get_tuned_config("parallel_parallax_bwd_kernel_dkv_grouped")),
+    configs=get_tuned_config("parallel_parallax_bwd_kernel_dkv_grouped"),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
-    prune_configs_by={"early_config_prune": parallax_prune_dkv_grouped_configs},
+    prune_configs_by={"early_config_prune": _prune_parallax_dkv_grouped_configs},
 )
 @triton.heuristics(
     {

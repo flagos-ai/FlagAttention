@@ -268,14 +268,13 @@ def _env_choice(name: str, default: int, choices: tuple[int, ...]) -> int:
 
 
 def _launch_config(kv_len: int, head_dim: int) -> tuple[int, int, int, int]:
-    values = {}
-    for name, (default, choices) in _DECODE_CONFIG.items():
-        if name == "BLOCK_N" and head_dim == 128 and kv_len <= 512:
-            default = 64
-        values[name] = _env_choice(f"PARALLAX_DECODE_{name}", default, choices)
-    block_n, num_warps, num_stages, max_splits = (
-        values[name] for name in ("BLOCK_N", "NUM_WARPS", "NUM_STAGES", "MAX_SPLITS")
-    )
+    default_block_n, block_n_choices = _DECODE_CONFIG["BLOCK_N"]
+    if head_dim == 128 and kv_len <= 512:
+        default_block_n = 64
+    block_n = _env_choice("PARALLAX_DECODE_BLOCK_N", default_block_n, block_n_choices)
+    num_warps = _env_choice("PARALLAX_DECODE_NUM_WARPS", *_DECODE_CONFIG["NUM_WARPS"])
+    num_stages = _env_choice("PARALLAX_DECODE_NUM_STAGES", *_DECODE_CONFIG["NUM_STAGES"])
+    max_splits = _env_choice("PARALLAX_DECODE_MAX_SPLITS", *_DECODE_CONFIG["MAX_SPLITS"])
     return block_n, num_warps, num_stages, max_splits
 
 
@@ -311,51 +310,6 @@ def _split_workspace(
         torch.empty(vector_shape, device=device, dtype=torch.float32),
         torch.empty(vector_shape, device=device, dtype=torch.float32),
     )
-
-
-def _validate_inputs(
-    q: torch.Tensor,
-    r: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    seqused_k: torch.Tensor | None,
-    out: torch.Tensor | None,
-) -> tuple[int, int, int, int, int]:
-    if q.ndim != 4 or q.shape[1] != 1 or r.shape != q.shape:
-        raise ValueError("q and r must have the same (B, 1, H_q, D) shape")
-    if k.ndim != 4 or v.shape != k.shape:
-        raise ValueError("k and v must have the same (B, L, H_kv, D) shape")
-    B, _, HQ, D = q.shape
-    Bk, L, H, Dk = k.shape
-    if B != Bk or D != Dk:
-        raise ValueError("q/r and k/v batch size and head dimension must match")
-    if min(L, HQ, H) < 1:
-        raise ValueError("KV length and head counts must be positive")
-    if HQ % H:
-        raise ValueError(f"H_q ({HQ}) must be divisible by H_kv ({H}) for GQA")
-    if D not in (64, 128):
-        raise ValueError(f"Triton decode supports head_dim in {{64, 128}}, got {D}")
-    tensors = (q, r, k, v)
-    if not q.is_cuda or any(x.device != q.device for x in tensors[1:]):
-        raise ValueError("q, r, k and v must be on the same CUDA device")
-    if q.dtype not in (torch.float16, torch.bfloat16) or any(x.dtype != q.dtype for x in tensors[1:]):
-        raise TypeError("q, r, k and v must have the same fp16 or bf16 dtype")
-    if seqused_k is not None:
-        if seqused_k.shape != (B,) or seqused_k.dtype != torch.int32:
-            raise ValueError(f"seqused_k must be int32 with shape ({B},)")
-        if seqused_k.device != q.device:
-            raise ValueError("seqused_k must be on the same CUDA device as q")
-        if not is_cuda_graph_capturing():
-            lo = int(seqused_k.min().item())
-            hi = int(seqused_k.max().item())
-            if lo < 1 or hi > L:
-                raise ValueError(f"seqused_k values must be in [1, {L}], got [{lo}, {hi}]")
-    if out is not None:
-        if out.shape != q.shape or out.dtype != q.dtype or out.device != q.device:
-            raise ValueError("out must match q's shape, dtype and device")
-        if not out.is_contiguous():
-            raise ValueError("out must be contiguous")
-    return B, L, HQ, H, D
 
 
 def _window_size_to_left(window_size) -> int:
@@ -398,14 +352,37 @@ def parallax_attn_with_kvcache(
     scale: float | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Triton Parallax decode with the CuTe baseline's FA-style interface.
+    """Single-token causal Parallax attention over a dense KV cache.
 
     Dense KV, MHA/GQA, fp16/bf16, runtime ``seqused_k``, sliding windows and a
     caller-owned output are supported.  Paged KV is not implemented.
     """
     if page_table is not None:
         raise NotImplementedError("paged KV (page_table) is not implemented")
-    B, L, HQ, H, D = _validate_inputs(q, r, k_cache, v_cache, seqused_k, out)
+    B, Sq, HQ, D = q.shape
+    Bk, L, H, Dk = k_cache.shape
+    if Sq != 1 or r.shape != q.shape:
+        raise ValueError("q and r must have the same (B, 1, H_q, D) shape")
+    if v_cache.shape != k_cache.shape or (Bk, Dk) != (B, D):
+        raise ValueError("k/v must have matching shapes and share q's batch size and head dimension")
+    if min(L, HQ, H) < 1 or HQ % H:
+        raise ValueError("KV length and head counts must be positive, with H_q divisible by H_kv")
+    if D not in (64, 128):
+        raise ValueError(f"Triton decode supports head_dim in {{64, 128}}, got {D}")
+    if not q.is_cuda or any(x.device != q.device for x in (r, k_cache, v_cache)):
+        raise ValueError("q, r, k and v must be on the same CUDA device")
+    if q.dtype not in (torch.float16, torch.bfloat16) or any(x.dtype != q.dtype for x in (r, k_cache, v_cache)):
+        raise TypeError("q, r, k and v must have the same fp16 or bf16 dtype")
+    if seqused_k is not None:
+        if seqused_k.shape != (B,) or seqused_k.dtype != torch.int32 or seqused_k.device != q.device:
+            raise ValueError("seqused_k must be int32 with shape (B,) on q's device")
+        if not is_cuda_graph_capturing():
+            lo, hi = int(seqused_k.min().item()), int(seqused_k.max().item())
+            if lo < 1 or hi > L:
+                raise ValueError(f"seqused_k values must be in [1, {L}], got [{lo}, {hi}]")
+    if out is not None:
+        if out.shape != q.shape or out.dtype != q.dtype or out.device != q.device or not out.is_contiguous():
+            raise ValueError("out must be contiguous and match q's shape, dtype and device")
     window_left = _window_size_to_left(window_size)
     if window_left < -1:
         raise ValueError("window_size left must be -1 or non-negative")
