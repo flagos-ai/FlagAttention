@@ -15,11 +15,10 @@
 """Ascend Triton implementation of fused Attention Residuals.
 
 The generic CUDA implementation in ``flag_attn.FLA.attnres.fused`` keeps the
-per-source residual pointers in a tuple kernel argument. triton-ascend does not
-support tuple-of-tensor arguments, so this override stacks the sources into one
-contiguous ``[L, N, D]`` buffer on the host and indexes it as
-``source * N + row`` inside the kernel. The stack is an extra device copy; it is
-accepted for this first version (correctness first, performance later).
+sources in a tuple kernel argument. triton-ascend has no tuple-of-tensor
+arguments, so the sources stay as separate tensors: the host passes a small
+int64 table of their base addresses and the kernel casts each entry back to a
+pointer, which avoids materialising a stacked copy of the residuals.
 """
 
 from __future__ import annotations
@@ -32,11 +31,30 @@ import triton.language as tl
 
 _INT32_MAX = 2**31 - 1
 
+# Small per-call address tables are reused when a caller keeps the same residual
+# tensors across steps (the common decode/benchmark case); the key holds the
+# exact addresses, so a rebuilt allocation can never alias a stale table.
+_PTR_TABLE_CACHE: dict = {}
+_MAX_PTR_TABLES = 64
+
+
+def _residual_ptr_table(flat_residuals: Sequence[torch.Tensor]) -> torch.Tensor:
+    ptrs = tuple(residual.data_ptr() for residual in flat_residuals)
+    key = (flat_residuals[0].device, ptrs)
+    table = _PTR_TABLE_CACHE.get(key)
+    if table is None:
+        table = torch.tensor(list(ptrs), dtype=torch.int64, device=flat_residuals[0].device)
+        if len(_PTR_TABLE_CACHE) >= _MAX_PTR_TABLES:
+            _PTR_TABLE_CACHE.clear()
+        _PTR_TABLE_CACHE[key] = table
+    return table
+
 
 @triton.jit
 def _fused_attnres_fwd_kernel(
     query,
-    residuals,
+    residual0,
+    residual_ptrs,
     rms_weight,
     output_rms_weight,
     output,
@@ -64,8 +82,12 @@ def _fused_attnres_fwd_kernel(
     output_values = tl.zeros([BD], dtype=tl.float32)
 
     for source in tl.static_range(0, L):
-        residual_ptr = residuals + (source * N + row) * D
-        residual_values = tl.load(residual_ptr + offsets_d, mask=mask_d, other=0.0).to(tl.float32)
+        # ``residual0`` only supplies the element pointer type; every source is
+        # a separate tensor indexed through the host-built address table.
+        residual_ptr = tl.cast(tl.load(residual_ptrs + source), residual0.dtype)
+        residual_values = tl.load(
+            residual_ptr + row * D + offsets_d, mask=mask_d, other=0.0
+        ).to(tl.float32)
 
         rstd = tl.rsqrt(tl.sum(residual_values * residual_values) / D + eps)
         source_logit = tl.sum(residual_values * query_weight) * rstd
@@ -157,16 +179,15 @@ def fused_attnres(
     flat_residuals = [residual.reshape(-1, hidden_size).contiguous() for residual in residuals]
     num_rows = flat_residuals[0].shape[0]
 
-    # triton-ascend has no tuple-of-tensor kernel args, so the sources are
-    # stacked into one [L, N, D] buffer and indexed as source * N + row.
-    if len(flat_residuals) == 1:
-        stacked_residuals = flat_residuals[0]
-    else:
-        stacked_residuals = torch.stack(flat_residuals, dim=0)
-    if stacked_residuals.numel() > _INT32_MAX:
+    # triton-ascend has no tuple-of-tensor kernel args; pass the source base
+    # addresses as a small int64 table and cast them back in the kernel, so no
+    # stacked copy of the residuals is needed.
+    if num_rows * hidden_size > _INT32_MAX:
         raise ValueError(
-            f"fused_attnres on Ascend indexes residuals with int32 offsets, got {stacked_residuals.numel()} elements"
+            f"fused_attnres on Ascend indexes residuals with int32 offsets, got "
+            f"{num_rows * hidden_size} elements per source"
         )
+    residual_ptrs = _residual_ptr_table(flat_residuals)
 
     output = torch.empty_like(flat_residuals[0])
     if return_weights:
@@ -178,7 +199,8 @@ def fused_attnres(
     if num_rows > 0:
         _fused_attnres_fwd_kernel[(num_rows,)](
             query.reshape(-1).contiguous(),
-            stacked_residuals,
+            flat_residuals[0],
+            residual_ptrs,
             rms_weight.reshape(-1).contiguous(),
             None if output_rms_weight is None else output_rms_weight.reshape(-1).contiguous(),
             output,
