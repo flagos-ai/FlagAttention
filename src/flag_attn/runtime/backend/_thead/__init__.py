@@ -32,7 +32,7 @@ _OPERATOR_EXPORTS = {
         ".minimax_sparse_attention.sparse_attn",
         "minimax_m3_sparse_attn_decode",
     ),
-        "parallel_wall_attn": (
+    "parallel_wall_attn": (
         ".FLA.wall_attn.parallel",
         "parallel_wall_attn",
     ),

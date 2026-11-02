@@ -31,7 +31,6 @@ Uses generic Triton forward/backward kernels without NVIDIA-specific dispatch.
 # This module has no runtime dependency on the source FLA repository.
 
 import os
-from contextvars import ContextVar
 
 import torch
 import triton
@@ -54,8 +53,6 @@ def exp2(x):
 def log2(x):
     return tl.log2(x)
 
-
-_DEBUG_ASSERTS = os.environ.get("WALL_ATTN_DEBUG", "0") == "1"
 
 # Set WALL_ATTN_DKV_DIAG_BF16=0 to force fp32 tensor cores in the diagonal loop
 # of parallel_wall_attn_bwd_kernel_dkv (precision over speed).
@@ -118,12 +115,21 @@ def parallel_wall_attn_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     USE_SCALAR_G: tl.constexpr,
 ):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    # int64 tile indices reduce spills in the PPU forward kernel.
+    # Interleave heads in the fastest grid dimension and issue costly causal
+    # query tiles first. This spreads independent heads across the 64 PPU SMs
+    # and leaves only cheap tiles in the last CTA waves.
+    pid = tl.program_id(0).to(tl.int64)
+    nv = tl.cdiv(V, BV)
+    i_v = pid % nv
+    i_bh = pid // nv % (B * HQ)
+    nt = tl.num_programs(0) // (nv * B * HQ)
+    i_t = nt - 1 - pid // (nv * B * HQ)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
     i_h = i_hq // G
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = (eos - bos).to(tl.int32)
     else:
@@ -131,16 +137,22 @@ def parallel_wall_attn_fwd_kernel(
         bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
     RCP_LN2: tl.constexpr = 1.4426950216
 
-    p_q = tl.make_block_ptr(q + (bos * HQ + i_hq) * K, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
-    p_o = tl.make_block_ptr(o + (bos * HQ + i_hq) * V, (T, V), (HQ*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-    p_lse = tl.make_block_ptr(lse + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,))
+    o_q = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_q = o_q < T
+    m_qk = m_q[:, None] & (o_d[None, :] < K)
+    p_q = q + (bos * HQ + i_hq) * K + o_q[:, None] * (HQ*K) + o_d[None, :]
+    p_o = o + (bos * HQ + i_hq) * V + o_q[:, None] * (HQ*V) + o_v[None, :]
+    p_lse = lse + bos * HQ + i_hq + o_q * HQ
 
-    p_pq = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
-    p_R = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (T, K), (HQ*K, 1), (i_t * BT, 0), (1, BK), (1, 0))
+    p_pq = g_cumsum + (bos * HQ + i_hq) * K + o_q[:, None] * (HQ*K) + o_d[None, :]
+    o_r = i_t * BT + tl.arange(0, 1)
+    p_R = g_cumsum + (bos * HQ + i_hq) * K + o_r[:, None] * (HQ*K) + o_d[None, :]
 
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_pq = tl.load(p_pq, boundary_check=(0, 1)).to(tl.float32)
-    b_R = tl.load(p_R, boundary_check=(0, 1)).to(tl.float32)
+    b_q = tl.load(p_q, mask=m_qk, other=0.0)
+    b_pq = tl.load(p_pq, mask=m_qk, other=0.0).to(tl.float32)
+    b_R = tl.load(p_R, mask=(o_r[:, None] < T) & (o_d[None, :] < K), other=0.0).to(tl.float32)
     # b_R is at i_t*BT; the same value is used in both off-diag and diag loops,
     # since |b_pq - b_R| within a BT-chunk is bounded by BT*|g_max|*RCP_LN2.
     # Off-diagonal: P_q - R <= 0 and R - P_k <= 0 -> exp2 <= 1 -> bf16 safe.
@@ -151,32 +163,31 @@ def parallel_wall_attn_fwd_kernel(
     b_acc = tl.zeros([BT], dtype=tl.float32)
 
     if USE_SCALAR_G:
-        p_cq = tl.make_block_ptr(g_scalar_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,))
-        b_cq = tl.load(p_cq, boundary_check=(0,)).to(tl.float32)
+        p_cq = g_scalar_cumsum + bos * HQ + i_hq + o_q * HQ
+        b_cq = tl.load(p_cq, mask=m_q, other=0.0).to(tl.float32)
 
     if USE_SINK_BIAS:
         b_sink_bias = tl.load(sink_bias + i_hq).to(tl.float32)
     else:
         b_sink_bias = None
 
-    o_q = i_t * BT + tl.arange(0, BT)
     i_start = tl.maximum((i_t * BT - W + 1) // BS * BS, 0) if USE_WINDOW else 0
 
     b_R_t = tl.trans(b_R)
 
     for i_s in range(i_start, i_t * BT, BS):
-        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H*K), (0, i_s), (BK, BS), (0, 1))
-        p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H*V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
-        p_pk = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (K, T), (1, HQ*K), (0, i_s), (BK, BS), (0, 1))
+        o_k = i_s + tl.arange(0, BS)
+        m_k = o_k < T
+        p_k = k + (bos * H + i_h) * K + o_d[:, None] + o_k[None, :] * (H*K)
+        p_v = v + (bos * H + i_h) * V + o_k[:, None] * (H*V) + o_v[None, :]
+        p_pk = g_cumsum + (bos * HQ + i_hq) * K + o_d[:, None] + o_k[None, :] * (HQ*K)
 
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_pk = tl.load(p_pk, boundary_check=(0, 1)).to(tl.float32)
+        b_k = tl.load(p_k, mask=(o_d[:, None] < K) & m_k[None, :], other=0.0)
+        b_v = tl.load(p_v, mask=m_k[:, None] & (o_v[None, :] < V), other=0.0)
+        b_pk = tl.load(p_pk, mask=(o_d[:, None] < K) & m_k[None, :], other=0.0).to(tl.float32)
         b_k_til = (b_k.to(tl.float32) * exp2(b_R_t - b_pk)).to(b_k.dtype)
         b_s = tl.dot(b_q_til, b_k_til) * scale * RCP_LN2
 
-        o_k = i_s + tl.arange(0, BS)
-        m_k = o_k < T
         if USE_SCALAR_G:
             b_ck = tl.load(g_scalar_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
             b_s += b_cq[:, None] - b_ck[None, :]
@@ -192,21 +203,22 @@ def parallel_wall_attn_fwd_kernel(
         b_mp = b_m
 
     for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
-        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H*K), (0, i_s), (BK, BS), (0, 1))
-        p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H*V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
-        p_pk = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (K, T), (1, HQ*K), (0, i_s), (BK, BS), (0, 1))
+        o_k = i_s + tl.arange(0, BS)
+        m_k = o_k < T
+        p_k = k + (bos * H + i_h) * K + o_d[:, None] + o_k[None, :] * (H*K)
+        p_v = v + (bos * H + i_h) * V + o_k[:, None] * (H*V) + o_v[None, :]
+        p_pk = g_cumsum + (bos * HQ + i_hq) * K + o_d[:, None] + o_k[None, :] * (HQ*K)
 
         # Per-sub-block local reference to prevent exp2 overflow.
-        p_R_local = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (T, K), (HQ*K, 1), (i_s, 0), (1, BK), (1, 0))
-        b_R_local = tl.load(p_R_local, boundary_check=(0, 1)).to(tl.float32)
+        o_r = i_s + tl.arange(0, 1)
+        p_R_local = g_cumsum + (bos * HQ + i_hq) * K + o_r[:, None] * (HQ*K) + o_d[None, :]
+        b_R_local = tl.load(p_R_local, mask=(o_r[:, None] < T) & (o_d[None, :] < K), other=0.0).to(tl.float32)
         b_R_local_bc = tl.broadcast_to(b_R_local, (BT, BK))
         b_R_local_t = tl.trans(b_R_local)
 
-        o_k = i_s + tl.arange(0, BS)
-        m_k = o_k < T
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_pk = tl.load(p_pk, boundary_check=(0, 1)).to(tl.float32)
+        b_k = tl.load(p_k, mask=(o_d[:, None] < K) & m_k[None, :], other=0.0)
+        b_v = tl.load(p_v, mask=m_k[:, None] & (o_v[None, :] < V), other=0.0)
+        b_pk = tl.load(p_pk, mask=(o_d[:, None] < K) & m_k[None, :], other=0.0).to(tl.float32)
 
         # k_til in local frame: exp2 bounded by BS positions <= 110 (fp32-safe with BK dot).
         b_exp_k = b_R_local_t - b_pk
@@ -241,8 +253,9 @@ def parallel_wall_attn_fwd_kernel(
 
     b_o = b_o / b_acc[:, None]
     b_m += log2(b_acc)
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_lse, b_m.to(p_lse.dtype.element_ty), boundary_check=(0,))
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_q[:, None] & (o_v[None, :] < V))
+    if i_v == 0:
+        tl.store(p_lse, b_m.to(p_lse.dtype.element_ty), mask=m_q)
 
 
 @triton.autotune(
@@ -643,7 +656,7 @@ def parallel_wall_attn_fwd(
         NT = len(chunk_indices)
         o = torch.empty(B, T, HQ, V, dtype=v.dtype, device=q.device)
         lse = torch.empty(B, T, HQ, dtype=torch.float, device=q.device)
-        parallel_wall_attn_fwd_kernel.fn[(NV, NT, B * HQ)](
+        parallel_wall_attn_fwd_kernel.fn[(NV * NT * B * HQ,)](
             q=q, k=k, v=v, o=o,
             g_cumsum=g_cumsum, g_scalar_cumsum=g_scalar_cumsum, sink_bias=sink_bias,
             lse=lse, scale=scale, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
@@ -656,7 +669,7 @@ def parallel_wall_attn_fwd(
     lse = torch.empty(B, T, HQ, dtype=torch.float, device=q.device)
 
     def grid(meta):
-        return (NV, triton.cdiv(T, meta['BT']), B * HQ)
+        return (NV * triton.cdiv(T, meta['BT']) * B * HQ,)
     parallel_wall_attn_fwd_kernel[grid](
         q=q,
         k=k,
@@ -834,24 +847,11 @@ class WallParallelAttentionFunction(torch.autograd.Function):
         if q.shape[2] % k.shape[2] != 0:
             raise ValueError("HQ must be divisible by `k.shape[2]` for GQA")
 
-        if _DEBUG_ASSERTS:
-            assert torch.isfinite(g).all(), f"[wall-attn fwd] NaN/Inf in g: {g.abs().max()}"
-            assert torch.isfinite(q).all(), f"[wall-attn fwd] NaN/Inf in q: {q.abs().max()}"
-            assert torch.isfinite(k).all(), f"[wall-attn fwd] NaN/Inf in k: {k.abs().max()}"
-            assert torch.isfinite(v).all(), f"[wall-attn fwd] NaN/Inf in v: {v.abs().max()}"
 
         P = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, scale=RCP_LN2)
-        if _DEBUG_ASSERTS:
-            assert torch.isfinite(P).all(), (
-                f"[wall-attn fwd] NaN/Inf in P=cumsum(g): P abs max={P.abs().max()}, g abs max={g.abs().max()}"
-            )
 
         if g_scalar is not None:
-            if _DEBUG_ASSERTS:
-                assert torch.isfinite(g_scalar).all(), f"[wall-attn fwd] NaN/Inf in g_scalar: {g_scalar.abs().max()}"
             c = chunk_global_cumsum(g_scalar, cu_seqlens=cu_seqlens, scale=RCP_LN2)
-            if _DEBUG_ASSERTS:
-                assert torch.isfinite(c).all(), f"[wall-attn fwd] NaN/Inf in c=cumsum(g_scalar): c abs max={c.abs().max()}"
         else:
             c = None
 
@@ -868,11 +868,6 @@ class WallParallelAttentionFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
-        if _DEBUG_ASSERTS:
-            assert torch.isfinite(o).all(), (
-                f"[wall-attn fwd] NaN/Inf in output o: o abs max={o.abs().max()}, "
-                f"lse finite={torch.isfinite(lse).all()}, P abs max={P.abs().max()}"
-            )
 
         ctx.save_for_backward(q, k, v, o, P, lse, sink_bias_scaled, c if c is not None else torch.empty(0))
         ctx.scale = scale
@@ -888,8 +883,6 @@ class WallParallelAttentionFunction(torch.autograd.Function):
         q, k, v, o, P, lse, sink_bias_scaled, c_or_empty = ctx.saved_tensors
         c = c_or_empty if ctx.has_scalar_g else None
 
-        if _DEBUG_ASSERTS:
-            assert torch.isfinite(do).all(), f"[wall-attn bwd] NaN/Inf in do: {do.abs().max()}"
 
         dq, dk, dv, dP, dsink_bias, dc = parallel_wall_attn_bwd(
             q=q,
@@ -905,23 +898,10 @@ class WallParallelAttentionFunction(torch.autograd.Function):
             window_size=ctx.window_size,
             cu_seqlens=ctx.cu_seqlens,
         )
-        if _DEBUG_ASSERTS:
-            assert torch.isfinite(dq).all(), f"[wall-attn bwd] NaN/Inf in dq: {dq.abs().max()}"
-            assert torch.isfinite(dk).all(), f"[wall-attn bwd] NaN/Inf in dk: {dk.abs().max()}"
-            assert torch.isfinite(dv).all(), f"[wall-attn bwd] NaN/Inf in dv: {dv.abs().max()}"
-            assert torch.isfinite(dP).all(), (
-                f"[wall-attn bwd] NaN/Inf in dP: dP abs max={dP.abs().max()}, "
-                f"P abs max={P.abs().max()}, lse finite={torch.isfinite(lse).all()}"
-            )
 
         # The kernel emits dP with an LN2 factor (b_dg = LN2 * q * dq); the forward set
         # P = cumsum(g) * RCP_LN2, so dL/dg = RCP_LN2 * reverse_cumsum(dP) (nets the LN2).
         dg = chunk_global_cumsum(dP, cu_seqlens=ctx.cu_seqlens, reverse=True, scale=RCP_LN2)
-        if _DEBUG_ASSERTS:
-            assert torch.isfinite(dg).all(), (
-                f"[wall-attn bwd] NaN/Inf in dg (after rev cumsum): dg abs max={dg.abs().max()}, "
-                f"dP abs max={dP.abs().max()}"
-            )
 
         if dc is not None:
             dg_scalar = chunk_global_cumsum(dc, cu_seqlens=ctx.cu_seqlens, reverse=True)
@@ -931,7 +911,7 @@ class WallParallelAttentionFunction(torch.autograd.Function):
         return dq.to(q), dk.to(k), dv.to(v), dg, dsink_bias, None, None, None, dg_scalar, None
 
 
-def _parallel_wall_attn_default(
+def parallel_wall_attn(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -986,51 +966,4 @@ def _parallel_wall_attn_default(
     )
 
 
-
-
-_LAST_ROUTE: ContextVar[str | None] = ContextVar(
-    "wall_attn_route", default=None
-)
-
-
-def get_last_route() -> str | None:
-    """Return the route used by the T-Head implementation."""
-    return _LAST_ROUTE.get()
-
-
-def select_route(*args, **kwargs) -> str:
-    """Select the generic Triton implementation."""
-    return "thead_triton_generic"
-
-
-def parallel_wall_attn(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    *,
-    g_scalar: torch.Tensor | None = None,
-    sink_bias: torch.Tensor | None = None,
-    scale: float | None = None,
-    window_size: int | None = None,
-    cu_seqlens: torch.LongTensor | None = None,
-) -> torch.Tensor:
-    """Run Wall Attention using generic Triton kernels."""
-
-    _LAST_ROUTE.set("thead_triton_generic")
-
-    return _parallel_wall_attn_default(
-        q,
-        k,
-        v,
-        g,
-        g_scalar=g_scalar,
-        sink_bias=sink_bias,
-        scale=scale,
-        window_size=window_size,
-        cu_seqlens=cu_seqlens,
-    )
-
-
-__all__ = ["parallel_wall_attn", "select_route", "get_last_route"]
-
+__all__ = ["parallel_wall_attn"]
