@@ -1,26 +1,7 @@
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 # SPDX-License-Identifier: MIT
 #
-# MIT License
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-
+# See LICENSE in this directory for the full license text.
 
 from __future__ import annotations
 
@@ -34,12 +15,7 @@ import triton.language as tl
 from triton.testing import do_bench as _triton_do_bench
 
 from flag_attn.FLA.index import prepare_chunk_indices
-from flag_attn.FLA.utils import (
-    get_num_sms,
-    has_shared_memory,
-    is_nvidia_blackwell_device,
-    is_nvidia_hopper_device,
-)
+from flag_attn.FLA.utils import get_num_sms
 from flag_attn.runtime import get_tuned_config
 
 
@@ -60,10 +36,6 @@ def _block_size(head_dim: int, device_index: int, cu_seqlens=None) -> int:
         name = torch.cuda.get_device_name(device_index).upper()
         if "METAX" in name and "C550" in name:
             return 32
-    if is_nvidia_blackwell_device(device_index):
-        return 128
-    if has_shared_memory(232_448, device_index):
-        return 64 if head_dim <= 128 else 32
     return 64
 
 
@@ -1478,183 +1450,6 @@ def parallel_parallax_bwd_kernel_dqr(
     )
 
 
-@triton.jit
-def _parallel_parallax_dkv_dense_aligned_accumulate_row(
-    q,
-    r,
-    grad_o,
-    d1,
-    bart,
-    m,
-    delta_t,
-    delta_b,
-    b_k,
-    b_v,
-    bos,
-    i_hq,
-    row_indices,
-    col_indices,
-    scale,
-    grad_k_acc,
-    grad_v_acc,
-    HQ: tl.constexpr,
-    K: tl.constexpr,
-    BK: tl.constexpr,
-    CAUSAL_BORDER: tl.constexpr,
-):
-    o_k = tl.arange(0, BK)
-    q_offsets = ((bos + row_indices[:, None]) * HQ + i_hq) * K + o_k[None, :]
-    scalar_offsets = (bos + row_indices[:, None]) * HQ + i_hq
-
-    b_q = tl.load(q + q_offsets)
-    b_r = tl.load(r + q_offsets)
-    grad_o_tile = tl.load(grad_o + q_offsets)
-    b_d1 = tl.load(d1 + scalar_offsets)
-    b_bart = tl.load(bart + scalar_offsets)
-    b_m = tl.load(m + scalar_offsets)
-    b_t = tl.load(delta_t + scalar_offsets)
-    b_b = tl.load(delta_b + scalar_offsets)
-
-    qk = tl.dot(b_q, tl.trans(b_k), out_dtype=tl.float32)
-    qk *= scale * 1.4426950216
-    if CAUSAL_BORDER:
-        qk = tl.where(
-            row_indices[:, None] >= col_indices[None, :],
-            qk,
-            -float("inf"),
-        )
-    p = exp2(qk - b_m) / b_d1
-    rk = tl.dot(b_r, tl.trans(b_k), out_dtype=tl.float32)
-    a = tl.dot(grad_o_tile, tl.trans(b_v), out_dtype=tl.float32)
-    delta = a - b_b
-    bart_minus_rk = b_bart - rk
-    gl = p * (a - b_t + bart_minus_rk * delta) * scale
-    gu = -p * delta
-    grad_k_acc = tl.dot(
-        tl.trans(gl).to(b_q.dtype),
-        b_q,
-        out_dtype=tl.float32,
-        acc=grad_k_acc,
-    )
-    grad_k_acc = tl.dot(
-        tl.trans(gu).to(b_r.dtype),
-        b_r,
-        out_dtype=tl.float32,
-        acc=grad_k_acc,
-    )
-    weights = p * (1.0 + bart_minus_rk)
-    grad_v_acc = tl.dot(
-        tl.trans(weights).to(grad_o_tile.dtype),
-        grad_o_tile,
-        out_dtype=tl.float32,
-        acc=grad_v_acc,
-    )
-    return grad_k_acc, grad_v_acc
-
-
-@triton.jit
-def parallel_parallax_bwd_kernel_dkv_dense_aligned(
-    q,
-    r,
-    k,
-    v,
-    d1,
-    bart,
-    m,
-    delta_t,
-    delta_b,
-    grad_o,
-    grad_k,
-    grad_v,
-    scale,
-    T: tl.constexpr,
-    HQ: tl.constexpr,
-    H: tl.constexpr,
-    G: tl.constexpr,
-    K: tl.constexpr,
-    BK: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-):
-    tl.static_assert(K == BK)
-    tl.static_assert(BT == BS)
-    tl.static_assert(T % BT == 0)
-
-    i_col = tl.program_id(0).to(tl.int64)
-    i_bh = tl.program_id(1).to(tl.int64)
-    i_b, i_hq = i_bh // HQ, i_bh % HQ
-    i_h = i_hq // G
-    bos = i_b * T
-
-    col_indices = i_col * BS + tl.arange(0, BS).to(tl.int64)
-    o_k = tl.arange(0, BK).to(tl.int64)
-    kv_offsets = ((bos + col_indices[:, None]) * H + i_h) * K + o_k[None, :]
-    out_offsets = ((bos + col_indices[:, None]) * HQ + i_hq) * K + o_k[None, :]
-    b_k = tl.load(k + kv_offsets)
-    b_v = tl.load(v + kv_offsets)
-    grad_k_acc = tl.zeros((BS, BK), dtype=tl.float32)
-    grad_v_acc = tl.zeros((BS, BK), dtype=tl.float32)
-
-    border_rows = i_col * BT + tl.arange(0, BT).to(tl.int64)
-    grad_k_acc, grad_v_acc = _parallel_parallax_dkv_dense_aligned_accumulate_row(
-        q,
-        r,
-        grad_o,
-        d1,
-        bart,
-        m,
-        delta_t,
-        delta_b,
-        b_k,
-        b_v,
-        bos,
-        i_hq,
-        border_rows,
-        col_indices,
-        scale,
-        grad_k_acc,
-        grad_v_acc,
-        HQ,
-        K,
-        BK,
-        True,
-    )
-    for row_block in range(i_col + 1, T // BT):
-        row_indices = row_block * BT + tl.arange(0, BT).to(tl.int64)
-        grad_k_acc, grad_v_acc = _parallel_parallax_dkv_dense_aligned_accumulate_row(
-            q,
-            r,
-            grad_o,
-            d1,
-            bart,
-            m,
-            delta_t,
-            delta_b,
-            b_k,
-            b_v,
-            bos,
-            i_hq,
-            row_indices,
-            col_indices,
-            scale,
-            grad_k_acc,
-            grad_v_acc,
-            HQ,
-            K,
-            BK,
-            False,
-        )
-
-    tl.store(
-        grad_k + out_offsets,
-        grad_k_acc.to(grad_k.dtype.element_ty),
-    )
-    tl.store(
-        grad_v + out_offsets,
-        grad_v_acc.to(grad_v.dtype.element_ty),
-    )
-
-
 @triton.autotune(
     configs=get_tuned_config("parallel_parallax_bwd_kernel_dkv"),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
@@ -2201,15 +1996,6 @@ def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None
                 num_stages=1,
             )
         elif NQ <= 8 or use_c550_padded_fwd:
-            use_d100_short_w8 = (
-                is_nvidia_hopper_device(q.device.index)
-                and B == 3
-                and T == 111
-                and H == 2
-                and HQ == 2
-                and K == 100
-                and window_size_left < 0
-            )
             parallel_parallax_fwd_kernel_short_multi[query_grid](
                 q,
                 r,
@@ -2230,8 +2016,8 @@ def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None
                 WINDOW_SIZE_LEFT=window_size_left,
                 BT=BT,
                 NT=NQ,
-                num_warps=(8 if use_d100_short_w8 else (4 if BT <= 64 else 8)),
-                num_stages=1 if (use_c550_short or use_c550_padded_fwd or use_d100_short_w8) else 2,
+                num_warps=(4 if BT <= 64 else 8),
+                num_stages=1 if (use_c550_short or use_c550_padded_fwd) else 2,
             )
         else:
             parallel_parallax_fwd_kernel[query_grid](
@@ -2300,25 +2086,7 @@ def parallel_parallax_bwd(
     dkv_programs = (len(chunk_indices) if cu_seqlens is not None else NQ) * B * H
     num_sms = get_num_sms(q.device.index)
     group_dkv_heads = G in (4, 8) or (G == 2 and (cu_seqlens is not None or T > 8192))
-    prefer_per_head_dkv = (
-        is_nvidia_hopper_device(q.device.index)
-        and cu_seqlens is None
-        and K == 128
-        and ((B == 2 and T == 8192 and HQ == 16 and G in (4, 8)) or (B == 4 and T == 16384 and HQ == 32 and G == 2))
-    )
-    use_dense_aligned_dkv = (
-        is_nvidia_hopper_device(q.device.index)
-        and q.dtype == torch.bfloat16
-        and cu_seqlens is None
-        and B == 2
-        and T == 8192
-        and H == 8
-        and HQ == 16
-        and G == 2
-        and K == 128
-        and BT == 64
-        and window_size_left < 0
-    )
+    prefer_per_head_dkv = False
     if cu_seqlens is None and T > 256 and 32 < K <= 128 and G in (4, 8):
         if "C550" in torch.cuda.get_device_name(q.device).upper():
             prefer_per_head_dkv = True
@@ -2372,15 +2140,6 @@ def parallel_parallax_bwd(
                 num_stages=1,
             )
         elif NQ <= 16 or (use_c550_short and NQ <= 32):
-            use_d100_short_bwd = (
-                is_nvidia_hopper_device(q.device.index)
-                and B == 3
-                and T == 111
-                and H == 2
-                and HQ == 2
-                and K == 100
-                and window_size_left < 0
-            )
             parallel_parallax_bwd_kernel_dqr_short_multi[query_grid](
                 q,
                 r,
@@ -2404,7 +2163,7 @@ def parallel_parallax_bwd(
                 WINDOW_SIZE_LEFT=window_size_left,
                 BT=BT,
                 NT=NQ,
-                num_warps=(8 if use_d100_short_bwd else (4 if BT <= 64 else 8)),
+                num_warps=(4 if BT <= 64 else 8),
                 num_stages=1 if use_c550_short else 2,
             )
             parallel_parallax_bwd_kernel_dkv_short_multi[query_grid](
@@ -2430,8 +2189,8 @@ def parallel_parallax_bwd(
                 WINDOW_SIZE_LEFT=window_size_left,
                 BT=BT,
                 NT=NQ,
-                num_warps=(8 if use_d100_short_bwd else (4 if BT <= 64 else 8)),
-                num_stages=1 if (use_c550_short or use_d100_short_bwd) else 2,
+                num_warps=(4 if BT <= 64 else 8),
+                num_stages=1 if use_c550_short else 2,
             )
         else:
             deltas = torch.empty((2, B, T, HQ), device=q.device, dtype=torch.float32)
@@ -2514,33 +2273,7 @@ def parallel_parallax_bwd(
                     WINDOW_SIZE_LEFT=window_size_left,
                     BT=BT,
                 )
-            if use_dense_aligned_dkv:
-                parallel_parallax_bwd_kernel_dkv_dense_aligned[(T // BT, B * HQ)](
-                    q,
-                    r,
-                    k,
-                    v,
-                    d1,
-                    bart,
-                    m,
-                    delta_t,
-                    delta_b,
-                    grad_o,
-                    grad_k_buf,
-                    grad_v_buf,
-                    scale,
-                    T,
-                    HQ=HQ,
-                    H=H,
-                    G=G,
-                    K=K,
-                    BK=BK,
-                    BT=BT,
-                    BS=64,
-                    num_warps=8,
-                    num_stages=3,
-                )
-            elif use_grouped_dkv:
+            if use_grouped_dkv:
                 parallel_parallax_bwd_kernel_dkv_grouped[grouped_dkv_grid](
                     q,
                     r,
