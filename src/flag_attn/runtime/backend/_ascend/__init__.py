@@ -6,6 +6,7 @@ import importlib
 _OPERATOR_EXPORTS = {
     "chunk_gdn2": (".gdn2", "chunk_gdn2"),
     "forward": (".attn_qk_int8_per_block", "forward"),
+    "fused_attnres": (".FLA.attnres", "fused_attnres"),
     "per_block_int8": (".ops", "quant_per_block_int8"),
     "quant_per_block_int8": (".ops", "quant_per_block_int8"),
     "sage_attention": (".attn_qk_int8_per_block", "forward"),
