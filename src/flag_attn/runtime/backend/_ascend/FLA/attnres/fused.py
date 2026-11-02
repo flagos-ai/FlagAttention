@@ -97,6 +97,7 @@ def _fused_attnres_fwd_kernel(
     RETURN_WEIGHTS: tl.constexpr,
     SINGLE: tl.constexpr,
     PREFETCH: tl.constexpr,
+    NOMAX: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets_d = tl.arange(0, BD)
@@ -143,12 +144,20 @@ def _fused_attnres_fwd_kernel(
         source_logit = tl.sum(residual_values * query_weight) * rstd
         source_score = source_logit * scale
 
-        previous_max = running_max
-        running_max = tl.maximum(running_max, source_score)
-        rescale = tl.exp(previous_max - running_max)
-        probability = tl.exp(source_score - running_max)
-        running_sum = running_sum * rescale + probability
-        output_values = output_values * rescale + probability * residual_values
+        if NOMAX:
+            # With the standard scale (1/sqrt(D)) the scores are O(1) after RMS
+            # normalisation, so the max subtraction and its rescale tile are
+            # redundant; dropping them removes one full-width vector op.
+            probability = tl.exp(source_score)
+            running_sum += probability
+            output_values += probability * residual_values
+        else:
+            previous_max = running_max
+            running_max = tl.maximum(running_max, source_score)
+            rescale = tl.exp(previous_max - running_max)
+            probability = tl.exp(source_score - running_max)
+            running_sum = running_sum * rescale + probability
+            output_values = output_values * rescale + probability * residual_values
 
         if RETURN_WEIGHTS:
             tl.store(logit + source * N + row, source_logit)
@@ -169,7 +178,10 @@ def _fused_attnres_fwd_kernel(
 
     tl.store(output + row * D + offsets_d, output_values.to(output.dtype.element_ty), mask=mask_d)
     if RETURN_WEIGHTS:
-        tl.store(lse + row, running_max + tl.log(running_sum))
+        if NOMAX:
+            tl.store(lse + row, tl.log(running_sum))
+        else:
+            tl.store(lse + row, running_max + tl.log(running_sum))
 
 
 def _validate_inputs(
@@ -214,6 +226,15 @@ def _validate_inputs(
             )
 
 
+def _prefetch_enabled(num_sources: int, has_output_norm: bool) -> bool:
+    """Prefetch overlaps a source read with the current one.
+
+    The double buffer does not fit in UB together with the output-norm weight
+    tile on this device, so output-norm specializations keep the plain loop.
+    """
+    return num_sources > 1 and not has_output_norm
+
+
 def _launch(grid, values, constexprs) -> None:
     """Launch through the cached raw launcher; fall back to Triton when needed."""
     key = (
@@ -229,6 +250,7 @@ def _launch(grid, values, constexprs) -> None:
         constexprs["RETURN_WEIGHTS"],
         constexprs["SINGLE"],
         constexprs["PREFETCH"],
+        constexprs["NOMAX"],
     )
     entry = _LAUNCH_SITE.get(key)
     if entry is None:
@@ -308,7 +330,8 @@ def fused_attnres(
             HAS_ONORM=output_rms_weight is not None,
             RETURN_WEIGHTS=return_weights,
             SINGLE=single,
-            PREFETCH=(not single) and output_rms_weight is None,
+            PREFETCH=_prefetch_enabled(len(residuals), output_rms_weight is not None),
+            NOMAX=scale <= hidden_size ** -0.5,
         )
         _launch((num_rows,), values, constexprs)
 
