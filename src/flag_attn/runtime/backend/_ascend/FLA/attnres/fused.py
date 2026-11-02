@@ -22,6 +22,11 @@ pointer, which avoids materialising a stacked copy of the residuals. A single
 source is read directly, and the launch goes through a cached raw launcher
 because the device time of this one-kernel operator is small enough that
 Triton's per-call Python launch path dominates.
+
+The kernel is bound by fp32 vector throughput rather than bandwidth, so with
+several sources it rotates two residual buffers to overlap the next source's
+load with the current source's arithmetic, and it folds the trailing RMSNorm
+into the softmax denominator to keep that epilogue to one full-width pass.
 """
 
 from __future__ import annotations
@@ -91,6 +96,7 @@ def _fused_attnres_fwd_kernel(
     HAS_ONORM: tl.constexpr,
     RETURN_WEIGHTS: tl.constexpr,
     SINGLE: tl.constexpr,
+    PREFETCH: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets_d = tl.arange(0, BD)
@@ -104,15 +110,30 @@ def _fused_attnres_fwd_kernel(
     running_sum = tl.zeros([], dtype=tl.float32)
     output_values = tl.zeros([BD], dtype=tl.float32)
 
-    for source in tl.static_range(0, L):
-        if SINGLE:
+    if PREFETCH:
+        # Rotating double buffer: the load of source s + 1 is issued before the
+        # arithmetic of source s, so its DMA overlaps the fp32 vector pipeline
+        # instead of serialising with it.
+        next_ptr = tl.cast(tl.load(residual_ptrs), residual0.dtype)
+        next_values = tl.load(next_ptr + row * D + offsets_d, mask=mask_d, other=0.0)
+
+    for source in tl.range(0, L):
+        if PREFETCH:
+            residual_values = next_values.to(tl.float32)
+            if source + 1 < L:
+                # ``residual0`` only supplies the element pointer type; every
+                # source is a separate tensor indexed through the host-built
+                # address table.
+                next_ptr = tl.cast(tl.load(residual_ptrs + source + 1), residual0.dtype)
+                next_values = tl.load(
+                    next_ptr + row * D + offsets_d, mask=mask_d, other=0.0
+                )
+        elif SINGLE:
             # One source: read it directly, so no address table is needed.
             residual_values = tl.load(
                 residual0 + row * D + offsets_d, mask=mask_d, other=0.0
             ).to(tl.float32)
         else:
-            # ``residual0`` only supplies the element pointer type; every source
-            # is a separate tensor indexed through the host-built address table.
             residual_ptr = tl.cast(tl.load(residual_ptrs + source), residual0.dtype)
             residual_values = tl.load(
                 residual_ptr + row * D + offsets_d, mask=mask_d, other=0.0
@@ -132,11 +153,19 @@ def _fused_attnres_fwd_kernel(
         if RETURN_WEIGHTS:
             tl.store(logit + source * N + row, source_logit)
 
-    output_values /= running_sum
     if HAS_ONORM:
-        output_rstd = tl.rsqrt(tl.sum(tl.where(mask_d, output_values * output_values, 0.0)) / D + eps)
+        # Fold the trailing RMSNorm into the softmax denominator:
+        # (out / denom) * rsqrt(sum((out / denom)^2) / D + eps) * ow
+        #   == out * ow * rsqrt(sum(out^2) / D + eps * denom^2),
+        # which saves the full-width division by ``running_sum`` and its
+        # temporary.
+        squared_norm = tl.sum(tl.where(mask_d, output_values * output_values, 0.0)) / D
         output_weight = tl.load(output_rms_weight + offsets_d, mask=mask_d, other=0.0).to(tl.float32)
-        output_values *= output_rstd * output_weight
+        output_values = output_values * output_weight * tl.rsqrt(
+            squared_norm + eps * running_sum * running_sum
+        )
+    else:
+        output_values = output_values / running_sum
 
     tl.store(output + row * D + offsets_d, output_values.to(output.dtype.element_ty), mask=mask_d)
     if RETURN_WEIGHTS:
@@ -199,6 +228,7 @@ def _launch(grid, values, constexprs) -> None:
         constexprs["HAS_ONORM"],
         constexprs["RETURN_WEIGHTS"],
         constexprs["SINGLE"],
+        constexprs["PREFETCH"],
     )
     entry = _LAUNCH_SITE.get(key)
     if entry is None:
@@ -265,6 +295,10 @@ def fused_attnres(
             lse,
             num_rows,
         ]
+        # The rotating buffer costs one more residual tile of unified buffer,
+        # which does not fit beside the output-norm tile (208KB > 192KB), so
+        # prefetching stays off when the RMSNorm epilogue is fused in. ``single``
+        # never prefetches: ``residual_ptrs`` is the residual itself there.
         constexprs = dict(
             L=len(residuals),
             D=hidden_size,
@@ -274,6 +308,7 @@ def fused_attnres(
             HAS_ONORM=output_rms_weight is not None,
             RETURN_WEIGHTS=return_weights,
             SINGLE=single,
+            PREFETCH=(not single) and output_rms_weight is None,
         )
         _launch((num_rows,), values, constexprs)
 
