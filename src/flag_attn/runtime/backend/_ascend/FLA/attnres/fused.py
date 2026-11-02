@@ -18,7 +18,10 @@ The generic CUDA implementation in ``flag_attn.FLA.attnres.fused`` keeps the
 sources in a tuple kernel argument. triton-ascend has no tuple-of-tensor
 arguments, so the sources stay as separate tensors: the host passes a small
 int64 table of their base addresses and the kernel casts each entry back to a
-pointer, which avoids materialising a stacked copy of the residuals.
+pointer, which avoids materialising a stacked copy of the residuals. A single
+source is read directly, and the launch goes through a cached raw launcher
+because the device time of this one-kernel operator is small enough that
+Triton's per-call Python launch path dominates.
 """
 
 from __future__ import annotations
@@ -29,13 +32,32 @@ import torch
 import triton
 import triton.language as tl
 
+from . import fast_launch as _fast_launch
+
 _INT32_MAX = 2**31 - 1
+
+_BD_CACHE: dict = {}
+_LAUNCH_SITE: dict = {}
 
 # Small per-call address tables are reused when a caller keeps the same residual
 # tensors across steps (the common decode/benchmark case); the key holds the
 # exact addresses, so a rebuilt allocation can never alias a stale table.
 _PTR_TABLE_CACHE: dict = {}
 _MAX_PTR_TABLES = 64
+
+
+def _flat_rows(tensor: torch.Tensor, hidden: int) -> torch.Tensor:
+    """Return a ``(rows, hidden)`` view without copying when already in layout."""
+    if tensor.ndim == 2 and tensor.is_contiguous():
+        return tensor
+    return tensor.reshape(-1, hidden).contiguous()
+
+
+def _flat_1d(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a flat contiguous view without copying when already in layout."""
+    if tensor.ndim == 1 and tensor.is_contiguous():
+        return tensor
+    return tensor.reshape(-1).contiguous()
 
 
 def _residual_ptr_table(flat_residuals: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -68,6 +90,7 @@ def _fused_attnres_fwd_kernel(
     scale: tl.constexpr,
     HAS_ONORM: tl.constexpr,
     RETURN_WEIGHTS: tl.constexpr,
+    SINGLE: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets_d = tl.arange(0, BD)
@@ -82,12 +105,18 @@ def _fused_attnres_fwd_kernel(
     output_values = tl.zeros([BD], dtype=tl.float32)
 
     for source in tl.static_range(0, L):
-        # ``residual0`` only supplies the element pointer type; every source is
-        # a separate tensor indexed through the host-built address table.
-        residual_ptr = tl.cast(tl.load(residual_ptrs + source), residual0.dtype)
-        residual_values = tl.load(
-            residual_ptr + row * D + offsets_d, mask=mask_d, other=0.0
-        ).to(tl.float32)
+        if SINGLE:
+            # One source: read it directly, so no address table is needed.
+            residual_values = tl.load(
+                residual0 + row * D + offsets_d, mask=mask_d, other=0.0
+            ).to(tl.float32)
+        else:
+            # ``residual0`` only supplies the element pointer type; every source
+            # is a separate tensor indexed through the host-built address table.
+            residual_ptr = tl.cast(tl.load(residual_ptrs + source), residual0.dtype)
+            residual_values = tl.load(
+                residual_ptr + row * D + offsets_d, mask=mask_d, other=0.0
+            ).to(tl.float32)
 
         rstd = tl.rsqrt(tl.sum(residual_values * residual_values) / D + eps)
         source_logit = tl.sum(residual_values * query_weight) * rstd
@@ -156,6 +185,28 @@ def _validate_inputs(
             )
 
 
+def _launch(grid, values, constexprs) -> None:
+    """Launch through the cached raw launcher; fall back to Triton when needed."""
+    key = (
+        grid,
+        values[0].dtype,
+        values[0].device,
+        constexprs["L"],
+        constexprs["D"],
+        constexprs["BD"],
+        constexprs["eps"],
+        constexprs["scale"],
+        constexprs["HAS_ONORM"],
+        constexprs["RETURN_WEIGHTS"],
+        constexprs["SINGLE"],
+    )
+    entry = _LAUNCH_SITE.get(key)
+    if entry is None:
+        entry = _fast_launch.build(_fused_attnres_fwd_kernel, grid, values, constexprs)
+        _LAUNCH_SITE[key] = entry
+    entry(values)
+
+
 def fused_attnres(
     query: torch.Tensor,
     residuals: Sequence[torch.Tensor],
@@ -176,18 +227,20 @@ def fused_attnres(
 
     output_shape = residuals[0].shape
     hidden_size = output_shape[-1]
-    flat_residuals = [residual.reshape(-1, hidden_size).contiguous() for residual in residuals]
+    flat_residuals = [_flat_rows(residual, hidden_size) for residual in residuals]
     num_rows = flat_residuals[0].shape[0]
 
-    # triton-ascend has no tuple-of-tensor kernel args; pass the source base
-    # addresses as a small int64 table and cast them back in the kernel, so no
-    # stacked copy of the residuals is needed.
     if num_rows * hidden_size > _INT32_MAX:
         raise ValueError(
             f"fused_attnres on Ascend indexes residuals with int32 offsets, got "
             f"{num_rows * hidden_size} elements per source"
         )
-    residual_ptrs = _residual_ptr_table(flat_residuals)
+
+    # triton-ascend has no tuple-of-tensor kernel args; either pass the source
+    # base addresses through a small int64 table (and cast them back in the
+    # kernel) or, for a single source, let the kernel read ``residual0``.
+    single = len(flat_residuals) == 1
+    residual_ptrs = flat_residuals[0] if single else _residual_ptr_table(flat_residuals)
 
     output = torch.empty_like(flat_residuals[0])
     if return_weights:
@@ -197,26 +250,35 @@ def fused_attnres(
         logit = lse = None
 
     if num_rows > 0:
-        _fused_attnres_fwd_kernel[(num_rows,)](
-            query.reshape(-1).contiguous(),
+        bd = _BD_CACHE.get(hidden_size)
+        if bd is None:
+            bd = triton.next_power_of_2(hidden_size)
+            _BD_CACHE[hidden_size] = bd
+        values = [
+            _flat_1d(query),
             flat_residuals[0],
             residual_ptrs,
-            rms_weight.reshape(-1).contiguous(),
-            None if output_rms_weight is None else output_rms_weight.reshape(-1).contiguous(),
+            _flat_1d(rms_weight),
+            None if output_rms_weight is None else _flat_1d(output_rms_weight),
             output,
             logit,
             lse,
             num_rows,
+        ]
+        constexprs = dict(
             L=len(residuals),
             D=hidden_size,
-            BD=triton.next_power_of_2(hidden_size),
+            BD=bd,
             eps=rms_eps,
             scale=scale,
             HAS_ONORM=output_rms_weight is not None,
             RETURN_WEIGHTS=return_weights,
+            SINGLE=single,
         )
+        _launch((num_rows,), values, constexprs)
 
-    output = output.view(output_shape)
+    if output.shape != output_shape:
+        output = output.view(output_shape)
     if return_weights:
         probability = (logit * scale - lse[None, :]).exp()
         return output, probability.view(len(residuals), *output_shape[:-1])
