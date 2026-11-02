@@ -23,10 +23,16 @@ source is read directly, and the launch goes through a cached raw launcher
 because the device time of this one-kernel operator is small enough that
 Triton's per-call Python launch path dominates.
 
-The kernel is bound by fp32 vector throughput rather than bandwidth, so with
-several sources it rotates two residual buffers to overlap the next source's
-load with the current source's arithmetic, and it folds the trailing RMSNorm
-into the softmax denominator to keep that epilogue to one full-width pass.
+The single-row kernel is bound by fp32 vector throughput rather than bandwidth,
+so with several sources it rotates two residual buffers to overlap the next
+source's load with the current source's arithmetic, and it folds the trailing
+RMSNorm into the softmax denominator to keep that epilogue to one full-width
+pass.
+
+One row per program caps that kernel near 380 GB/s of the ~1.08 TB/s this part
+can reach, so wide row counts (>= ``_TWO_PASS_MIN_ROWS``) are handed to
+``two_pass``: row-batched kernels that score every source once with [BR, BDB]
+tiles and then mix them in a second pass, both at the HBM ceiling.
 """
 
 from __future__ import annotations
@@ -38,8 +44,15 @@ import triton
 import triton.language as tl
 
 from . import fast_launch as _fast_launch
+from . import two_pass as _two_pass
 
 _INT32_MAX = 2**31 - 1
+
+# The row-batched path reads the sources twice, so it only pays off once the row
+# count keeps both passes at the HBM ceiling. Measured on D=7168 with the
+# benchmark protocol, cost relative to the single-row kernel: 1.45x at N=128/256,
+# 1.09x at N=512, 0.70x at N=1024, 0.39x at N=2048 and 0.87x for 9x8192.
+_TWO_PASS_MIN_ROWS = 1024
 
 _BD_CACHE: dict = {}
 _LAUNCH_SITE: dict = {}
@@ -294,8 +307,17 @@ def fused_attnres(
     single = len(flat_residuals) == 1
     residual_ptrs = flat_residuals[0] if single else _residual_ptr_table(flat_residuals)
 
+    plan = None
+    if num_rows >= _TWO_PASS_MIN_ROWS and not single:
+        plan = _two_pass.plan(
+            hidden_size, num_rows, len(residuals), output_rms_weight is not None
+        )
+
     output = torch.empty_like(flat_residuals[0])
-    if return_weights:
+    if return_weights or plan is not None:
+        # The row-batched path keeps the weights out of the unified buffer, so
+        # it always materialises the logits; they are also what
+        # ``return_weights=True`` hands back.
         logit = torch.empty((len(residuals), num_rows), device=output.device, dtype=torch.float32)
         lse = torch.empty((num_rows,), device=output.device, dtype=torch.float32)
     else:
@@ -333,7 +355,17 @@ def fused_attnres(
             PREFETCH=_prefetch_enabled(len(residuals), output_rms_weight is not None),
             NOMAX=scale <= hidden_size ** -0.5,
         )
-        _launch((num_rows,), values, constexprs)
+        if plan is not None:
+            _two_pass.launch(
+                values,
+                plan,
+                eps=rms_eps,
+                scale=scale,
+                has_onorm=output_rms_weight is not None,
+                nomax=constexprs["NOMAX"],
+            )
+        else:
+            _launch((num_rows,), values, constexprs)
 
     if output.shape != output_shape:
         output = output.view(output_shape)
