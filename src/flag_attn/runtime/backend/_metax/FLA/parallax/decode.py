@@ -315,37 +315,29 @@ def _validate_inputs(
     seqused_k: torch.Tensor | None,
     out: torch.Tensor | None,
 ) -> tuple[int, int, int, int, int]:
-    if q.ndim != 4 or r.shape != q.shape:
+    if q.ndim != 4 or q.shape[1] != 1 or r.shape != q.shape:
         raise ValueError("q and r must have the same (B, 1, H_q, D) shape")
-    if q.shape[1] != 1:
-        raise ValueError(f"Triton decode requires seqlen_q=1, got {q.shape[1]}")
     if k.ndim != 4 or v.shape != k.shape:
         raise ValueError("k and v must have the same (B, L, H_kv, D) shape")
     B, _, HQ, D = q.shape
     Bk, L, H, Dk = k.shape
     if B != Bk or D != Dk:
         raise ValueError("q/r and k/v batch size and head dimension must match")
-    if L < 1:
-        raise ValueError("KV cache length must be positive")
-    if HQ < 1 or H < 1 or D < 1:
-        raise ValueError("head counts and head dimension must be positive")
+    if min(L, HQ, H) < 1:
+        raise ValueError("KV length and head counts must be positive")
     if HQ % H:
         raise ValueError(f"H_q ({HQ}) must be divisible by H_kv ({H}) for GQA")
     if D not in (64, 128):
         raise ValueError(f"Triton decode supports head_dim in {{64, 128}}, got {D}")
     tensors = (q, r, k, v)
-    if not all(x.is_cuda for x in tensors):
-        raise ValueError("q, r, k and v must be CUDA tensors")
-    if not all(x.device == q.device for x in tensors):
+    if not q.is_cuda or any(x.device != q.device for x in tensors[1:]):
         raise ValueError("q, r, k and v must be on the same CUDA device")
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError(f"q/r/k/v must be fp16 or bf16, got {q.dtype}")
-    if not all(x.dtype == q.dtype for x in tensors):
-        raise TypeError("q, r, k and v must have the same dtype")
+    if q.dtype not in (torch.float16, torch.bfloat16) or any(x.dtype != q.dtype for x in tensors[1:]):
+        raise TypeError("q, r, k and v must have the same fp16 or bf16 dtype")
     if seqused_k is not None:
         if seqused_k.shape != (B,) or seqused_k.dtype != torch.int32:
             raise ValueError(f"seqused_k must be int32 with shape ({B},)")
-        if not seqused_k.is_cuda or seqused_k.device != q.device:
+        if seqused_k.device != q.device:
             raise ValueError("seqused_k must be on the same CUDA device as q")
         if not is_cuda_graph_capturing():
             lo = int(seqused_k.min().item())
