@@ -42,10 +42,12 @@ HAS_TRITON_DECODE = True
 HAS_TLE = HAS_TRITON_DECODE
 
 _LOG2E = tl.constexpr(1.4426950408889634)
-_BLOCK_N: int = 128
-_MAX_SPLITS: int = 32
-_NUM_WARPS: int = 4
-_NUM_STAGES: int = 3
+_DECODE_CONFIG = {
+    "BLOCK_N": (128, (64, 128)),
+    "NUM_WARPS": (4, (2, 4, 8)),
+    "NUM_STAGES": (3, (1, 2, 3, 4)),
+    "MAX_SPLITS": (32, (8, 16, 32, 64)),
+}
 
 
 @triton.jit
@@ -257,7 +259,8 @@ def _parallax_decode_merge_kernel(
 
 @lru_cache(maxsize=None)
 def _env_choice(name: str, default: int, choices: tuple[int, ...]) -> int:
-    value = int(os.environ.get(name, default))
+    legacy_name = name.replace("PARALLAX_DECODE_", "PARALLAX_TLE_", 1)
+    value = int(os.environ.get(name, os.environ.get(legacy_name, default)))
     if value not in choices:
         allowed = ", ".join(str(choice) for choice in choices)
         raise ValueError(f"{name} must be one of {{{allowed}}}, got {value}")
@@ -265,11 +268,14 @@ def _env_choice(name: str, default: int, choices: tuple[int, ...]) -> int:
 
 
 def _launch_config(kv_len: int, head_dim: int) -> tuple[int, int, int, int]:
-    default_block_n = 64 if head_dim == 128 and kv_len <= 512 else _BLOCK_N
-    block_n = _env_choice("PARALLAX_TLE_BLOCK_N", default_block_n, (64, 128))
-    num_warps = _env_choice("PARALLAX_TLE_NUM_WARPS", _NUM_WARPS, (2, 4, 8))
-    num_stages = _env_choice("PARALLAX_TLE_NUM_STAGES", _NUM_STAGES, (1, 2, 3, 4))
-    max_splits = _env_choice("PARALLAX_TLE_MAX_SPLITS", _MAX_SPLITS, (8, 16, 32, 64))
+    values = {}
+    for name, (default, choices) in _DECODE_CONFIG.items():
+        if name == "BLOCK_N" and head_dim == 128 and kv_len <= 512:
+            default = 64
+        values[name] = _env_choice(f"PARALLAX_DECODE_{name}", default, choices)
+    block_n, num_warps, num_stages, max_splits = (
+        values[name] for name in ("BLOCK_N", "NUM_WARPS", "NUM_STAGES", "MAX_SPLITS")
+    )
     return block_n, num_warps, num_stages, max_splits
 
 

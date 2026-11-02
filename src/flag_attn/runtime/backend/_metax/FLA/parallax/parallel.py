@@ -33,6 +33,8 @@ import triton
 import triton.language as tl
 from triton.testing import do_bench as _triton_do_bench
 
+from flag_attn.runtime import get_tuned_config
+
 from flag_attn.FLA.index import prepare_chunk_indices
 from flag_attn.FLA.utils import (
     get_num_sms,
@@ -64,90 +66,6 @@ def _block_size(head_dim: int, device_index: int, cu_seqlens=None) -> int:
     if has_shared_memory(232_448, device_index):
         return 64 if head_dim <= 128 else 32
     return 64
-
-
-def _make_parallax_configs(tile_pairs):
-    configs = []
-    for block_k, block_s in tile_pairs:
-        if block_k == 64 and block_s == 16:
-            launch_configs = ((2, 1), (2, 2), (4, 1), (4, 2))
-        elif block_k == 64:
-            launch_configs = ((2, 2), (4, 1), (4, 2), (8, 2))
-        else:
-            launch_configs = ((4, 1), (4, 2), (8, 1), (8, 2))
-        for num_warps, num_stages in launch_configs:
-            configs.append(
-                triton.Config(
-                    {"BK": block_k, "BS": block_s},
-                    num_warps=num_warps,
-                    num_stages=num_stages,
-                )
-            )
-    return configs
-
-
-_PARALLAX_DQR_TILES = (
-    (16, 64),
-    (16, 128),
-    (32, 32),
-    (32, 64),
-    (32, 128),
-    (64, 16),
-    (64, 32),
-    (64, 64),
-    (64, 128),
-    (128, 32),
-    (128, 64),
-    (128, 128),
-    (256, 16),
-    (256, 32),
-    (256, 64),
-    (256, 128),
-)
-
-_PARALLAX_FWD_TILES = tuple(tile for tile in _PARALLAX_DQR_TILES if tile != (64, 16))
-
-_PARALLAX_DKV_TILES = (
-    (16, 64),
-    (16, 128),
-    (32, 32),
-    (32, 64),
-    (32, 128),
-    (64, 32),
-    (64, 64),
-    (64, 128),
-    (128, 16),
-    (128, 32),
-    (128, 64),
-    (128, 128),
-    (256, 16),
-    (256, 32),
-    (256, 64),
-    (256, 128),
-)
-
-PARALLAX_FWD_CONFIGS = _make_parallax_configs(_PARALLAX_FWD_TILES)
-PARALLAX_DQR_CONFIGS = _make_parallax_configs(_PARALLAX_DQR_TILES)
-PARALLAX_DQR_SPLIT_CONFIGS = _make_parallax_configs(_PARALLAX_DQR_TILES)
-PARALLAX_DKV_CONFIGS = _make_parallax_configs(_PARALLAX_DKV_TILES) + [
-    triton.Config(
-        {"BK": 128, "BS": 64},
-        num_warps=8,
-        num_stages=3,
-    )
-]
-
-
-PARALLAX_PREPROCESS_CONFIGS = [
-    triton.Config(
-        {"BP": block_p},
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-    for block_p in (32, 64, 128, 256)
-    for num_warps in (4, 8)
-    for num_stages in (2, 4)
-]
 
 
 def _autotune_arg(named_args, kwargs, name):
@@ -623,7 +541,7 @@ def parallel_parallax_fwd_kernel_c550_tiled(
 
 
 @triton.autotune(
-    configs=PARALLAX_FWD_CONFIGS,
+    configs=copy.deepcopy(get_tuned_config("parallel_parallax_fwd_kernel")),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
     prune_configs_by={"early_config_prune": parallax_prune_fwd_configs},
 )
@@ -1173,7 +1091,7 @@ def parallel_parallax_bwd_kernel_dkv_short_multi(
 
 
 @triton.autotune(
-    configs=PARALLAX_PREPROCESS_CONFIGS,
+    configs=copy.deepcopy(get_tuned_config("parallel_parallax_bwd_kernel_preprocess")),
     key=["T", "K", "IS_VARLEN"],
     prune_configs_by={"early_config_prune": parallax_prune_preprocess_configs},
 )
@@ -1417,7 +1335,7 @@ def _parallel_parallax_bwd_kernel_dqr(
 
 
 @triton.autotune(
-    configs=PARALLAX_DQR_CONFIGS,
+    configs=copy.deepcopy(get_tuned_config("parallel_parallax_bwd_kernel_dqr_fused")),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
     reset_to_zero=["grad_q", "grad_r"],
     prune_configs_by={"early_config_prune": parallax_prune_dqr_fused_configs},
@@ -1490,7 +1408,7 @@ def parallel_parallax_bwd_kernel_dqr_fused(
 
 
 @triton.autotune(
-    configs=PARALLAX_DQR_SPLIT_CONFIGS,
+    configs=copy.deepcopy(get_tuned_config("parallel_parallax_bwd_kernel_dqr")),
     do_bench=_bench_with_maca_resource_limit,
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
     reset_to_zero=["grad_q", "grad_r"],
@@ -1739,7 +1657,7 @@ def parallel_parallax_bwd_kernel_dkv_dense_aligned(
 
 
 @triton.autotune(
-    configs=PARALLAX_DKV_CONFIGS,
+    configs=copy.deepcopy(get_tuned_config("parallel_parallax_bwd_kernel_dkv")),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
     prune_configs_by={"early_config_prune": parallax_prune_configs},
     do_bench=_bench_with_maca_resource_limit,
@@ -1963,7 +1881,7 @@ def parallel_parallax_bwd_kernel_dkv(
 
 
 @triton.autotune(
-    configs=PARALLAX_DKV_CONFIGS,
+    configs=copy.deepcopy(get_tuned_config("parallel_parallax_bwd_kernel_dkv_grouped")),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
     prune_configs_by={"early_config_prune": parallax_prune_dkv_grouped_configs},
 )
@@ -2803,7 +2721,7 @@ def _validate_parallel_parallax_inputs(q, r, k, v, window_size, cu_seqlens):
     if any(tensor.device != q.device for tensor in (r, k, v)):
         raise ValueError("q, r, k, and v must be on the same CUDA device")
     if q.dtype not in (torch.bfloat16, torch.float16) or any(tensor.dtype != q.dtype for tensor in (r, k, v)):
-        raise TypeError("q, r, k, and v must have the same fp16 or bf16 dtype")
+        raise TypeError("parallel_parallax requires bf16 or fp16 inputs with matching dtype")
 
     B, T, HQ, K = q.shape
     if k.shape[0] != B or k.shape[1] != T or k.shape[3] != K:
@@ -2822,7 +2740,7 @@ def _validate_parallel_parallax_inputs(q, r, k, v, window_size, cu_seqlens):
         if not isinstance(cu_seqlens, torch.Tensor):
             raise TypeError("cu_seqlens must be a torch.Tensor or None")
         if B != 1:
-            raise ValueError("cu_seqlens requires batch size 1")
+            raise ValueError("batch size is expected to be 1 when using cu_seqlens")
         if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
             raise ValueError("cu_seqlens must be one-dimensional with at least two entries")
         if cu_seqlens.dtype not in (torch.int32, torch.int64):
