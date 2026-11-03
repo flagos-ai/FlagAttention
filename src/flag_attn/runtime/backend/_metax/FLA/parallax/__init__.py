@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from flag_attn.runtime.backend._metax.FLA.parallax.decode import (
-    HAS_TLE,
     parallax_attn_with_kvcache,
     parallax_decode,
 )
@@ -25,7 +24,6 @@ from flag_attn.runtime.backend._metax.FLA.parallax.parallel import (
 )
 
 __all__ = [
-    "HAS_TLE",
     "ParallaxFunction",
     "parallax_attn_with_kvcache",
     "parallax_decode",

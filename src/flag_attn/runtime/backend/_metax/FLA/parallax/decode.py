@@ -17,10 +17,6 @@ import triton.language as tl
 from flag_attn.FLA.utils import get_num_sms, is_cuda_graph_capturing
 
 
-# Compatibility alias; this backend uses ordinary Triton.
-HAS_TRITON_DECODE = True
-HAS_TLE = HAS_TRITON_DECODE
-
 _LOG2E = tl.constexpr(1.4426950408889634)
 _DECODE_CONFIG = {
     "BLOCK_N": (128, (64, 128)),
@@ -469,4 +465,4 @@ def parallax_decode(
     )
 
 
-__all__ = ["HAS_TLE", "parallax_attn_with_kvcache", "parallax_decode"]
+__all__ = ["parallax_attn_with_kvcache", "parallax_decode"]
