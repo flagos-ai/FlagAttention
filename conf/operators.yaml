@@ -27,6 +27,7 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/flag_attn/test_gdn_packed_decode.py
+      - tests/flag_attn/test_gdn_forward.py::test_prefill_packed_and_speculative_state_handoff
     benchmark: benchmark/test_fused_recurrent_gdn_benchmark.py
   - id: fused_recurrent_gated_delta_rule_fwd
     description: TLE scalar GDN inference recurrence with indexed state snapshots on NVIDIA GPUs.
@@ -42,6 +43,9 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/flag_attn/test_fused_recurrent_gdn.py
+      - tests/flag_attn/test_gdn_forward.py::test_prefill_packed_and_speculative_state_handoff
+      - tests/flag_attn/test_gdn_packed_decode.py::test_packed_continuation_matches_recurrent
+      - tests/flag_attn/test_gdn_packed_decode.py::test_low_precision_cache_large_parallelism
     benchmark: benchmark/test_fused_recurrent_gdn_benchmark.py
   - id: parallel_wall_attn
     description: Run Wall-Attention correctness and performance tests on the selected backend.

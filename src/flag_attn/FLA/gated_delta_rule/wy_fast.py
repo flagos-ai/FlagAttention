@@ -214,7 +214,7 @@ if HAS_TLE_RECOMPUTE_W_U:
                 (BT, BV),
                 (1, 0),
             )
-            b_v = tle.load(p_v, boundary_check=(0, 1), is_async=True, padding_option="zero")
+            b_v = tle.load(p_v, boundary_check=(0, 1), padding_option="zero", is_async=True)
             b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
             b_u = tl.dot(b_A, b_vb, allow_tf32=False)
             tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
@@ -236,7 +236,7 @@ if HAS_TLE_RECOMPUTE_W_U:
                 (BT, BK),
                 (1, 0),
             )
-            b_k = tle.load(p_k, boundary_check=(0, 1), is_async=True, padding_option="zero")
+            b_k = tle.load(p_k, boundary_check=(0, 1), padding_option="zero", is_async=True)
             b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
             b_w = tl.dot(b_A, b_kb)
             tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))

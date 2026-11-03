@@ -1,5 +1,17 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 
@@ -10,12 +22,11 @@ from flag_attn.testing.packed_gdn import make_packed_case, reference_packed, unp
 from flag_attn.testing.recurrent_gdn import check_close
 
 pytestmark = [
-    pytest.mark.gdn_forward,
-    pytest.mark.fused_recurrent_gated_delta_rule_packed_decode,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("dims", [(1, 2, 128, 128), (2, 6, 60, 80), (2, 8, 127, 129), (1, 1, 256, 64)])
 @pytest.mark.parametrize("seed", [0, 17])
@@ -48,6 +59,26 @@ def test_packed_reference(dtype, dims, seed, monkeypatch):
     assert len(calls) == 3
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_packed_beta_rounding_in_fp32_cache(dtype):
+    c = make_packed_case(n=1, h=1, hv=1, kdim=1, vdim=1, dtype=dtype)
+    c["mixed_qkv"].fill_(1)
+    c["initial_state"].zero_()
+    c["b"].fill_(0.1)
+    c["scale"] = 1.0
+    c["use_qk_l2norm_in_kernel"] = False
+    expected = c["b"].float().sigmoid().to(dtype).float()
+    _, state = op(**c)
+    slot = c["ssm_state_indices"].long()
+    torch.testing.assert_close(state[slot, 0, 0, 0], expected[:, 0], rtol=2e-4, atol=2e-5)
+    untouched = state.clone()
+    untouched[slot] = 0
+    assert torch.count_nonzero(untouched) == 0
+
+
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 @pytest.mark.parametrize(
     "case",
     [
@@ -109,6 +140,8 @@ def test_packed_boundaries(case):
     check_close(*op(**c), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @torch.inference_mode()
 def test_packed_continuation_matches_recurrent():
     from flag_attn import fused_recurrent_gated_delta_rule_fwd
@@ -123,6 +156,7 @@ def test_packed_continuation_matches_recurrent():
         check_close(*op(**c), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 @torch.inference_mode()
 def test_packed_split_grid():
     n, hv = 21846, 3
@@ -141,6 +175,7 @@ def test_packed_split_grid():
     assert torch.count_nonzero(out) == 0 and torch.count_nonzero(state) == 0
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 @torch.inference_mode()
 def test_public_exports_and_untouched_padding():
     import flag_attn
@@ -159,6 +194,7 @@ def test_public_exports_and_untouched_padding():
     assert torch.equal(c["initial_state"][untouched], original[untouched])
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 @pytest.mark.parametrize("axis", ["projection", "state_head", "state_value", "state_key"])
 @torch.inference_mode()
 def test_large_relative_offsets(axis):
@@ -186,6 +222,8 @@ def test_large_relative_offsets(axis):
     assert torch.count_nonzero(c["out"]) > 0
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dims", [(128, 128), (256, 64), (64, 256)])
 @torch.inference_mode()
@@ -204,6 +242,7 @@ def test_low_precision_cache_large_parallelism(state_dtype, dims):
     check_close(*fused_recurrent_gated_delta_rule_fwd(**recurrent), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 @pytest.mark.parametrize("case", ["width", "out", "indices", "gate", "parameter", "grad"])
 def test_packed_invalid(case):
     c = make_packed_case()
@@ -221,3 +260,20 @@ def test_packed_invalid(case):
         c["mixed_qkv"].requires_grad_(True)
     with pytest.raises((ValueError, RuntimeError)):
         op(**c)
+
+
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_packed_large_cache_reuses_read_slot(state_dtype, monkeypatch):
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("Hopper cache scheduling path")
+    from flag_attn.testing.recurrent_gdn import record_recurrent_launch
+
+    calls = record_recurrent_launch(monkeypatch)
+    c = make_packed_case(n=192, h=4, hv=16, state_dtype=state_dtype)
+    c["ssm_state_indices"][0] = 0
+    c["ssm_state_indices"][-1] = -1
+    expected = reference_packed(c)
+    check_close(*op(**c), *expected)
+    assert len(calls) == 1 and calls[0]["REUSE_PACKED_STATE"]

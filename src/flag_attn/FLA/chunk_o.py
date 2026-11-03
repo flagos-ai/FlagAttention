@@ -35,7 +35,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         for num_warps in NUM_WARPS
         for num_stages in [2, 3, 4]
     ],
-    key=["H", "K", "V", "BT", "IS_VARLEN"],
+    key=["T", "H", "Hg", "K", "V", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
@@ -121,8 +121,7 @@ def chunk_fwd_kernel_o(
     p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
 
-    # to fix mma -> mma layout conversion
-    # already solved by triton v3.2 or higher
+    # Tensor-core operands use the same low-precision dtype.
     b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 

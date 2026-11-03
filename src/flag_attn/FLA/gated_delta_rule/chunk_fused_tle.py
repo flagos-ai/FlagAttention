@@ -1,5 +1,16 @@
 # Copyright (c) 2026 FlagAttention contributors
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import torch
 import triton
@@ -8,7 +19,6 @@ import triton.experimental.tle.language as tle
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 TLE_CHUNK_GDR_BLOCK_S = 64
-TLE_CHUNK_GDR_HEAD_DIM = 128
 TLE_CHUNK_GDR_PIPE_CAPACITY = 2
 TLE_CHUNK_GDR_TARGET_NUM_CTAS = 128
 
@@ -303,6 +313,7 @@ def _tle_chunk_gdr_fwd_kernel(
     os = tle.gpu.alloc([1, CHUNK, BLOCK_DV], q_desc.dtype, scope=tle.gpu.smem)
     hh = tle.gpu.alloc([1, DK, BLOCK_DV], q_desc.dtype, scope=tle.gpu.smem)
     dd = tle.gpu.alloc([1, CHUNK, BLOCK_DV], q_desc.dtype, scope=tle.gpu.smem)
+    # Both consumers must release Q/K and gate slots before producer reuse.
     qp = tle.pipe(capacity=PIPE_CAPACITY, scope="cta", name="qk", readers=("rec", "out"), q=qs, k=ks)
     vp = tle.pipe(capacity=PIPE_CAPACITY, scope="cta", name="vb", v=vs, beta=bs)
     ap = tle.pipe(capacity=PIPE_CAPACITY, scope="cta", name="ag", readers=("rec", "out"), a=aa, g=gs)
