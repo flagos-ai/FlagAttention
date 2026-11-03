@@ -1,8 +1,8 @@
+# This file contains code copied from the flash-linear-attention project.
+# The original source code was licensed under the MIT license and included
+# the following copyright notice:
 # Copyright (c) 2026 Parallax authors.
 # Copyright (c) 2026 Yifei Zuo
-# SPDX-License-Identifier: MIT
-#
-# See LICENSE in this directory for the full license text.
 
 from __future__ import annotations
 

@@ -65,9 +65,6 @@ include = [
 ]
 namespaces = false
 
-[tool.setuptools.package-data]
-"flag_attn.runtime.backend._metax.FLA.parallax" = ["LICENSE"]
-
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
 testpaths = [

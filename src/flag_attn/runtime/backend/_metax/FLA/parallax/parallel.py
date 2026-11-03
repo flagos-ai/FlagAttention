@@ -1,7 +1,7 @@
+# This file contains code copied from the flash-linear-attention project.
+# The original source code was licensed under the MIT license and included
+# the following copyright notice:
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
-# SPDX-License-Identifier: MIT
-#
-# See LICENSE in this directory for the full license text.
 
 from __future__ import annotations
 
