@@ -24,6 +24,7 @@ _OPERATOR_EXPORTS = {
     "chunk_gla": (".FLA.gla", "chunk_gla"),
     "chunk_kda": (".FLA.kda", "chunk_kda"),
     "chunk_kda_fwd_infer": (".FLA.kda.chunk_kda", "chunk_kda_fwd_infer"),
+    "fused_attnres": (".FLA.attnres.fused", "fused_attnres"),
     "minimax_m3_index_decode": (".msa", "minimax_m3_index_decode"),
     "minimax_m3_index_decode_score": (".msa", "minimax_m3_index_decode_score"),
     "minimax_m3_index_score": (".msa", "minimax_m3_index_score"),

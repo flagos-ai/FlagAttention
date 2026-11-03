@@ -57,6 +57,19 @@ _BENCHMARK_METRIC_FIELDS = (
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("flagattention", "FlagAttention test reporting")
+
+    group.addoption(
+        "--stage",
+        choices=("all", "prefill", "decode"),
+        default="all",
+        help="Select all test stages, prefill, or decode",
+    )
+    group.addoption(
+        "--dtype",
+        default="all",
+        metavar="PRECISION",
+        help="Select a precision supported by the test, or all (default)",
+    )
     group.addoption(
         "--record",
         action="store",
