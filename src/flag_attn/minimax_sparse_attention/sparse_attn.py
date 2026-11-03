@@ -836,11 +836,12 @@ def _gqa_sparse_fwd_tle_kernel(
         qk_t = tle.gpu.wgmma_wait(0, qk_t)
         qk_t *= sm_scale_log2e
 
+        # V's origin is head_dim, not the padded BLOCK_SIZE_D; see _tma_box_width.
         tle.gpu.copy(
             kv_cache_desc,
             kv_smem.slot(0),
             [BLOCK_SIZE_K, BLOCK_SIZE_D],
-            [kv_row, BLOCK_SIZE_D],
+            [kv_row, head_dim],
             barrier=kv_full[0],
         )
 
@@ -1079,8 +1080,9 @@ def _gqa_sparse_fwd_tle_prefetch_kernel(
         cur_c = blk0 * BLOCK_SIZE_K
         tle.gpu.copy(kv_cache_desc, k_smem.slot(0), [BLOCK_SIZE_K, BLOCK_SIZE_D],
                      [row0, 0], barrier=k_full[0])
+        # V's origin is head_dim, not the padded BLOCK_SIZE_D; see _tma_box_width.
         tle.gpu.copy(kv_cache_desc, v_smem.slot(0), [BLOCK_SIZE_K, BLOCK_SIZE_D],
-                     [row0, BLOCK_SIZE_D], barrier=v_full[0])
+                     [row0, head_dim], barrier=v_full[0])
 
     for block_iter in tl.range(loop_blocks, disable_licm=True, num_stages=1):
         c = cur_c
@@ -1137,7 +1139,7 @@ def _gqa_sparse_fwd_tle_prefetch_kernel(
         acc_o_t = tle.gpu.wgmma_wait(0, acc_o_t)
         if block_iter + 1 < loop_blocks:
             tle.gpu.copy(kv_cache_desc, v_smem.slot(0), [BLOCK_SIZE_K, BLOCK_SIZE_D],
-                         [nxt_row, BLOCK_SIZE_D], barrier=v_full[0])
+                         [nxt_row, head_dim], barrier=v_full[0])
 
         l_i = tl.math.fma(l_i, alpha, l_ij)
         m_i = m_ij
@@ -1416,7 +1418,7 @@ def _gqa_sparse_fwd_tle_upstream_kernel(
                 kv_cache_desc,
                 kv_smem.slot(buf_idx),
                 [HALF_K, BLOCK_SIZE_D],
-                [kv_row, BLOCK_SIZE_D],
+                [kv_row, head_dim],
                 barrier=kv_full[buf_idx],
             )
 
@@ -1557,7 +1559,7 @@ def _gqa_sparse_fwd_tle_upstream_kernel(
                 kv_cache_desc,
                 kv_smem.slot(0),
                 [BLOCK_SIZE_K, BLOCK_SIZE_D],
-                [kv_row, BLOCK_SIZE_D],
+                [kv_row, head_dim],
                 barrier=kv_full[0],
             )
 
@@ -2069,6 +2071,23 @@ def _tma_allocator(size: int, align: int, stream):
     return torch.empty(size, dtype=torch.int8, device="cuda")
 
 
+def _tma_box_width(head_dim: int) -> int:
+    """TMA box width for one K or V half of a packed KV row.
+
+    ``TensorDescriptor`` requires power-of-two ``block_shape`` entries, and the
+    kernels stage K/V into ``[*, BLOCK_SIZE_D]`` tiles. Passing ``head_dim``
+    breaks at 96 twice over: the descriptor is rejected, and the box would be
+    narrower than the tile copied into.
+
+    Over-wide is safe because the descriptor's ``shape`` stays the true
+    ``2 * head_dim``, so TMA zero-fills past the row. Those pad columns are
+    inert: Q is loaded ``padding_option="zero"`` so QK contributes nothing over
+    them, and the output store is ``boundary_check``ed. V's copies take
+    ``head_dim`` as their column origin, not this width.
+    """
+    return triton.next_power_of_2(head_dim)
+
+
 # ---------------------------------------------------------------------------
 # fp8 prefill on the TLE path. Upstream sends all fp8 to the tl.dot kernel,
 # which is 2.16x SLOWER than its own bf16 path while every memory channel sits
@@ -2434,7 +2453,7 @@ def minimax_m3_sparse_attn(
             kv_cache_2d,
             shape=[kv_cache_2d.shape[0], kv_cache_2d.shape[1]],
             strides=[kv_cache_2d.stride(0), kv_cache_2d.stride(1)],
-            block_shape=[SPARSE_BLOCK_SIZE, head_dim],
+            block_shape=[SPARSE_BLOCK_SIZE, _tma_box_width(head_dim)],
         )
         _gqa_sparse_fwd_tle_fp8_kernel[grid](
             q, kv_cache, k_desc, k_scale_arg, v_scale_arg, topk_idx, output,
@@ -2491,7 +2510,7 @@ def minimax_m3_sparse_attn(
             kv_cache_2d,
             shape=[kv_cache_2d.shape[0], kv_cache_2d.shape[1]],
             strides=[kv_cache_2d.stride(0), kv_cache_2d.stride(1)],
-            block_shape=[SPARSE_BLOCK_SIZE // 2, head_dim],
+            block_shape=[SPARSE_BLOCK_SIZE // 2, _tma_box_width(head_dim)],
         )
         _gqa_sparse_fwd_tle_upstream_kernel[grid](
             q, kv_cache, kv_cache_desc, k_scale_arg, v_scale_arg, topk_idx,
@@ -2523,7 +2542,7 @@ def minimax_m3_sparse_attn(
         kv_cache_2d,
         shape=[kv_cache_2d.shape[0], kv_cache_2d.shape[1]],
         strides=[kv_cache_2d.stride(0), kv_cache_2d.stride(1)],
-        block_shape=[SPARSE_BLOCK_SIZE, head_dim],
+        block_shape=[SPARSE_BLOCK_SIZE, _tma_box_width(head_dim)],
     )
     if qh8_choice == "prefetch":
         _gqa_sparse_fwd_tle_prefetch_kernel[grid](
