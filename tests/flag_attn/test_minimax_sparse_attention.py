@@ -36,7 +36,14 @@ from flag_attn.minimax_sparse_attention import (
 from flag_attn.minimax_sparse_attention import minimax_m3_sparse_attn_decode
 
 index_topk_module = importlib.import_module(minimax_m3_index_topk.__module__)
-sparse_attn_module = importlib.import_module(minimax_m3_sparse_attn.__module__)
+# `__module__` is the lazy package, whose __getattr__ only resolves public
+# operator exports. Tests reaching for backend internals (`tle`,
+# `_prefill_qh8_kernel_choice`) need the defining module, or a hasattr guard
+# against the package silently fails.
+sparse_attn_package = importlib.import_module(minimax_m3_sparse_attn.__module__)
+sparse_attn_module = importlib.import_module(
+    f"{sparse_attn_package.__name__}.sparse_attn"
+)
 
 triton.knobs.autotuning.adjust_block_size = False
 BLOCK = SPARSE_BLOCK_SIZE
