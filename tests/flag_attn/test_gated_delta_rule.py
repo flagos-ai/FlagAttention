@@ -77,13 +77,12 @@ def _selected_two_kernel_fwd_kernel():
     from flag_attn import runtime
 
     if runtime.device.vendor_name == "thead":
-        from flag_attn.runtime.backend._thead.FLA.gated_delta_rule.chunk_fused_forward import (
-            _chunk_gdn_two_kernel_fwd_kernel,
-        )
-    else:
-        from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import (
-            _chunk_gdn_two_kernel_fwd_kernel,
-        )
+        pytest.skip("T-Head backend does not expose the legacy two-kernel implementation")
+
+    from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import (
+        _chunk_gdn_two_kernel_fwd_kernel,
+    )
+
     return _chunk_gdn_two_kernel_fwd_kernel
 
 

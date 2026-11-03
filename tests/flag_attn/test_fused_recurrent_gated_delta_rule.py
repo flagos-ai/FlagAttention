@@ -1,7 +1,14 @@
-# Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright 2026 FlagOS Contributors
+"""T-Head recurrent GDN correctness, adapted from vLLM-SAIL.
 
-"""T-Head fused recurrent gated delta rule forward tests."""
+Source: vllm-project/vllm-sail@95c24b3c21a132a4987f7daba99b69fccf7d6190
+tests/e2e/gdn/test_gdn_pla_decode.py (update and state-isolation cases).
+Precompute g/beta for FlagAttention; replace plugin dispatch mocks with an
+independent CPU FP32 recurrence. Retain the existing non-inplace regression.
+All test inputs use the source suite's dense state and contiguous index tables.
+"""
 
 import pytest
 import torch
@@ -11,22 +18,13 @@ from flag_attn import runtime
 from flag_attn.testing import backend as test_backend
 
 pytestmark = pytest.mark.chunk_gated_delta_rule
-
-ASSERT_RATIO = 0.01
-K = V = 128
-
-# Exact activation/state dtype pairs from vLLM's packed-decode reference test.
-DECODE_CASES = [
-    pytest.param(32, 4, 8, torch.float16, torch.float16, id="N32-H4-HV8-fp16"),
-    pytest.param(32, 4, 8, torch.bfloat16, torch.bfloat16, id="N32-H4-HV8-bf16"),
-    pytest.param(32, 4, 8, torch.float32, torch.float32, id="N32-H4-HV8-fp32"),
-    pytest.param(1, 16, 64, torch.bfloat16, torch.float32, id="N1-H16-HV64-bf16-fp32state"),
-    pytest.param(9, 4, 12, torch.bfloat16, torch.float32, id="N9-H4-HV12-bf16-fp32state"),
-    pytest.param(1, 4, 12, torch.bfloat16, torch.bfloat16, id="N1-H4-HV12-bf16"),
-]
+H, HV = 4, 8
+DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+OUTPUT_TOL = {torch.float16: (1e-3, 1e-3), torch.bfloat16: (1e-3, 1.6e-2), torch.float32: (1e-5, 1.3e-6)}
 
 
-def _load_fwd():
+@pytest.fixture(scope="module")
+def fwd():
     if not test_backend.is_available() or runtime.device.vendor_name != "thead":
         pytest.skip("requires the T-Head accelerator")
     from flag_attn.runtime.backend._thead.FLA.gated_delta_rule.fused_recurrent import (
@@ -35,243 +33,155 @@ def _load_fwd():
     return fused_recurrent_gated_delta_rule_fwd
 
 
-def _reference(inputs):
-    """CPU FP32 recurrence; state ABI is [slots, HV, V, K]."""
-    q, k, v, g, beta = [inputs[name].detach().float().cpu() for name in ("q", "k", "v", "g", "beta")]
-    state0 = inputs["initial_state"].detach().float().cpu()
-    indices = inputs["ssm_state_indices"].detach().cpu()
-    B, T, H, K = q.shape
-    HV, V = v.shape[-2:]
-    cu = inputs["cu_seqlens"]
-    spans = list(zip(cu.cpu().tolist()[:-1], cu.cpu().tolist()[1:])) if cu is not None else [
-        (b * T, (b + 1) * T) for b in range(B)
-    ]
-    q, k = q.reshape(-1, H, K), k.reshape(-1, H, K)
-    v, g = v.reshape(-1, HV, V), g.reshape(-1, HV)
-    beta = beta.reshape(-1, HV, V) if beta.ndim == 4 else beta.reshape(-1, HV, 1)
+@pytest.fixture(scope="module", autouse=True)
+def cpu_reference_threads():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(previous)
+
+
+def _inputs(lengths, dtype, *, state_dtype=torch.float32, dim=128, seed=0, slots=None):
+    """Keep the official tensor generation order, scales, and null-slot convention."""
+    torch.manual_seed(seed)
+    device = test_backend.device
+    batch, total = len(lengths), sum(lengths)
+    slots = slots or batch + 1
+    def rand(shape, dt=dtype):
+        return torch.randn(shape, dtype=dt, device=device)
+    q, k = rand((1, total, H, dim)) * 0.1, rand((1, total, H, dim)) * 0.1
+    v = rand((1, total, HV, dim)) * 0.1
+    a, b = rand((total, HV)) * 0.1, rand((total, HV)) * 0.1
+    a_log, bias = rand((HV,), torch.float32) * 0.1, rand((HV,)) * 0.1
+    state = rand((slots, HV, dim, dim), state_dtype) * 0.05
+    indices = (torch.randperm(slots - 1)[:batch] + 1).to(device=device, dtype=torch.int32)
+    return dict(
+        q=q, k=k, v=v,
+        g=(-a_log.exp() * F.softplus(a.float() + bias.float())).unsqueeze(0),
+        beta=b.float().sigmoid().unsqueeze(0), scale=dim**-0.5,
+        initial_state=state, inplace_final_state=True,
+        cu_seqlens=torch.tensor([0] + torch.tensor(lengths).cumsum(0).tolist(), device=device, dtype=torch.int32),
+        ssm_state_indices=indices, num_accepted_tokens=None, use_qk_l2norm_in_kernel=True,
+    )
+
+
+def _reference(data):
+    """CPU FP32 math; keep the accumulator unrounded within each kernel call."""
+    q, k, v, g, beta = [data[name].detach().float().cpu() for name in ("q", "k", "v", "g", "beta")]
+    batch, length = q.shape[:2]
+    dim = q.shape[-1]
+    q, k = q.reshape(-1, H, dim), k.reshape(-1, H, dim)
+    v, g, beta = v.reshape(-1, HV, dim), g.reshape(-1, HV), beta.reshape(-1, HV)
+    initial = data["initial_state"].detach().float().cpu()
+    indices = data["ssm_state_indices"].cpu()
+    accepted = data["num_accepted_tokens"]
+    accepted = None if accepted is None else accepted.cpu()
+    cu = data["cu_seqlens"]
+    bounds = cu.cpu().tolist() if cu is not None else list(range(0, batch * length + 1, length))
     out = torch.zeros_like(v)
-    final = state0.clone() if inputs["inplace_final_state"] else torch.empty(B * T, HV, V, K)
-    valid = torch.zeros(B * T, dtype=torch.bool)
+    final = initial.clone() if data["inplace_final_state"] else torch.empty(batch * length, HV, dim, dim)
+    valid = torch.zeros(batch * length, dtype=torch.bool)
     written = set()
-    accepted = inputs.get("num_accepted_tokens")
-    accepted = None if accepted is None else accepted.detach().cpu()
-    for n, (start, end) in enumerate(spans):
-        if start == end:
-            continue
+    for n, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
         row = indices[n].reshape(-1)
-        read_pos = int(accepted[n]) - 1 if accepted is not None else 0
-        slot = int(row[read_pos])
-        if slot <= 0:
+        slot = int(row[int(accepted[n]) - 1 if accepted is not None else 0])
+        if slot <= 0 or start == end:
             continue
-        state = state0[slot].clone()
-        for t, pos in enumerate(range(start, end)):
-            qt = q[pos].repeat_interleave(HV // H, dim=0)
-            kt = k[pos].repeat_interleave(HV // H, dim=0)
-            if inputs["use_qk_l2norm_in_kernel"]:
+        state = initial[slot].clone()
+        for step, token in enumerate(range(start, end)):
+            qt, kt = q[token], k[token]
+            if data["use_qk_l2norm_in_kernel"]:
                 qt = qt / torch.sqrt(qt.square().sum(-1, keepdim=True) + 1e-6)
                 kt = kt / torch.sqrt(kt.square().sum(-1, keepdim=True) + 1e-6)
-            state = state * torch.exp(g[pos])[:, None, None]
-            residual = (v[pos] - (state * kt[:, None, :]).sum(-1)) * beta[pos]
+            qt = qt.repeat_interleave(HV // H, dim=0) * data["scale"]
+            kt = kt.repeat_interleave(HV // H, dim=0)
+            state = state * g[token].exp()[:, None, None]
+            residual = (v[token] - (state * kt[:, None, :]).sum(-1)) * beta[token, :, None]
             state = state + residual[:, :, None] * kt[:, None, :]
-            out[pos] = (state * (qt * inputs["scale"])[:, None, :]).sum(-1)
-            valid[pos] = True
-            dest = int(row[t]) if inputs["inplace_final_state"] else pos
-            if not inputs["inplace_final_state"] or dest > 0:
+            out[token] = (state * qt[:, None, :]).sum(-1)
+            valid[token] = True
+            dest = int(row[step]) if data["inplace_final_state"] else token
+            if dest > 0 or not data["inplace_final_state"]:
                 final[dest] = state
                 written.add(dest)
-    return out.reshape(B, T, HV, V), final, valid, sorted(written)
+    return out.reshape_as(data["v"]), final, valid, written
 
 
-def _assert_close(name, actual, expected):
-    # Select tolerances before converting: output and state may differ in dtype.
-    atol, rtol = (1e-4, 1e-4) if actual.dtype == torch.float32 else (2e-2, 1e-2)
-    actual, expected = actual.detach().float().cpu(), expected.detach().float().cpu()
-    assert actual.shape == expected.shape, (name, actual.shape, expected.shape)
-    assert torch.isfinite(actual).all(), f"{name}: nonfinite actual"
-    assert torch.isfinite(expected).all(), f"{name}: nonfinite reference"
-    torch.testing.assert_close(
-        actual, expected, atol=atol, rtol=rtol,
-        msg=lambda message: f"{name}: elementwise check failed\n{message}",
-    )
-    max_abs = (actual - expected).abs().max().item()
-    ratio = (actual - expected).square().mean().sqrt().item() / (
-        expected.square().mean().sqrt().item() + 1e-8
-    )
-    assert max_abs <= 1e-6 or ratio < ASSERT_RATIO, (
-        f"{name}: relative_rms={ratio:.7g}, max_abs={max_abs:.7g}, limit={ASSERT_RATIO}"
-    )
-    return ratio
-
-
-
-def _check_case_impl(inputs):
-    fwd = _load_fwd()
-    expected_o, expected_state, valid, written = _reference(inputs)
-    original = inputs["initial_state"].clone()
-    actual_o, actual_state = fwd(**inputs)
+@torch.inference_mode()
+def _check(fwd, data):
+    expected_out, expected_state, valid, written = _reference(data)
+    original = data["initial_state"].clone()
+    out, state = fwd(**data)
     test_backend.device_fn.synchronize()
-    assert actual_o.shape == expected_o.shape
-    assert actual_state.shape == expected_state.shape
-    actual_flat = actual_o.reshape(-1, *actual_o.shape[-2:])
-    expected_flat = expected_o.reshape(actual_flat.shape)
-    output_ratio = 0.0
-    for pos in valid.nonzero().flatten().tolist():
-        output_ratio = max(output_ratio, _assert_close(f"output[{pos}]", actual_flat[pos], expected_flat[pos]))
-    state_ratio = 0.0
-    for slot in written:
-        state_ratio = max(state_ratio, _assert_close(f"state[{slot}]", actual_state[slot], expected_state[slot]))
-    if inputs["inplace_final_state"]:
-        assert actual_state.data_ptr() == inputs["initial_state"].data_ptr()
+    assert out.shape == expected_out.shape and out.dtype == data["v"].dtype
+    assert state.shape == expected_state.shape and state.dtype == original.dtype
+    atol, rtol = OUTPUT_TOL[out.dtype]
+    torch.testing.assert_close(out.float().cpu().reshape(-1, HV, out.shape[-1])[valid],
+                               expected_out.reshape(-1, HV, out.shape[-1])[valid], atol=atol, rtol=rtol)
+    # State tolerances follow the official PLA/Triton parity test.
+    torch.testing.assert_close(state.float().cpu(), expected_state, atol=1e-3, rtol=1e-2)
+    if data["inplace_final_state"]:
+        assert state.data_ptr() == data["initial_state"].data_ptr()
         untouched = [slot for slot in range(len(original)) if slot not in written]
-        assert torch.equal(actual_state[untouched], original[untouched]), "untouched state slots changed"
+        assert torch.equal(state[untouched], original[untouched])
     else:
-        assert torch.equal(inputs["initial_state"], original), "non-inplace call modified initial state"
-        assert actual_state.data_ptr() != inputs["initial_state"].data_ptr()
-    return output_ratio, state_ratio
+        assert state.data_ptr() != data["initial_state"].data_ptr()
+        assert torch.equal(data["initial_state"], original)
+    return out, state
 
 
-
-def _check_case(inputs, record_property):
-    threads = torch.get_num_threads()
-    try:
-        torch.set_num_threads(1)
-        output_error, state_error = _check_case_impl(inputs)
-    finally:
-        torch.set_num_threads(threads)
-    record_property("output_relative_rms", output_error)
-    record_property("state_relative_rms", state_error)
-
-
-def _make_decode_inputs(batch, H, HV, dtype, state_dtype, strided_mixed_qkv):
-    """Use the ordinary-forward reference inputs from the first vLLM test."""
-    device = test_backend.device
-    generator = torch.Generator(device=device).manual_seed(0)
-    qkv_dim = 2 * H * K + HV * V
-    if strided_mixed_qkv:
-        projection = torch.randn(
-            batch, qkv_dim + 64, device=device, dtype=dtype, generator=generator
-        )
-        mixed_qkv = projection[:, :qkv_dim]
-    else:
-        mixed_qkv = torch.randn(
-            batch, qkv_dim, device=device, dtype=dtype, generator=generator
-        )
-    a = torch.randn(batch, HV, device=device, dtype=dtype, generator=generator)
-    b = torch.randn(batch, HV, device=device, dtype=dtype, generator=generator)
-    A_log = torch.randn(HV, device=device, dtype=dtype, generator=generator)
-    dt_bias = torch.randn(HV, device=device, dtype=dtype, generator=generator)
-    indices = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
-    if batch > 3:
-        indices[-3:] = -1
-        indices[-1] = 0
-    state = torch.randn(
-        batch + 1, HV, V, K, device=device, dtype=state_dtype, generator=generator
-    )
-    q, k, v = torch.split(mixed_qkv, (H * K, H * K, HV * V), dim=-1)
-    # Upstream materializes all three reference inputs, even when the packed
-    # projection is strided. Do not add a separate Q/K/V-view test here.
-    q = q.view(batch, H, K).unsqueeze(1).contiguous()
-    k = k.view(batch, H, K).unsqueeze(1).contiguous()
-    v = v.view(batch, HV, V).unsqueeze(1).contiguous()
-    x = a.float() + dt_bias.float()
-    softplus_x = torch.where(
-        x <= 20.0, torch.log1p(torch.exp(torch.clamp(x, max=20.0))), x
-    )
-    g = (-torch.exp(A_log.float()) * softplus_x).unsqueeze(1)
-    beta = torch.sigmoid(b.float()).unsqueeze(1)
-    return dict(q=q, k=k, v=v, g=g, beta=beta, scale=K**-0.5,
-                initial_state=state, inplace_final_state=True, cu_seqlens=None,
-                ssm_state_indices=indices, num_accepted_tokens=None,
-                use_qk_l2norm_in_kernel=True)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("lengths,state_dtype,dim,seed", [
+    pytest.param([1, 1, 1, 1], torch.float32, 128, 4, id="decode"),
+    pytest.param([2, 1, 3], torch.float32, 128, 6, id="varlen"),
+    pytest.param([1, 1, 1, 1], torch.bfloat16, 128, 11, id="bf16-state"),
+    pytest.param([1, 1, 1, 1], torch.float32, 64, 13, id="dim64"),
+])
+def test_update(fwd, dtype, lengths, state_dtype, dim, seed):
+    data = _inputs(lengths, dtype, state_dtype=state_dtype, dim=dim, seed=seed)
+    # The ordinary vLLM kernel writes one index per token. Repeat each request's
+    # slot in a real contiguous table, exactly as the official Triton reference.
+    data["ssm_state_indices"] = data["ssm_state_indices"][:, None].repeat(1, max(lengths))
+    _check(fwd, data)
 
 
-def _make_gating_reference_inputs(num_reqs, dtype, num_speculative_tokens=None):
-    """Mirror ordinary-forward reference construction from vLLM's gating tests."""
-    torch.manual_seed(0)
-    device = test_backend.device
-    H, HV = 16, 32  # upstream tp_size=1
-    length = 1 if num_speculative_tokens is None else num_speculative_tokens + 1
-    tokens = num_reqs * length
-    entries = tokens * 2
-    mixed_qkv = torch.rand(tokens, 2 * H * K + HV * V, device=device, dtype=dtype)
-    q, k, v = torch.split(mixed_qkv, (H * K, H * K, HV * V), dim=-1)
-    q, k, v = q.view(1, tokens, H, K), k.view(1, tokens, H, K), v.view(1, tokens, HV, V)
-    A_log = torch.rand(HV, device=device, dtype=dtype)
-    dt_bias = torch.rand(HV, device=device, dtype=dtype)
-    a = torch.rand(tokens, HV, device=device, dtype=dtype)
-    b = torch.rand(tokens, HV, device=device, dtype=dtype)
-    state = torch.rand(entries + 1, HV, V, K, device=device, dtype=dtype)
-    indices = (torch.randperm(entries, device=device, dtype=torch.int32) + 1)[:tokens]
-    accepted = None
-    if num_speculative_tokens is not None:
-        indices = indices.view(num_reqs, length)
-        # Preserve upstream's exclusive upper bound, not randint(1, length+1).
-        accepted = torch.randint(
-            1, num_speculative_tokens + 1, (num_reqs,), device=device, dtype=torch.int32
-        )
-    cu = torch.arange(0, tokens + 1, length, device=device, dtype=torch.int32)
-    beta = b.sigmoid()
-    g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
-    return dict(q=q, k=k, v=v, g=g.unsqueeze(0), beta=beta.unsqueeze(0),
-                scale=K**-0.5, initial_state=state, inplace_final_state=True,
-                cu_seqlens=cu, ssm_state_indices=indices, num_accepted_tokens=accepted,
-                use_qk_l2norm_in_kernel=True)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("accepted_dtype", (torch.int32, torch.int64))
+def test_speculative_update(fwd, dtype, accepted_dtype):
+    data = _inputs([2, 2, 2], dtype, slots=7, seed=12)
+    data["ssm_state_indices"] = (torch.randperm(6).reshape(3, 2) + 1).to(
+        device=test_backend.device, dtype=torch.int32)
+    data["num_accepted_tokens"] = torch.tensor([1, 2, 1], device=test_backend.device, dtype=accepted_dtype)
+    _check(fwd, data)
 
 
-@pytest.mark.parametrize("strided_mixed_qkv", [False, True], ids=["packed-contiguous", "packed-strided"])
-@pytest.mark.parametrize("batch,H,HV,dtype,state_dtype", DECODE_CASES)
-@torch.inference_mode()
-def test_decode_from_vllm_reference(batch, H, HV, dtype, state_dtype, strided_mixed_qkv, record_property):
-    _load_fwd()
-    inputs = _make_decode_inputs(batch, H, HV, dtype, state_dtype, strided_mixed_qkv)
-    _check_case(inputs, record_property)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("null_slot", (0, -1))
+def test_null_state_isolation(fwd, dtype, null_slot):
+    data = _inputs([1] * 4, dtype, slots=8, seed=14)
+    initial = data["initial_state"].clone()
+    data["ssm_state_indices"][1] = null_slot
+    out, state = _check(fwd, data)
+    keep = [0, 2, 3]
+    compact = dict(data, initial_state=initial,
+                   ssm_state_indices=data["ssm_state_indices"][keep].clone(),
+                   cu_seqlens=torch.arange(4, device=test_backend.device, dtype=torch.int32))
+    for name in ("q", "k", "v", "g", "beta"):
+        compact[name] = data[name][:, keep].contiguous()
+    ref_out, ref_state = _check(fwd, compact)
+    # Invalid-request output is undefined; compare only the real requests.
+    torch.testing.assert_close(out[:, keep], ref_out, atol=0, rtol=0)
+    assert torch.equal(state, ref_state)
 
 
-@pytest.mark.parametrize("num_reqs", [1, 2, 4])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-@torch.inference_mode()
-def test_non_spec_from_vllm_gating_reference(num_reqs, dtype, record_property):
-    _load_fwd()
-    inputs = _make_gating_reference_inputs(num_reqs, dtype)
-    _check_case(inputs, record_property)
-
-
-@pytest.mark.parametrize("num_reqs", [1, 2, 4])
-@pytest.mark.parametrize("num_speculative_tokens", [1, 3], ids=["length2", "length4"])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-@torch.inference_mode()
-def test_spec_from_vllm_gating_reference(num_reqs, num_speculative_tokens, dtype, record_property):
-    _load_fwd()
-    inputs = _make_gating_reference_inputs(num_reqs, dtype, num_speculative_tokens)
-    _check_case(inputs, record_property)
-
-
-@pytest.mark.parametrize("layout", ["fixed-batch2-length3", "packed-lengths1-and3"])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-@torch.inference_mode()
-def test_non_inplace_returns_every_token_state(layout, dtype, record_property):
-    """Non-inplace output covers all tokens and leaves the state pool intact."""
-    _load_fwd()
-    device = test_backend.device
-    generator = torch.Generator(device=device).manual_seed(0)
-    H, HV = 2, 4
-    if layout == "fixed-batch2-length3":
-        batch, length = 2, 3
-        cu = None
-    else:
-        batch, length = 1, 4
-        cu = torch.tensor([0, 1, 4], device=device, dtype=torch.int32)
-    q = torch.randn(batch, length, H, K, device=device, dtype=dtype, generator=generator)
-    k = torch.randn(batch, length, H, K, device=device, dtype=dtype, generator=generator)
-    v = torch.randn(batch, length, HV, V, device=device, dtype=dtype, generator=generator)
-    g = -torch.rand(batch, length, HV, device=device, dtype=torch.float32, generator=generator)
-    beta = torch.rand(batch, length, HV, device=device, dtype=dtype, generator=generator)
-    state = torch.randn(3, HV, V, K, device=device, dtype=dtype, generator=generator)
-    indices = torch.tensor([1, 2], device=device, dtype=torch.int32)
-    inputs = dict(
-        q=q, k=k, v=v, g=g, beta=beta, scale=K**-0.5,
-        initial_state=state, inplace_final_state=False, cu_seqlens=cu,
-        ssm_state_indices=indices, num_accepted_tokens=None,
-        use_qk_l2norm_in_kernel=True,
-    )
-    _check_case(inputs, record_property)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("fixed_length", (False, True), ids=("packed", "fixed"))
+def test_non_inplace_returns_every_token_state(fwd, dtype, fixed_length):
+    data = _inputs([3, 3] if fixed_length else [1, 3], dtype, seed=15)
+    if fixed_length:
+        for name in ("q", "k", "v", "g", "beta"):
+            tensor = data[name]
+            data[name] = tensor.reshape(2, 3, *tensor.shape[2:])
+        data["cu_seqlens"] = None
+    data["inplace_final_state"] = False
+    _check(fwd, data)

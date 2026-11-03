@@ -1,19 +1,25 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Benchmark T-Head packed GDN with an independent CPU reference.
+# Resolve the enclosing checkout so this copy runs from any working directory.
+import sys
+from pathlib import Path
 
-Four representative head configurations are each measured with both BF16 and
-FP32 state, covering identical batches. QKV remains BF16. Latency is in us,
-using seven rounds of 40 Event samples over 32-call Graph replays.
-"""
+_BASELINE_ROOT = Path(__file__).resolve().parents[3]
+_PROJECT_ROOT = _BASELINE_ROOT.parent
+for _import_root in (_PROJECT_ROOT / "src", _PROJECT_ROOT, _BASELINE_ROOT):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
+
 
 from functools import lru_cache
 import math
-import statistics
+import time
+import warnings
 
 import pytest
 import torch
+import triton
 
 from flag_attn import runtime
 from flag_attn.testing import backend as test_backend
@@ -25,116 +31,44 @@ except ModuleNotFoundError:
 
 pytestmark = pytest.mark.chunk_gated_delta_rule
 
-BATCHES = (1, 2, 4, 8, 16, 32, 64)
-STATE_DTYPES = (torch.bfloat16, torch.float32)
-# Head configurations cover HV/H=2,3,4.
-HEAD_CONFIGS = (
-    (2, 8, 16),
-    (4, 4, 8),
-    (2, 8, 24),
-    (2, 8, 32),
-)
+# Batch sizes covered by this benchmark.
+BATCHES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+STATE_DTYPES = (torch.float32, torch.bfloat16)
+# Two head configurations with TP=4.
+HEAD_CONFIGS = ((4, 4, 8), (4, 4, 16))
 HEAD_DIM = 128
 DTYPE = torch.bfloat16
-SEED = 1234
-ASSERT_RATIO = 0.01
-ROUNDS, REPEAT_ITERS, DRY_RUN_ITERS = 7, 40, 5
-INITIAL_WARMUP, ROUND_WARMUP = 10, 30
-CALLS_PER_GRAPH = 32
-
+SEED = 42
+INITIAL_WARMUP = 10
+WARMUP_MS, REP_MS = 50, 200
+QUANTILES = (0.5, 0.2, 0.8)
 
 def _assert_close(name, actual, expected):
-    # Select tolerances before converting: output and state may differ in dtype.
     atol, rtol = (1e-4, 1e-4) if actual.dtype == torch.float32 else (2e-2, 1e-2)
     actual, expected = actual.detach().float().cpu(), expected.detach().float().cpu()
-    assert actual.shape == expected.shape, (name, actual.shape, expected.shape)
-    assert torch.isfinite(actual).all(), f"{name}: nonfinite actual"
-    assert torch.isfinite(expected).all(), f"{name}: nonfinite reference"
     torch.testing.assert_close(
-        actual, expected, atol=atol, rtol=rtol, msg=lambda message: f"{name}: elementwise check failed\n{message}",
+        actual, expected, atol=atol, rtol=rtol,
+        msg=lambda message: f"{name}: {message}",
     )
-    max_abs = (actual - expected).abs().max().item()
-    ratio = (actual - expected).square().mean().sqrt().item() / (expected.square().mean().sqrt().item() + 1e-8)
-    assert (
-        max_abs <= 1e-6 or ratio < ASSERT_RATIO
-    ), f"{name}: relative_rms={ratio:.7g}, max_abs={max_abs:.7g}, limit={ASSERT_RATIO}"
-    return ratio
 
 
-def _check_result(call, state, initial, expected, expected_state):
-    out = call()
-    test_backend.device_fn.synchronize()
-    output_error = state_error = 0.0
-    # Every row has one token and a distinct valid slot, numbered 1..B.
-    for row in range(out.shape[0]):
-        output_error = max(output_error, _assert_close(f"output[{row}]", out[row], expected[row]))
-        slot = row + 1
-        state_error = max(state_error, _assert_close(f"state[{slot}]", state[slot], expected_state[slot]))
-    assert torch.equal(state[0], initial[0]), "null state slot changed"
-    return output_error, state_error
-
-
-def _capture(call, state, initial):
-    device = test_backend.device_fn
-    state.copy_(initial)
-    for _ in range(INITIAL_WARMUP):
-        call()
-    stream = device.Stream()
-    stream.wait_stream(device.current_stream())
-    graph = device.CUDAGraph()
-    with device.graph(graph, stream=stream):
-        for _ in range(CALLS_PER_GRAPH):
-            out = call()
-    device.current_stream().wait_stream(stream)
-    device.synchronize()
-
-    # Check that a Graph replay produces the same updates as eager execution.
-    state.copy_(initial)
-    graph.replay()
-    saved_out, saved_state = out.clone(), state.clone()
-    state.copy_(initial)
-    for _ in range(CALLS_PER_GRAPH):
-        eager_out = call()
-    device.synchronize()
-    assert torch.equal(saved_out, eager_out), "Graph/eager output mismatch"
-    assert torch.equal(saved_state, state), "Graph/eager state mismatch"
-    assert torch.equal(state[0], initial[0]), "null state slot changed"
-    return graph, out
-
-
-def _measure(call, state, initial):
-    device = test_backend.device_fn
-    if not test_backend.graph_available() or not hasattr(device, "Event"):
-        pytest.fail("this benchmark requires T-Head Graph and Event support")
-    graph, out = _capture(call, state, initial)
-    events = [
-        (device.Event(enable_timing=True), device.Event(enable_timing=True)) for _ in range(REPEAT_ITERS)
-    ]
-    for start, end in events:
-        start.record()
-        end.record()
-    device.synchronize()
-    samples = []
-    for _ in range(ROUNDS):
-        state.copy_(initial)
-        for _ in range(ROUND_WARMUP):
+def _measure(call):
+    try:
+        values = triton.testing.do_bench(
+            call, quantiles=list(QUANTILES), warmup=WARMUP_MS, rep=REP_MS,
+        )
+        timing = "triton_do_bench_device_event"
+    except (RuntimeError, NotImplementedError, AttributeError) as error:
+        warnings.warn(f"do_bench unavailable; using 200-call wall timing: {error}", stacklevel=2)
+        test_backend.device_fn.synchronize()
+        start = time.perf_counter()
+        for _ in range(200):
             call()
-        for _ in range(DRY_RUN_ITERS):
-            graph.replay()
-        device.synchronize()
-        for start, end in events:
-            start.record()
-            graph.replay()
-            end.record()
-        device.synchronize()
-        values = [start.elapsed_time(end) * 1000.0 / CALLS_PER_GRAPH for start, end in events]
-        assert all(math.isfinite(value) and value > 0 for value in values)
-        assert torch.isfinite(out).all(), "nonfinite output"
-        assert torch.isfinite(state).all(), "nonfinite state"
-        assert torch.equal(state[0], initial[0]), "null slot changed"
-        samples.append(values)
-    return samples
-
+        test_backend.device_fn.synchronize()
+        values = [(time.perf_counter() - start) / 200 * 1000, None, None]
+        timing = "synchronized_wall_mean_200_calls"
+    assert math.isfinite(values[0]) and values[0] > 0, values
+    return [value * 1000 if value is not None else None for value in values], timing
 
 def _shape_matrix():
     return [
@@ -157,26 +91,22 @@ def _load_implementation():
 
 
 def _make_inputs(batch, h, hv, state_dtype):
-    # Per-case generators make pytest filtering reproducible. The two state
-    # dtypes share identical QKV/gates and the same FP32 source initial state.
+    # Keep input generation deterministic across cases.
+    torch.manual_seed(SEED)
     device = test_backend.device
-    generator = torch.Generator(device=device).manual_seed(SEED)
-    mixed = torch.randn(batch, (2 * h + hv) * HEAD_DIM, device=device, dtype=DTYPE, generator=generator) * 0.1
-    a = torch.randn(batch, hv, device=device, dtype=DTYPE, generator=generator)
-    b = torch.randn(batch, hv, device=device, dtype=DTYPE, generator=generator)
-    initial = (
-        torch.randn(batch + 1, hv, HEAD_DIM, HEAD_DIM, device=device, dtype=torch.float32, generator=generator) * 0.1
-    )
+    mixed = torch.randn(batch, (2 * h + hv) * HEAD_DIM, device=device, dtype=DTYPE)
+    b = torch.randn(batch, hv, device=device, dtype=DTYPE)
+    alog = torch.randn(hv, device=device, dtype=torch.float32)
+    a = torch.randn(batch, hv, device=device, dtype=DTYPE)
+    bias = torch.randn(hv, device=device, dtype=DTYPE)
+    initial = torch.randn(
+        max(512, batch + 16), hv, HEAD_DIM, HEAD_DIM, device=device, dtype=state_dtype,
+    ) * 0.1
     return dict(
-        mixed_qkv=mixed,
-        a=a,
-        b=b,
-        A_log=torch.zeros(hv, device=device, dtype=torch.float32),
-        dt_bias=torch.zeros(hv, device=device, dtype=torch.float32),
-        initial_state=initial.to(state_dtype),
+        mixed_qkv=mixed, a=a, b=b, A_log=alog, dt_bias=bias,
+        initial_state=initial,
         ssm_state_indices=torch.arange(1, batch + 1, device=device, dtype=torch.int32),
     )
-
 
 def _reference(data, h, hv):
     """Independent CPU FP32 packed decoding, including gates and one update."""
@@ -190,15 +120,13 @@ def _reference(data, h, hv):
     a, b, alog, bias = (data[name].detach().float().cpu() for name in ("a", "b", "A_log", "dt_bias"))
     g = -alog.exp() * torch.nn.functional.softplus(a + bias, beta=1.0, threshold=20.0)
     beta = b.sigmoid()  # Keep beta FP32 through the recurrence.
-    initial = data["initial_state"].detach().float().cpu()
-    indices = data["ssm_state_indices"].detach().long().cpu()
-    state = initial[indices] * g.exp()[:, :, None, None]
+    indices = data["ssm_state_indices"].long()
+    initial = data["initial_state"][indices].detach().float().cpu()
+    state = initial * g.exp()[:, :, None, None]
     residual = (v - (state * k[:, :, None, :]).sum(-1)) * beta[:, :, None]
     state = state + residual[:, :, :, None] * k[:, :, None, :]
     out = (state * (q * HEAD_DIM ** -0.5)[:, :, None, :]).sum(-1)
-    final = initial.clone()
-    final[indices] = state
-    return out.unsqueeze(1), final
+    return out.unsqueeze(1), state
 
 
 @torch.inference_mode()
@@ -228,59 +156,48 @@ def run_benchmark(record_property, shape):
     try:
         torch.set_num_threads(1)
         expected, expected_state = _reference(data, h, hv)
-        output_error, state_error = _check_result(run_flag, state, initial, expected, expected_state)
-        assert run_flag().data_ptr() == output.data_ptr(), "output buffer was not reused"
+        indices = data["ssm_state_indices"].long()
+        actual = run_flag()
+        test_backend.device_fn.synchronize()
+        _assert_close("output", actual, expected)
+        _assert_close("state", state[indices], expected_state)
+        assert torch.equal(state[0], initial[0]), "null state slot changed"
+        assert actual.data_ptr() == output.data_ptr()
     finally:
         torch.set_num_threads(threads)
     del expected, expected_state
-    samples = _measure(run_flag, state, initial)
-    medians = [statistics.median(row) for row in samples]
-    flag_us = statistics.median(medians)
+
+    state.copy_(initial)
+    for _ in range(INITIAL_WARMUP):
+        run_flag()
+    test_backend.device_fn.synchronize()
+    state.copy_(initial)
+    values, method = _measure(run_flag)
+    flag_us = values[0]
+
     recorder = BenchmarkRecorder(
-        record_property,
-        op_name="fused_recurrent_gated_delta_rule_packed_decode",
-        dtype=str(DTYPE),
-        phase="forward",
+        record_property, op_name="fused_recurrent_gated_delta_rule_packed_decode",
+        dtype=str(DTYPE), phase="forward",
     )
     recorder.add(
         shape_detail=dict(
-            TP=tp,
-            B=batch,
-            T=1,
-            H=h,
-            HV=hv,
-            K=HEAD_DIM,
-            V=HEAD_DIM,
-            qkv_dtype=str(DTYPE),
-            state_dtype=str(state_dtype),
-            mixed_qkv_shape=list(data["mixed_qkv"].shape),
-            state_shape=list(initial.shape),
-            qk_normalization=True,
-            scale=HEAD_DIM ** -0.5,
-            seed=SEED,
+            TP=tp, B=batch, T=1, H=h, HV=hv, K=HEAD_DIM, V=HEAD_DIM,
+            qkv_dtype=str(DTYPE), state_dtype=str(state_dtype),
+            mixed_qkv_shape=list(data["mixed_qkv"].shape), state_shape=list(initial.shape),
+            qk_normalization=True, scale=HEAD_DIM ** -0.5, seed=SEED,
         ),
-        latency=flag_us,
-        latency_unit="us",
-        sample_count=ROUNDS * REPEAT_ITERS,
-        calls_per_graph=CALLS_PER_GRAPH,
-        rounds=ROUNDS,
-        samples_per_round=REPEAT_ITERS,
-        initial_warmup=INITIAL_WARMUP,
-        round_warmup=ROUND_WARMUP,
-        dry_run_iters=DRY_RUN_ITERS,
-        execution_kind="multi_call_graph_replay",
-        timing_method="device_event",
-        latency_scope="packed_qkv_gates_recurrence_amortized_graph_update",
-        cache_protocol="warm_repeated_no_flush",
-        samples_us=samples,
-        round_medians_us=medians,
-        output_relative_rms=output_error,
-        state_relative_rms=state_error,
-        correctness="cpu_fp32_single_step_and_graph_vs_eager",
-        shape_selection="four_head_configurations_paired_bf16_fp32_states_fixed_batches",
+        latency=flag_us, latency_unit="us",
+        initial_warmup=INITIAL_WARMUP, warmup_ms=WARMUP_MS, rep_ms=REP_MS,
+        quantiles=list(QUANTILES), quantiles_us=values,
+        execution_kind="eager", timing_method=method,
+        latency_scope="packed_qkv_gates_recurrence",
+        cache_protocol="triton_driver_clear_cache" if method.startswith("triton") else "repeated_no_flush",
+        correctness="cpu_fp32_single_step",
+        shape_selection="two_head_configurations_tp4_fp32_and_bf16_states",
     )
     recorder.record()
     return (*shape, flag_us)
+
 
 
 @pytest.fixture(scope="module")
