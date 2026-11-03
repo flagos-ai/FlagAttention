@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import copy
 import warnings
-from functools import wraps
 
 import torch
 import triton
@@ -17,6 +16,7 @@ from triton.testing import do_bench as _triton_do_bench
 from flag_attn.FLA.index import prepare_chunk_indices
 from flag_attn.FLA.utils import get_num_sms
 from flag_attn.runtime import get_tuned_config
+from flag_attn.utils import input_guard
 
 
 @triton.jit
@@ -41,10 +41,14 @@ def _block_size(head_dim: int, device_index: int, cu_seqlens=None) -> int:
 
 def _autotune_arg(named_args, kwargs, name):
     value = named_args.get(name)
+    # FlagTree may keep constexpr names in `named_args` with a None value and
+    # pass their actual launch value through kwargs.  `dict.get(key, default)`
+    # does not use the default when such a placeholder exists.
     return kwargs.get(name) if value is None else value
 
 
 def _copy_autotune_configs(configs):
+    """Protect config templates from mutation by FlagTree's autotuner."""
     return copy.deepcopy(list(configs))
 
 
@@ -58,7 +62,7 @@ def _bench_with_maca_resource_limit(fn, quantiles=None):
         return [float("inf")] * len(quantiles) if quantiles is not None else float("inf")
 
 
-def _prune_parallax_configs(configs, named_args, **kwargs):
+def parallax_prune_configs(configs, named_args, **kwargs):
     head_dim = _autotune_arg(named_args, kwargs, "K")
     if head_dim is None:
         q = _autotune_arg(named_args, kwargs, "q")
@@ -88,41 +92,8 @@ def _prune_parallax_configs(configs, named_args, **kwargs):
     return _copy_autotune_configs(preferred or tile_matches)
 
 
-def _prune_parallax_fwd_configs(configs, named_args, **kwargs):
-    valid = _prune_parallax_configs(configs, named_args, **kwargs)
-    q = _autotune_arg(named_args, kwargs, "q")
-    cu_seqlens = _autotune_arg(named_args, kwargs, "cu_seqlens")
-    if q is not None and cu_seqlens is not None and 64 < q.shape[-1] <= 128:
-        name = torch.cuda.get_device_name(q.device).upper()
-        if "METAX" in name and "C550" in name:
-            block_t = _autotune_arg(named_args, kwargs, "BT")
-            selected = [
-                cfg
-                for cfg in configs
-                if cfg.kwargs["BK"] == 128
-                and cfg.kwargs["BS"] == block_t
-                and cfg.num_warps == 4
-                and cfg.num_stages == 1
-            ]
-            if not selected:
-                raise RuntimeError("C550 varlen forward resource candidate is missing")
-            return _copy_autotune_configs(selected)
-    if q is not None and cu_seqlens is None and 32 < q.shape[-1] <= 64:
-        name = torch.cuda.get_device_name(q.device).upper()
-        if "METAX" in name and "C550" in name:
-            selected = [
-                cfg
-                for cfg in valid
-                if cfg.kwargs["BK"] == 64 and cfg.kwargs["BS"] == 32 and cfg.num_warps == 4 and cfg.num_stages == 1
-            ]
-            if not selected:
-                raise RuntimeError("C550 forward resource candidate is missing")
-            return selected
-    return valid
-
-
-def _prune_parallax_dqr_fused_configs(configs, named_args, **kwargs):
-    valid = _prune_parallax_configs(configs, named_args, **kwargs)
+def parallax_prune_dqr_fused_configs(configs, named_args, **kwargs):
+    valid = parallax_prune_configs(configs, named_args, **kwargs)
     q = _autotune_arg(named_args, kwargs, "q")
     cu_seqlens = _autotune_arg(named_args, kwargs, "cu_seqlens")
     if q is not None and cu_seqlens is None and 32 < q.shape[-1] <= 64:
@@ -139,8 +110,8 @@ def _prune_parallax_dqr_fused_configs(configs, named_args, **kwargs):
     return valid
 
 
-def _prune_parallax_dkv_grouped_configs(configs, named_args, **kwargs):
-    valid = _prune_parallax_configs(configs, named_args, **kwargs)
+def parallax_prune_dkv_grouped_configs(configs, named_args, **kwargs):
+    valid = parallax_prune_configs(configs, named_args, **kwargs)
     q = _autotune_arg(named_args, kwargs, "q")
     cu_seqlens = _autotune_arg(named_args, kwargs, "cu_seqlens")
     if q is not None and cu_seqlens is None and 32 < q.shape[-1] <= 64:
@@ -157,28 +128,8 @@ def _prune_parallax_dkv_grouped_configs(configs, named_args, **kwargs):
     return valid
 
 
-def _prune_parallax_dqr_varlen_configs(configs, named_args, **kwargs):
-    q = _autotune_arg(named_args, kwargs, "q")
-    cu_seqlens = _autotune_arg(named_args, kwargs, "cu_seqlens")
-    if q is not None and cu_seqlens is not None and 64 < q.shape[-1] <= 128:
-        name = torch.cuda.get_device_name(q.device).upper()
-        if "METAX" in name and "C550" in name:
-            block_t = _autotune_arg(named_args, kwargs, "BT")
-            selected = [
-                cfg
-                for cfg in configs
-                if cfg.kwargs["BK"] == 128
-                and cfg.kwargs["BS"] == block_t
-                and cfg.num_warps == 4
-                and cfg.num_stages == 1
-            ]
-            if not selected:
-                raise RuntimeError("C550 varlen DQR resource candidate is missing")
-            return _copy_autotune_configs(selected)
-    return _prune_parallax_configs(configs, named_args, **kwargs)
-
-
-def _prune_parallax_preprocess_configs(configs, named_args, **kwargs):
+def parallax_prune_preprocess_configs(configs, named_args, **kwargs):
+    """Varlen chunk indices require preprocess BP to remain equal to BT."""
     cu_seqlens = _autotune_arg(named_args, kwargs, "cu_seqlens")
     if cu_seqlens is None:
         return _copy_autotune_configs(configs)
@@ -209,6 +160,7 @@ def parallel_parallax_fwd_kernel_short(
     WINDOW_SIZE_LEFT: tl.constexpr,
     BT: tl.constexpr,
 ):
+    """One-tile dense forward used when the complete sequence fits in SRAM."""
     i_bh = tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
     i_h = i_hq // G
@@ -346,6 +298,7 @@ def parallel_parallax_fwd_kernel_short_multi(
     BT: tl.constexpr,
     NT: tl.constexpr,
 ):
+    """Dense forward for a small number of query tiles."""
     i_t = tl.program_id(0).to(tl.int64)
     i_bh = tl.program_id(1).to(tl.int64)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -446,6 +399,7 @@ def parallel_parallax_fwd_kernel_c550_tiled(
     m_acc = tl.full((BT, 1), -float("inf"), dtype=tl.float32)
     d1_acc = tl.zeros((BT, 1), dtype=tl.float32)
     d2_acc = tl.zeros((BT, 1), dtype=tl.float32)
+    # Accumulate (W @ V)^T as V^T @ W^T with a [BK, BT] layout for BK=128.
     if BK == 128:
         barv_acc = tl.zeros((BK, BT), dtype=tl.float32)
         rv_acc = tl.zeros((BK, BT), dtype=tl.float32)
@@ -454,6 +408,7 @@ def parallel_parallax_fwd_kernel_c550_tiled(
         rv_acc = tl.zeros((BT, BK), dtype=tl.float32)
     scale_log2 = scale * 1.4426950216
 
+    # Skip KV tiles outside the window of every query row in this tile.
     start_s = 0
     if WINDOW_SIZE_LEFT > 0:
         start_s = tl.maximum(0, i_t * BT - WINDOW_SIZE_LEFT + 1) // BT
@@ -481,6 +436,8 @@ def parallel_parallax_fwd_kernel_c550_tiled(
         if BK == 128:
             barv_acc = tl.trans(alpha) * barv_acc
             rv_acc = tl.trans(alpha) * rv_acc
+            # The C550 launcher uses BT=32: split the KV reduction into two
+            # contiguous groups of 16 and accumulate both into the same result.
             v0, v1 = tl.split(tl.permute(tl.reshape(tl.trans(b_v), (BK, 2, BT // 2)), (0, 2, 1)))
             w0, w1 = tl.split(tl.permute(tl.reshape(tl.trans(w.to(b_v.dtype)), (2, BT // 2, BT)), (1, 2, 0)))
             barv_acc = tl.dot(v0, w0, out_dtype=tl.float32, acc=barv_acc)
@@ -495,6 +452,7 @@ def parallel_parallax_fwd_kernel_c550_tiled(
             rv_acc = tl.dot(wr.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=rv_acc)
         m_acc = m_new
 
+    # Restore [BT, BK] before row-wise normalization and output stores.
     if BK == 128:
         barv_acc = tl.trans(barv_acc)
         rv_acc = tl.trans(rv_acc)
@@ -514,7 +472,7 @@ def parallel_parallax_fwd_kernel_c550_tiled(
 @triton.autotune(
     configs=get_tuned_config("parallel_parallax_fwd_kernel"),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
-    prune_configs_by={"early_config_prune": _prune_parallax_fwd_configs},
+    prune_configs_by={"early_config_prune": parallax_prune_configs},
 )
 @triton.heuristics(
     {
@@ -567,6 +525,8 @@ def parallel_parallax_fwd_kernel(
     if WINDOW_SIZE_LEFT >= 0:
         leftmost_valid = tl.maximum(0, row_offset - WINDOW_SIZE_LEFT + 1)
         FIRST_COL_BLOCK = leftmost_valid // BS
+        # The unmasked score region must clear the window's left edge for
+        # the tile's LAST row, not its first.
         safe_left_valid = tl.maximum(0, row_offset + BT - WINDOW_SIZE_LEFT)
         SAFE_LEFT_START = (safe_left_valid + BS - 1) // BS
     else:
@@ -596,6 +556,7 @@ def parallel_parallax_fwd_kernel(
     Rv_acc = tl.zeros((BT, BK), dtype=tl.float32)
     scale_log2 = scale * RCP_LN2
 
+    # Left-border blocks require the sliding-window mask.
     for col_block_id in range(FIRST_COL_BLOCK, LEFT_BORDER_END):
         col_indices = col_block_id.to(tl.int64) * BS + tl.arange(0, BS)
         m_kv = (col_indices[:, None] < T) & m_k[None, :]
@@ -615,6 +576,7 @@ def parallel_parallax_fwd_kernel(
         alpha = exp2(m_acc - safe_m)
         w = exp2(qk - safe_m)
         d1_acc = alpha * d1_acc + tl.sum(w, axis=1, keep_dims=True)
+        # Finish the w path before materializing rk/wr to shorten tile lifetimes.
         barv_acc = alpha * barv_acc
         barv_acc = tl.dot(w.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=barv_acc)
         rk = tl.dot(b_r, tl.trans(b_k), out_dtype=tl.float32)
@@ -624,6 +586,7 @@ def parallel_parallax_fwd_kernel(
         Rv_acc = tl.dot(wr.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=Rv_acc)
         m_acc = m_new
 
+    # Interior blocks need no causal or window score mask; load masks remain.
     for _safe in range(SAFE_MIDDLE_START, NUM_SAFE_BLOCKS):
         o_kv = _safe.to(tl.int64) * BS + tl.arange(0, BS)
         m_kv = (o_kv[:, None] < T) & m_k[None, :]
@@ -637,6 +600,7 @@ def parallel_parallax_fwd_kernel(
         alpha = exp2(m_acc - safe_m)
         w = exp2(qk - safe_m)
         d1_acc = alpha * d1_acc + tl.sum(w, axis=1, keep_dims=True)
+        # Finish the w path before materializing rk/wr to shorten tile lifetimes.
         barv_acc = alpha * barv_acc
         barv_acc = tl.dot(w.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=barv_acc)
         rk = tl.dot(b_r, tl.trans(b_k), out_dtype=tl.float32)
@@ -646,6 +610,7 @@ def parallel_parallax_fwd_kernel(
         Rv_acc = tl.dot(wr.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=Rv_acc)
         m_acc = m_new
 
+    # Right-border blocks require causal, boundary, and optional window masks.
     for col_block_id in range(RIGHT_BORDER_START, NUM_TOTAL_BLOCKS):
         col_indices = col_block_id.to(tl.int64) * BS + tl.arange(0, BS)
         m_kv = (col_indices[:, None] < T) & m_k[None, :]
@@ -669,6 +634,7 @@ def parallel_parallax_fwd_kernel(
         alpha = exp2(m_acc - safe_m)
         w = exp2(qk - safe_m)
         d1_acc = alpha * d1_acc + tl.sum(w, axis=1, keep_dims=True)
+        # Finish the w path before materializing rk/wr to shorten tile lifetimes.
         barv_acc = alpha * barv_acc
         barv_acc = tl.dot(w.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=barv_acc)
         rk = tl.dot(b_r, tl.trans(b_k), out_dtype=tl.float32)
@@ -716,6 +682,7 @@ def parallel_parallax_bwd_kernel_short(
     WINDOW_SIZE_LEFT: tl.constexpr,
     BT: tl.constexpr,
 ):
+    """Fuse preprocess, dQ/dR, and dK/dV for a one-tile sequence."""
     i_bh = tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
     i_h = i_hq // G
@@ -907,6 +874,7 @@ def parallel_parallax_bwd_kernel_dqr_short_multi(
     BT: tl.constexpr,
     NT: tl.constexpr,
 ):
+    """Compute dQ/dR for a small fixed number of dense tiles."""
     i_t = tl.program_id(0).to(tl.int64)
     i_bh = tl.program_id(1).to(tl.int64)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -932,6 +900,7 @@ def parallel_parallax_bwd_kernel_dqr_short_multi(
     delta_t = tl.sum(b_grad_o.to(tl.float32) * b_o, axis=1, keep_dims=True)
     delta_b = tl.sum(b_grad_o.to(tl.float32) * b_barv, axis=1, keep_dims=True)
     inv_d1 = tl.where(row_mask, 1.0 / b_d1, 0.0)
+    # Accumulate (gl @ K)^T and (gu @ K)^T; stores transpose back to [BT, BK].
     grad_q_acc = tl.zeros((BK, BT), dtype=tl.float32)
     grad_r_acc = tl.zeros((BK, BT), dtype=tl.float32)
     scale_log2 = scale * 1.4426950216
@@ -989,6 +958,7 @@ def parallel_parallax_bwd_kernel_dkv_short_multi(
     BT: tl.constexpr,
     NT: tl.constexpr,
 ):
+    """Compute dK/dV without atomics for a small fixed number of dense tiles."""
     i_s = tl.program_id(0).to(tl.int64)
     i_bh = tl.program_id(1).to(tl.int64)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -1003,6 +973,8 @@ def parallel_parallax_bwd_kernel_dkv_short_multi(
     b_k = tl.load(k + kv_offsets, mask=col_mask & head_mask, other=0.0)
     b_v = tl.load(v + kv_offsets, mask=col_mask & head_mask, other=0.0)
 
+    # Q^T @ gl + R^T @ gu and grad_o^T @ weights give dK^T and dV^T.
+    # Keep [BK, BT] accumulators and restore [BT, BK] at writeback.
     grad_k_acc = tl.zeros((BK, BT), dtype=tl.float32)
     grad_v_acc = tl.zeros((BK, BT), dtype=tl.float32)
     scale_log2 = scale * 1.4426950216
@@ -1064,7 +1036,7 @@ def parallel_parallax_bwd_kernel_dkv_short_multi(
 @triton.autotune(
     configs=get_tuned_config("parallel_parallax_bwd_kernel_preprocess"),
     key=["T", "K", "IS_VARLEN"],
-    prune_configs_by={"early_config_prune": _prune_parallax_preprocess_configs},
+    prune_configs_by={"early_config_prune": parallax_prune_preprocess_configs},
 )
 @triton.heuristics(
     {
@@ -1172,6 +1144,8 @@ def _parallel_parallax_bwd_kernel_dqr(
     if WINDOW_SIZE_LEFT >= 0:
         leftmost_valid = tl.maximum(0, row_offset - WINDOW_SIZE_LEFT + 1)
         FIRST_COL_BLOCK = leftmost_valid // BS
+        # The unmasked score region must clear the window's left edge for
+        # the tile's LAST row, not its first.
         safe_left_valid = tl.maximum(0, row_offset + BT - WINDOW_SIZE_LEFT)
         SAFE_LEFT_START = (safe_left_valid + BS - 1) // BS
     else:
@@ -1220,6 +1194,7 @@ def _parallel_parallax_bwd_kernel_dqr(
 
     inv_d1 = tl.where(row_mask, 1.0 / b_d1, 0.0)
 
+    # Left-border blocks require the sliding-window mask.
     for col_block_id in range(FIRST_COL_BLOCK, LEFT_BORDER_END):
         col_indices = col_block_id.to(tl.int64) * BS + tl.arange(0, BS)
         m_kv = (col_indices[:, None] < T) & m_k[None, :]
@@ -1247,6 +1222,7 @@ def _parallel_parallax_bwd_kernel_dqr(
         a = p * (a - b_t + (b_bart - rk) * delta)
         grad_q_acc = tl.dot(a.to(b_k.dtype), b_k, out_dtype=tl.float32, acc=grad_q_acc)
 
+    # Interior blocks need no causal or window score mask; load masks remain.
     for _ in range(SAFE_MIDDLE_START, NUM_SAFE_BLOCKS):
         o_kv = _.to(tl.int64) * BS + tl.arange(0, BS)
         m_kv = (o_kv[:, None] < T) & m_k[None, :]
@@ -1268,6 +1244,7 @@ def _parallel_parallax_bwd_kernel_dqr(
         a = p * (a - b_t + (b_bart - rk) * delta)
         grad_q_acc = tl.dot(a.to(b_k.dtype), b_k, out_dtype=tl.float32, acc=grad_q_acc)
 
+    # Right-border blocks require causal, boundary, and optional window masks.
     for col_block_id in range(RIGHT_BORDER_START, NUM_TOTAL_BLOCKS):
         col_indices = col_block_id.to(tl.int64) * BS + tl.arange(0, BS)
         m_kv = (col_indices[:, None] < T) & m_k[None, :]
@@ -1309,7 +1286,7 @@ def _parallel_parallax_bwd_kernel_dqr(
     configs=get_tuned_config("parallel_parallax_bwd_kernel_dqr_fused"),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
     reset_to_zero=["grad_q", "grad_r"],
-    prune_configs_by={"early_config_prune": _prune_parallax_dqr_fused_configs},
+    prune_configs_by={"early_config_prune": parallax_prune_dqr_fused_configs},
 )
 @triton.heuristics(
     {
@@ -1383,7 +1360,7 @@ def parallel_parallax_bwd_kernel_dqr_fused(
     do_bench=_bench_with_maca_resource_limit,
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
     reset_to_zero=["grad_q", "grad_r"],
-    prune_configs_by={"early_config_prune": _prune_parallax_dqr_varlen_configs},
+    prune_configs_by={"early_config_prune": parallax_prune_configs},
 )
 @triton.heuristics(
     {
@@ -1453,7 +1430,7 @@ def parallel_parallax_bwd_kernel_dqr(
 @triton.autotune(
     configs=get_tuned_config("parallel_parallax_bwd_kernel_dkv"),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
-    prune_configs_by={"early_config_prune": _prune_parallax_configs},
+    prune_configs_by={"early_config_prune": parallax_prune_configs},
     do_bench=_bench_with_maca_resource_limit,
 )
 @triton.heuristics(
@@ -1492,6 +1469,8 @@ def parallel_parallax_bwd_kernel_dkv(
     physical_i_t = tl.program_id(0).to(tl.int64)
     i_bh = tl.program_id(1).to(tl.int64)
     i_t = physical_i_t
+    # Reindex dense tasks so consecutive program IDs visit query heads of
+    # the same KV tile; the mapping preserves every (tile, head) pair.
     if not IS_VARLEN and WINDOW_SIZE_LEFT < 0:
         linear_id = physical_i_t + i_bh * tl.num_programs(0)
         num_head_tasks = tl.num_programs(1)
@@ -1532,6 +1511,7 @@ def parallel_parallax_bwd_kernel_dkv(
 
     b_k = tl.load(p_k, mask=m_ck, other=0.0)
     b_v = tl.load(p_v, mask=m_ck, other=0.0)
+    # Accumulate transposed KV gradients; p_grad_k/p_grad_v still use [BS, BK].
     grad_k_acc = tl.zeros((BK, BS), dtype=tl.float32)
     grad_v_acc = tl.zeros((BK, BS), dtype=tl.float32)
     scale_log2 = scale * RCP_LN2
@@ -1541,6 +1521,7 @@ def parallel_parallax_bwd_kernel_dkv(
     WINDOW_BORDER_START = tl.maximum(first_safe_row_block, WINDOW_SAFE_END)
 
     causal_end = tl.minimum(first_safe_row_block, num_row_blocks)
+    # Causal-border query rows need the diagonal score mask.
     for row_block_id in range(start_row_block, causal_end):
         row_offset = row_block_id.to(tl.int64) * BT
         row_indices = row_offset + tl.arange(0, BT)
@@ -1589,6 +1570,7 @@ def parallel_parallax_bwd_kernel_dkv(
         grad_v_acc = tl.dot(tl.trans(grad_o_tile), weights.to(grad_o_tile.dtype), out_dtype=tl.float32, acc=grad_v_acc)
 
     safe_b_start = tl.maximum(first_safe_row_block, start_row_block)
+    # Interior query rows need no causal or window score mask.
     for row_block_id in range(safe_b_start, SAFE_MIDDLE_END):
         row_offset = row_block_id.to(tl.int64) * BT
         row_indices = row_offset + tl.arange(0, BT)
@@ -1627,6 +1609,7 @@ def parallel_parallax_bwd_kernel_dkv(
         grad_v_acc = tl.dot(tl.trans(grad_o_tile), weights.to(grad_o_tile.dtype), out_dtype=tl.float32, acc=grad_v_acc)
 
     window_border_start = tl.maximum(WINDOW_BORDER_START, start_row_block)
+    # Window-border query rows need the sliding-window score mask.
     for row_block_id in range(window_border_start, num_row_blocks):
         row_offset = row_block_id.to(tl.int64) * BT
         row_indices = row_offset + tl.arange(0, BT)
@@ -1677,7 +1660,7 @@ def parallel_parallax_bwd_kernel_dkv(
 @triton.autotune(
     configs=get_tuned_config("parallel_parallax_bwd_kernel_dkv_grouped"),
     key=["T", "K", "G", "WINDOW_SIZE_LEFT", "IS_VARLEN"],
-    prune_configs_by={"early_config_prune": _prune_parallax_dkv_grouped_configs},
+    prune_configs_by={"early_config_prune": parallax_prune_dkv_grouped_configs},
 )
 @triton.heuristics(
     {
@@ -1759,6 +1742,7 @@ def parallel_parallax_bwd_kernel_dkv_grouped(
     for i_g in range(0, G):
         i_hq = i_h * G + i_g
 
+        # Causal-border query rows need the diagonal score mask.
         for row_block_id in range(start_row_block, causal_end):
             row_offset = row_block_id.to(tl.int64) * BT
             row_indices = row_offset + tl.arange(0, BT)
@@ -1807,6 +1791,7 @@ def parallel_parallax_bwd_kernel_dkv_grouped(
                 tl.trans(weights).to(grad_o_tile.dtype), grad_o_tile, out_dtype=tl.float32, acc=grad_v_acc
             )
 
+        # Interior query rows need no causal or window score mask.
         for row_block_id in range(safe_b_start, SAFE_MIDDLE_END):
             row_offset = row_block_id.to(tl.int64) * BT
             row_indices = row_offset + tl.arange(0, BT)
@@ -1845,6 +1830,7 @@ def parallel_parallax_bwd_kernel_dkv_grouped(
                 tl.trans(weights).to(grad_o_tile.dtype), grad_o_tile, out_dtype=tl.float32, acc=grad_v_acc
             )
 
+        # Window-border query rows need the sliding-window score mask.
         for row_block_id in range(window_border_start, num_row_blocks):
             row_offset = row_block_id.to(tl.int64) * BT
             row_indices = row_offset + tl.arange(0, BT)
@@ -1906,6 +1892,7 @@ def parallel_parallax_bwd_kernel_reduce_gqa(
     K: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Fold per-query-head dK/dV into their shared GQA heads in one pass."""
     offsets = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     mask = offsets < N
 
@@ -1927,16 +1914,17 @@ def parallel_parallax_bwd_kernel_reduce_gqa(
 
 
 def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None, window_size_left=-1):
+    """Parallax forward (Triton). `(B, T, HQ, D)` / packed `(1, T_total, HQ, D)` inputs.
+
+    Returns `(o, barv, d1, bart, m)`: `o`/`barv` in the input dtype and layout;
+    `d1`/`bart`/`m` are fp32 per-(position, query-head) scalars `(B, T, HQ)`.
+    """
     B, T, HQ, K = q.shape
     H = k.shape[2]
     G = HQ // H
     BK = triton.next_power_of_2(K)
     use_c550_short = _use_c550_short_tiles(q, cu_seqlens)
-    use_c550_padded_fwd = False
-    if cu_seqlens is None and 256 < T <= 1024 and 32 < K < 64:
-        name = torch.cuda.get_device_name(q.device).upper()
-        use_c550_padded_fwd = "METAX" in name and "C550" in name
-    BT = 32 if (use_c550_short or use_c550_padded_fwd) else _block_size(K, q.device.index, cu_seqlens)
+    BT = 32 if use_c550_short else _block_size(K, q.device.index, cu_seqlens)
     o = torch.empty_like(q)
     barv = torch.empty_like(q)
     stats = torch.empty((3, B, T, HQ), device=q.device, dtype=torch.float32)
@@ -1995,7 +1983,7 @@ def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None
                 num_warps=4,
                 num_stages=1,
             )
-        elif NQ <= 8 or use_c550_padded_fwd:
+        elif NQ <= 8:
             parallel_parallax_fwd_kernel_short_multi[query_grid](
                 q,
                 r,
@@ -2017,7 +2005,7 @@ def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None
                 BT=BT,
                 NT=NQ,
                 num_warps=(4 if BT <= 64 else 8),
-                num_stages=1 if (use_c550_short or use_c550_padded_fwd) else 2,
+                num_stages=1 if use_c550_short else 2,
             )
         else:
             parallel_parallax_fwd_kernel[query_grid](
@@ -2042,6 +2030,8 @@ def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None
                 BT=BT,
             )
     else:
+        # Packed chunk indices use BT-sized units; keep the corresponding
+        # autotuned block sizes aligned with BT.
         chunk_grid = (len(chunk_indices), B * HQ)
         parallel_parallax_fwd_kernel[chunk_grid](
             q,
@@ -2107,6 +2097,7 @@ def parallel_parallax_bwd(
         grad_k_buf, grad_v_buf = grad_k, grad_v
     else:
         grad_k = grad_v = None
+        # Per-query-head partials are reduced back to the shared KV-head axis.
         grad_k_buf = torch.empty((B, T, HQ, K), device=q.device, dtype=q.dtype)
         grad_v_buf = torch.empty((B, T, HQ, K), device=q.device, dtype=q.dtype)
     if cu_seqlens is None:
@@ -2196,12 +2187,16 @@ def parallel_parallax_bwd(
             deltas = torch.empty((2, B, T, HQ), device=q.device, dtype=torch.float32)
             delta_t, delta_b = deltas.unbind(0)
 
+            # dQ/dR owns BT query rows; dK/dV owns BS key/value columns,
+            # so the dK/dV grid must use the tuned BS.
             def dkv_grid(meta):
                 return triton.cdiv(T, meta["BS"]), B * HQ
 
             def grouped_dkv_grid(meta):
                 return triton.cdiv(T, meta["BS"]), B * H
 
+            # Larger heads retain a separate scalar-reduction preprocess pass;
+            # smaller heads fuse those reductions into dQ/dR.
             use_split_dqr = K >= 128
             if use_split_dqr:
 
@@ -2324,6 +2319,8 @@ def parallel_parallax_bwd(
                     BT=BT,
                 )
     else:
+        # Packed chunk indices use BT-sized units; keep the corresponding
+        # autotuned block sizes aligned with BT.
         chunk_grid = (len(chunk_indices), B * HQ)
         grouped_chunk_grid = (len(chunk_indices), B * H)
         deltas = torch.empty((2, B, T, HQ), device=q.device, dtype=torch.float32)
@@ -2440,24 +2437,31 @@ def parallel_parallax_bwd(
 
 
 def _validate_parallel_parallax_inputs(q, r, k, v, window_size, cu_seqlens):
-    for name, tensor in (("q", q), ("r", r), ("k", k), ("v", v)):
+    tensors = {"q": q, "r": r, "k": k, "v": v}
+    for name, tensor in tensors.items():
         if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor")
+            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
         if tensor.ndim != 4:
-            raise ValueError(f"{name} must have shape [B, T, H, D]")
+            raise ValueError(f"{name} must have shape [B, T, H, D], got {tuple(tensor.shape)}")
         if tensor.device.type != "cuda":
-            raise ValueError(f"{name} must be a CUDA tensor")
+            raise ValueError(f"{name} must be a CUDA tensor, got device={tensor.device}")
 
-    if r.shape != q.shape or v.shape != k.shape:
-        raise ValueError("q/r and k/v must have matching shapes")
+    if r.shape != q.shape:
+        raise ValueError(f"r shape {tuple(r.shape)} must match q shape {tuple(q.shape)}")
+    if v.shape != k.shape:
+        raise ValueError(f"v shape {tuple(v.shape)} must match k shape {tuple(k.shape)}")
     if any(tensor.device != q.device for tensor in (r, k, v)):
         raise ValueError("q, r, k, and v must be on the same CUDA device")
-    if q.dtype not in (torch.bfloat16, torch.float16) or any(tensor.dtype != q.dtype for tensor in (r, k, v)):
-        raise TypeError("parallel_parallax requires bf16 or fp16 inputs with matching dtype")
+    if any(tensor.dtype != q.dtype for tensor in (r, k, v)):
+        raise TypeError("q, r, k, and v must have the same dtype")
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"parallel_parallax requires bf16 or fp16 inputs, got q.dtype={q.dtype}")
 
     B, T, HQ, K = q.shape
     if k.shape[0] != B or k.shape[1] != T or k.shape[3] != K:
-        raise ValueError("q/r and k/v must have matching batch size, sequence length and head dimension")
+        raise ValueError(
+            f"k/v shape {tuple(k.shape)} is incompatible with q/r shape {tuple(q.shape)}; B, T, and D must match"
+        )
     H = k.shape[2]
     if T <= 0 or H <= 0 or HQ <= 0:
         raise ValueError("sequence length and query/KV head counts must be positive")
@@ -2466,13 +2470,16 @@ def _validate_parallel_parallax_inputs(q, r, k, v, window_size, cu_seqlens):
     if not 16 <= K <= 256:
         raise ValueError(f"head dimension must be in [16, 256], got D={K}")
     if window_size is not None and (not isinstance(window_size, int) or window_size <= 0):
-        raise ValueError("window_size must be a positive integer or None")
+        raise ValueError(f"window_size must be a positive integer or None, got {window_size!r}")
 
     if cu_seqlens is not None:
         if not isinstance(cu_seqlens, torch.Tensor):
             raise TypeError("cu_seqlens must be a torch.Tensor or None")
         if B != 1:
-            raise ValueError("batch size is expected to be 1 when using cu_seqlens")
+            raise ValueError(
+                f"The batch size is expected to be 1 rather than {B} when using cu_seqlens. "
+                "Flatten variable-length inputs before processing."
+            )
         if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
             raise ValueError("cu_seqlens must be one-dimensional with at least two entries")
         if cu_seqlens.dtype not in (torch.int32, torch.int64):
@@ -2481,23 +2488,9 @@ def _validate_parallel_parallax_inputs(q, r, k, v, window_size, cu_seqlens):
             raise ValueError("cu_seqlens must be on the same CUDA device as q")
 
 
-def _parallax_input_guard(fn):
-
-    @wraps(fn)
-    def wrapper(ctx, *args):
-        tensor = args[0]
-        packed_args = tuple(x.contiguous() if isinstance(x, torch.Tensor) else x for x in args)
-        if tensor.device.index == torch.cuda.current_device():
-            return fn(ctx, *packed_args)
-        with torch.cuda.device(tensor.device):
-            return fn(ctx, *packed_args)
-
-    return wrapper
-
-
 class ParallaxFunction(torch.autograd.Function):
     @staticmethod
-    @_parallax_input_guard
+    @input_guard
     @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, q, r, k, v, scale, window_size_left, cu_seqlens):
         chunk_indices = (
@@ -2514,7 +2507,7 @@ class ParallaxFunction(torch.autograd.Function):
         return o
 
     @staticmethod
-    @_parallax_input_guard
+    @input_guard
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, do):
         q, r, k, v, o, barv, d1, bart, m = ctx.saved_tensors
@@ -2534,7 +2527,7 @@ class ParallaxFunction(torch.autograd.Function):
             ctx.chunk_indices,
             ctx.window_size_left,
         )
-        return gq, gr, gk, gv, None, None, None
+        return gq.to(q), gr.to(r), gk.to(k), gv.to(v), None, None, None
 
 
 def parallel_parallax(
@@ -2589,5 +2582,6 @@ def parallel_parallax(
     _validate_parallel_parallax_inputs(q, r, k, v, window_size, cu_seqlens)
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    # A window of W keeps keys [i - W + 1, i], including the diagonal.
     window_size_left = -1 if window_size is None else window_size
     return ParallaxFunction.apply(q, r, k, v, float(scale), window_size_left, cu_seqlens)

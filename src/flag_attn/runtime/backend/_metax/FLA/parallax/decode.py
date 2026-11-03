@@ -17,13 +17,12 @@ import triton.language as tl
 from flag_attn.FLA.utils import get_num_sms, is_cuda_graph_capturing
 
 
+# Triton 3.6 requires an instantiated constexpr for this JIT global.
 _LOG2E = tl.constexpr(1.4426950408889634)
-_DECODE_CONFIG = {
-    "BLOCK_N": (128, (64, 128)),
-    "NUM_WARPS": (4, (2, 4, 8)),
-    "NUM_STAGES": (3, (1, 2, 3, 4)),
-    "MAX_SPLITS": (32, (8, 16, 32, 64)),
-}
+_BLOCK_N: int = 128
+_MAX_SPLITS: int = 32
+_NUM_WARPS: int = 4
+_NUM_STAGES: int = 3
 
 
 @triton.jit
@@ -51,6 +50,7 @@ def _parallax_decode_kernel(
     WINDOW_SIZE_LEFT: tl.constexpr,
     USE_SEQLEN: tl.constexpr,
 ):
+    """One online-softmax reduction per batch/query-head."""
     i_bh = tl.program_id(0).to(tl.int64)
     i_b = i_bh // HQ
     i_hq = i_bh % HQ
@@ -94,6 +94,7 @@ def _parallax_decode_kernel(
         alpha = _exp2(m - m_safe)
         p1 = _exp2(s1 - m_safe)
         p2 = p1 * s2
+        # Load V after the score consumes K to shorten overlapping tile lifetimes.
         b_v = tl.load(v + kv_offsets, mask=mask_kv, other=0.0)
         b_v = b_v.to(tl.float32)
         d1 = d1 * alpha + tl.sum(p1, axis=0)
@@ -128,6 +129,7 @@ def _parallax_decode_split_kernel(
     BN: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
 ):
+    """Compute one fp32 online-softmax state per KV split."""
     i_bh = tl.program_id(0).to(tl.int64)
     i_split = tl.program_id(1)
     i_b = i_bh // HQ
@@ -135,6 +137,8 @@ def _parallax_decode_split_kernel(
     i_h = i_hq // G
 
     num_blocks = tl.cdiv(Skv, BN)
+    # Proportional boundaries balance splits when the KV tile count is
+    # not divisible by NUM_SPLITS.
     first_block = (i_split * num_blocks) // NUM_SPLITS
     last_block = ((i_split + 1) * num_blocks) // NUM_SPLITS
 
@@ -167,6 +171,7 @@ def _parallax_decode_split_kernel(
         alpha = _exp2(m - m_safe)
         p1 = _exp2(s1 - m_safe)
         p2 = p1 * s2
+        # Load V after the score consumes K to shorten overlapping tile lifetimes.
         b_v = tl.load(v + kv_offsets, mask=mask_kv, other=0.0)
         b_v = b_v.to(tl.float32)
         d1 = d1 * alpha + tl.sum(p1, axis=0)
@@ -176,6 +181,8 @@ def _parallax_decode_split_kernel(
         m = m_new
 
     state_offset = i_bh * NUM_SPLITS + i_split
+    # m/d1/d2 retain shape (1,); Triton requires a matching block pointer
+    # rather than a scalar pointer when storing these block values.
     state_ptr_offset = state_offset + tl.arange(0, 1)
     tl.store(partial_m + state_ptr_offset, m)
     tl.store(partial_d1 + state_ptr_offset, d1)
@@ -198,12 +205,14 @@ def _parallax_decode_merge_kernel(
     NUM_SPLITS: tl.constexpr,
     BSPLIT: tl.constexpr,
 ):
+    """Log-sum-exp merge of the split-local Parallax states."""
     i_bh = tl.program_id(0).to(tl.int64)
     offs_s = tl.arange(0, BSPLIT)
     mask_s = offs_s < NUM_SPLITS
     state_offsets = i_bh * NUM_SPLITS + offs_s
 
     m = tl.load(partial_m + state_offsets, mask=mask_s, other=-float("inf"))
+    # Rescale split-local states to a common maximum before summing them.
     m_global = tl.max(m, axis=0)
     m_safe = tl.where(m_global == -float("inf"), 0.0, m_global)
     alpha = _exp2(m - m_safe)
@@ -244,13 +253,12 @@ def _env_choice(name: str, default: int, choices: tuple[int, ...]) -> int:
 
 
 def _launch_config(kv_len: int, head_dim: int) -> tuple[int, int, int, int]:
-    default_block_n, block_n_choices = _DECODE_CONFIG["BLOCK_N"]
-    if head_dim == 128 and kv_len <= 512:
-        default_block_n = 64
-    block_n = _env_choice("PARALLAX_DECODE_BLOCK_N", default_block_n, block_n_choices)
-    num_warps = _env_choice("PARALLAX_DECODE_NUM_WARPS", *_DECODE_CONFIG["NUM_WARPS"])
-    num_stages = _env_choice("PARALLAX_DECODE_NUM_STAGES", *_DECODE_CONFIG["NUM_STAGES"])
-    max_splits = _env_choice("PARALLAX_DECODE_MAX_SPLITS", *_DECODE_CONFIG["MAX_SPLITS"])
+    """Select a shape-aware default while retaining explicit tuning overrides."""
+    default_block_n = 64 if head_dim == 128 and kv_len <= 512 else _BLOCK_N
+    block_n = _env_choice("PARALLAX_DECODE_BLOCK_N", default_block_n, (64, 128))
+    num_warps = _env_choice("PARALLAX_DECODE_NUM_WARPS", _NUM_WARPS, (2, 4, 8))
+    num_stages = _env_choice("PARALLAX_DECODE_NUM_STAGES", _NUM_STAGES, (1, 2, 3, 4))
+    max_splits = _env_choice("PARALLAX_DECODE_MAX_SPLITS", _MAX_SPLITS, (8, 16, 32, 64))
     return block_n, num_warps, num_stages, max_splits
 
 
@@ -261,6 +269,7 @@ def _choose_num_splits(
     block_n: int,
     max_splits: int,
 ) -> int:
+    """Choose enough split CTAs to fill an under-occupied GPU."""
     override = os.environ.get("PARALLAX_TLE_DECODE_SPLITS")
     num_blocks = triton.cdiv(kv_len, block_n)
     if override is not None:
@@ -270,6 +279,7 @@ def _choose_num_splits(
         return min(requested, num_blocks, max_splits)
     if kv_len < 512 or batch_heads >= get_num_sms(device_index):
         return 1
+    # Aim for two waves, capped so every split owns at least one KV tile.
     requested = triton.cdiv(2 * get_num_sms(device_index), batch_heads)
     return max(1, min(requested, num_blocks, max_splits))
 
@@ -277,6 +287,7 @@ def _choose_num_splits(
 def _split_workspace(
     device: torch.device, batch_heads: int, num_splits: int, head_dim: int
 ) -> tuple[torch.Tensor, ...]:
+    # Keep writable split states private to each call, including across streams.
     scalar_shape = (batch_heads, num_splits)
     vector_shape = (batch_heads, num_splits, head_dim)
     return (
@@ -286,6 +297,59 @@ def _split_workspace(
         torch.empty(vector_shape, device=device, dtype=torch.float32),
         torch.empty(vector_shape, device=device, dtype=torch.float32),
     )
+
+
+def _validate_inputs(
+    q: torch.Tensor,
+    r: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seqused_k: torch.Tensor | None,
+    out: torch.Tensor | None,
+) -> tuple[int, int, int, int, int]:
+    if q.ndim != 4 or r.shape != q.shape:
+        raise ValueError("q and r must have the same (B, 1, H_q, D) shape")
+    if q.shape[1] != 1:
+        raise ValueError(f"Triton decode requires seqlen_q=1, got {q.shape[1]}")
+    if k.ndim != 4 or v.shape != k.shape:
+        raise ValueError("k and v must have the same (B, L, H_kv, D) shape")
+    B, _, HQ, D = q.shape
+    Bk, L, H, Dk = k.shape
+    if B != Bk or D != Dk:
+        raise ValueError("q/r and k/v batch size and head dimension must match")
+    if L < 1:
+        raise ValueError("KV cache length must be positive")
+    if HQ < 1 or H < 1 or D < 1:
+        raise ValueError("head counts and head dimension must be positive")
+    if HQ % H:
+        raise ValueError(f"H_q ({HQ}) must be divisible by H_kv ({H}) for GQA")
+    if D not in (64, 128):
+        raise ValueError(f"Triton decode supports head_dim in {{64, 128}}, got {D}")
+    tensors = (q, r, k, v)
+    if not all(x.is_cuda for x in tensors):
+        raise ValueError("q, r, k and v must be CUDA tensors")
+    if not all(x.device == q.device for x in tensors):
+        raise ValueError("q, r, k and v must be on the same CUDA device")
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError(f"q/r/k/v must be fp16 or bf16, got {q.dtype}")
+    if not all(x.dtype == q.dtype for x in tensors):
+        raise TypeError("q, r, k and v must have the same dtype")
+    if seqused_k is not None:
+        if seqused_k.shape != (B,) or seqused_k.dtype != torch.int32:
+            raise ValueError(f"seqused_k must be int32 with shape ({B},)")
+        if not seqused_k.is_cuda or seqused_k.device != q.device:
+            raise ValueError("seqused_k must be on the same CUDA device as q")
+        if not is_cuda_graph_capturing():
+            lo = int(seqused_k.min().item())
+            hi = int(seqused_k.max().item())
+            if lo < 1 or hi > L:
+                raise ValueError(f"seqused_k values must be in [1, {L}], got [{lo}, {hi}]")
+    if out is not None:
+        if out.shape != q.shape or out.dtype != q.dtype or out.device != q.device:
+            raise ValueError("out must match q's shape, dtype and device")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+    return B, L, HQ, H, D
 
 
 def _window_size_to_left(window_size) -> int:
@@ -303,6 +367,7 @@ def _window_size_to_left(window_size) -> int:
 
 
 def _decode_device_guard(fn):
+    # Select the input device without copying or replacing the caller-owned out.
     @wraps(fn)
     def wrapper(q, *args, **kwargs):
         if not isinstance(q, torch.Tensor) or q.device.type != "cuda":
@@ -335,37 +400,14 @@ def parallax_attn_with_kvcache(
     """
     if page_table is not None:
         raise NotImplementedError("paged KV (page_table) is not implemented")
-    B, Sq, HQ, D = q.shape
-    Bk, L, H, Dk = k_cache.shape
-    if Sq != 1 or r.shape != q.shape:
-        raise ValueError("q and r must have the same (B, 1, H_q, D) shape")
-    if v_cache.shape != k_cache.shape or (Bk, Dk) != (B, D):
-        raise ValueError("k/v must have matching shapes and share q's batch size and head dimension")
-    if min(L, HQ, H) < 1 or HQ % H:
-        raise ValueError("KV length and head counts must be positive, with H_q divisible by H_kv")
-    if D not in (64, 128):
-        raise ValueError(f"Triton decode supports head_dim in {{64, 128}}, got {D}")
-    if not q.is_cuda or any(x.device != q.device for x in (r, k_cache, v_cache)):
-        raise ValueError("q, r, k and v must be on the same CUDA device")
-    if q.dtype not in (torch.float16, torch.bfloat16) or any(x.dtype != q.dtype for x in (r, k_cache, v_cache)):
-        raise TypeError("q, r, k and v must have the same fp16 or bf16 dtype")
-    if seqused_k is not None:
-        if seqused_k.shape != (B,) or seqused_k.dtype != torch.int32 or seqused_k.device != q.device:
-            raise ValueError("seqused_k must be int32 with shape (B,) on q's device")
-        if not is_cuda_graph_capturing():
-            lo, hi = int(seqused_k.min().item()), int(seqused_k.max().item())
-            if lo < 1 or hi > L:
-                raise ValueError(f"seqused_k values must be in [1, {L}], got [{lo}, {hi}]")
-    if out is not None:
-        if out.shape != q.shape or out.dtype != q.dtype or out.device != q.device or not out.is_contiguous():
-            raise ValueError("out must be contiguous and match q's shape, dtype and device")
+    B, L, HQ, H, D = _validate_inputs(q, r, k_cache, v_cache, seqused_k, out)
     window_left = _window_size_to_left(window_size)
     if window_left < -1:
         raise ValueError("window_size left must be -1 or non-negative")
     if scale is None:
         scale = 1.0 / math.sqrt(D)
 
-    q, r, k_cache, v_cache = (x.contiguous() for x in (q, r, k_cache, v_cache))
+    q, r, k_cache, v_cache = (x if x.is_contiguous() else x.contiguous() for x in (q, r, k_cache, v_cache))
     if seqused_k is not None and not seqused_k.is_contiguous():
         seqused_k = seqused_k.contiguous()
     result = torch.empty_like(q) if out is None else out
@@ -376,6 +418,8 @@ def parallax_attn_with_kvcache(
     if device_index is None:
         device_index = torch.cuda.current_device()
 
+    # Runtime lengths and windows use the one-CTA path so no split scans cache
+    # positions which are known to be inactive.
     num_splits = 1
     if seqused_k is None and window_left < 0:
         num_splits = _choose_num_splits(batch_heads, L, device_index, block_n, max_splits)
