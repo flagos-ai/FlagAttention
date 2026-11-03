@@ -98,8 +98,11 @@ def _score_kernel(
 
     for source in tl.range(0, L):
         residual_ptr = tl.cast(tl.load(residual_ptrs + source), residual0.dtype)
-        acc_square = tl.zeros([BR], tl.float32)
-        acc_dot = tl.zeros([BR], tl.float32)
+        # Two [BR, BDB] tiles accumulate the products over the whole row and are
+        # reduced once per source; reducing per block instead costs one extra
+        # full-width op per block (measured ~10% of pass 1 on L9_N8192).
+        acc_square = tl.zeros([BR, BDB], tl.float32)
+        acc_dot = tl.zeros([BR, BDB], tl.float32)
         for block in tl.range(0, D // BDB):
             cols = block * BDB + blocks
             query_values = tl.load(query + cols).to(tl.float32)
@@ -113,9 +116,9 @@ def _score_kernel(
                     residual_ptr + offsets, mask=rows[:, None] < N, other=0.0
                 )
             residual_values = residual_values.to(tl.float32)
-            acc_square += tl.sum(residual_values * residual_values, axis=1)
-            acc_dot += tl.sum(residual_values * query_weight[None, :], axis=1)
-        source_logit = acc_dot * tl.rsqrt(acc_square / D + eps)
+            acc_square += residual_values * residual_values
+            acc_dot += residual_values * query_weight[None, :]
+        source_logit = tl.sum(acc_dot, axis=1) * tl.rsqrt(tl.sum(acc_square, axis=1) / D + eps)
         if EVEN:
             tl.store(logit + source * N + rows, source_logit)
         else:
@@ -236,14 +239,18 @@ def plan(hidden_size: int, num_rows: int, num_sources: int, has_onorm: bool) -> 
         # a large power-of-two divisor leave the DMA too little to stream.
         return None
 
-    # Pass 1 keeps one [BR, BDB] fp32 tile live; BR=16/BDB=1024 is 64 KB and
-    # measured fastest (1.53 ms vs 2.19 ms at BR=8 on L9_N8192).
-    row_batch = 16 if num_rows % 16 == 0 else 8
+    # Pass 1 hoists the per-row reduce out of the column-block loop, so it keeps
+    # two [BR, BDB] fp32 accumulators plus one residual tile live.  A 128-wide
+    # block keeps that footprint small enough to stay under the UB budget with
+    # 32 rows per program, which measured fastest both at 1024 and 8192 rows.
+    row_batch = 32 if num_rows % 32 == 0 else (16 if num_rows % 16 == 0 else 8)
+    row_batch = row_batch if num_rows % row_batch == 0 else 1
+    block_b = min(128, lowbit)
     config = dict(
         L=num_sources,
         D=hidden_size,
         BR1=row_batch,
-        BDB1=min(1024, lowbit),
+        BDB1=block_b,
         EVEN1=num_rows % row_batch == 0,
         # Pass 2 needs an accumulator *and* a source tile live, and its best
         # measured point is BR=8/BDB=1024 (1.09 ms, 1082 GB/s = HBM ceiling);
