@@ -1,5 +1,17 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 
@@ -9,12 +21,11 @@ from flag_attn.FLA.gated_delta_rule.fused_recurrent import _launch, fused_recurr
 from flag_attn.testing.recurrent_gdn import make_case, reference, check_close
 
 pytestmark = [
-    pytest.mark.gdn_forward,
-    pytest.mark.fused_recurrent_gated_delta_rule_fwd,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @pytest.mark.parametrize("h,hv", [(2, 4), (4, 12), (2, 8)])
 @pytest.mark.parametrize("length", [1, 3, 8])
 @pytest.mark.parametrize("strided", [False, True])
@@ -27,6 +38,7 @@ def test_recurrent_stateful(h, hv, length, strided, seed):
     assert actual[1].data_ptr() == case["initial_state"].data_ptr()
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @pytest.mark.parametrize("kd,vd", [(1, 1), (60, 80), (64, 128), (128, 64), (256, 128), (128, 256)])
 @pytest.mark.parametrize("vector_beta", [False, True])
 def test_recurrent_tails_and_vector_beta(kd, vd, vector_beta):
@@ -35,6 +47,7 @@ def test_recurrent_tails_and_vector_beta(kd, vd, vector_beta):
     check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @pytest.mark.parametrize(
     "dtype,state_dtype",
     [(torch.float16, torch.float32), (torch.bfloat16, torch.bfloat16), (torch.float32, torch.float32)],
@@ -45,6 +58,7 @@ def test_recurrent_dtypes(dtype, state_dtype):
     check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @pytest.mark.parametrize("inplace", [False, True])
 def test_recurrent_dense_without_indices(inplace):
     n, length = 3, 4
@@ -57,6 +71,7 @@ def test_recurrent_dense_without_indices(inplace):
     check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @pytest.mark.parametrize("inplace", [False, True])
 def test_recurrent_ragged_and_empty(inplace):
     case = make_case(5, 8, 2, 6, lengths=[0, 1, 8, 3, 0], spec=True)
@@ -65,6 +80,7 @@ def test_recurrent_ragged_and_empty(inplace):
     check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 def test_recurrent_padding_and_index_strides():
     case = make_case(4, 4, 2, 6, padding=True, spec=True)
     case["ssm_state_indices"][-2] = -1
@@ -80,6 +96,7 @@ def test_recurrent_padding_and_index_strides():
     assert torch.count_nonzero(out[:, -4:]) == 0
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 def test_recurrent_continuation_and_repeatability():
     case = make_case(3, 8, 2, 6)
     original = case["initial_state"].clone()
@@ -109,6 +126,7 @@ def test_recurrent_continuation_and_repeatability():
     torch.testing.assert_close(pool[stable.long()], full_s[ids[:, -1].long()], rtol=2.0e-4, atol=2.0e-5)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 def test_recurrent_zero_decay_beta_limits():
     case = make_case(3, 4, 2, 6)
     case["g"].zero_()
@@ -118,6 +136,7 @@ def test_recurrent_zero_decay_beta_limits():
     check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 def test_recurrent_preallocated_kernel_is_exercised():
     case = make_case(2, 4, 2, 4, spec=True)
     expected = reference(case)
@@ -142,6 +161,7 @@ def test_recurrent_preallocated_kernel_is_exercised():
     check_close(out, case["initial_state"], *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @pytest.mark.parametrize("strided_state", [False, True])
 def test_recurrent_gate_and_state_strides(strided_state):
     case = make_case(3, 3, 2, 6, kdim=60, vdim=80)
@@ -159,6 +179,7 @@ def test_recurrent_gate_and_state_strides(strided_state):
     check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 def test_recurrent_public_export():
     import flag_attn
 
@@ -167,12 +188,14 @@ def test_recurrent_public_export():
     check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 def test_recurrent_padded_projection_buffer():
     case = make_case(3, 4, 2, 6, spec=True, projection_padding=64)
     expected = reference(case)
     check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 def test_recurrent_padding_snapshots_are_initialized(monkeypatch):
     case = make_case(4, 4, 2, 6, padding=True, spec=True)
     case["inplace_final_state"] = False
@@ -192,6 +215,7 @@ def test_recurrent_padding_snapshots_are_initialized(monkeypatch):
     assert torch.count_nonzero(final[-4:]) == 0
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 def test_recurrent_invalid_write_slot_keeps_cache():
     case = make_case(3, 4, 2, 6, spec=True)
     case["num_accepted_tokens"].fill_(1)
@@ -200,6 +224,7 @@ def test_recurrent_invalid_write_slot_keeps_cache():
     check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @pytest.mark.parametrize("values", ["zero", "impulse"])
 def test_recurrent_longer_verification_values(values):
     case = make_case(3, 16, 2, 6, kdim=127, vdim=129, spec=True)
@@ -215,6 +240,7 @@ def test_recurrent_longer_verification_values(values):
     check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 def test_recurrent_pre_normalized_inputs():
     case = make_case(4, 8, 2, 6, spec=True)
     for name in ("q", "k"):
@@ -225,8 +251,69 @@ def test_recurrent_pre_normalized_inputs():
     check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @pytest.mark.parametrize("lengths", [[0, 0, 0], [0, 1, 0]])
 def test_recurrent_empty_batch_segments(lengths):
     case = make_case(3, 1, 2, 4, lengths=lengths)
     expected = reference(case)
     check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+
+
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.parametrize("varlen", [False, True])
+def test_recurrent_single_read_index_without_inplace_writes(varlen):
+    case = make_case(2, 4, 2, 4)
+    case["inplace_final_state"] = False
+    case["ssm_state_indices"] = case["ssm_state_indices"][:, :1]
+    if not varlen:
+        for name in ("q", "k", "v", "g", "beta"):
+            x = case[name]
+            case[name] = x.reshape(2, 4, *x.shape[2:])
+        case["cu_seqlens"] = None
+    initial = case["initial_state"].clone()
+    expected = reference(case)
+    check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+    torch.testing.assert_close(case["initial_state"], initial, rtol=0, atol=0)
+
+
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.parametrize("invalid", ["v_rank", "g_dtype", "beta_dtype", "empty_indices", "short_indices"])
+def test_recurrent_invalid_metadata(invalid):
+    case = make_case(2, 4, 2, 4)
+    if invalid == "v_rank":
+        case["v"] = case["v"][..., 0]
+    elif invalid == "g_dtype":
+        case["g"] = case["g"].to(torch.int32)
+    elif invalid == "beta_dtype":
+        case["beta"] = case["beta"].to(torch.int32)
+    elif invalid == "empty_indices":
+        case["ssm_state_indices"] = case["ssm_state_indices"][:, :0]
+    else:
+        for name in ("q", "k", "v", "g", "beta"):
+            x = case[name]
+            case[name] = x.reshape(2, 4, *x.shape[2:])
+        case["cu_seqlens"] = None
+        case["ssm_state_indices"] = case["ssm_state_indices"][:, :2]
+    with pytest.raises(ValueError):
+        fused_recurrent_gated_delta_rule_fwd(**case)
+
+
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("vector_beta", [False, True])
+@pytest.mark.parametrize("normalize", [False, True])
+@torch.inference_mode()
+def test_recurrent_large_snapshot_layout(state_dtype, vector_beta, normalize, monkeypatch):
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("Hopper layout path")
+    from flag_attn.testing.recurrent_gdn import record_recurrent_launch
+
+    calls = record_recurrent_launch(monkeypatch)
+    case = make_case(32, 4, 4, 16, state_dtype=state_dtype, spec=True, vector_beta=vector_beta)
+    if not normalize:
+        for name in ("q", "k"):
+            case[name] = torch.nn.functional.normalize(case[name].float(), dim=-1).to(case[name].dtype)
+        case["use_qk_l2norm_in_kernel"] = False
+    expected = reference(case)
+    check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+    assert len(calls) == 1 and calls[0]["LAYOUT"] is not None

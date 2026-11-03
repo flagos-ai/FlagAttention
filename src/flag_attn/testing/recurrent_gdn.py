@@ -1,5 +1,17 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """State-safe recurrent fixtures and an independent FP32 recurrence."""
 
 import torch
@@ -121,3 +133,21 @@ def check_close(out, state, ref_out, ref_state):
     tol = 2.0e-4 if state.dtype == torch.float32 else 1.0e-2
     torch.testing.assert_close(state, ref_state, rtol=tol, atol=2.0e-5 if state.dtype == torch.float32 else 2.0e-3)
     assert torch.isfinite(out).all() and torch.isfinite(state).all()
+
+
+def record_recurrent_launch(monkeypatch):
+    import flag_attn.FLA.gated_delta_rule.fused_recurrent as module
+
+    kernel = module._recurrent_fwd_kernel
+    calls = []
+
+    class Recorder:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append({**dict(zip(kernel.arg_names, args)), **kwargs})
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(module, "_recurrent_fwd_kernel", Recorder())
+    return calls

@@ -1,9 +1,7 @@
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 #
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-# For a list of all contributors, visit:
-#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+# This file contains code derived from flash-linear-attention.
+# The original source code is licensed under the MIT license.
 
 import torch
 import triton
@@ -42,13 +40,13 @@ def _store_gated_block(
 
 @triton.heuristics(
     {
-        "USE_G": lambda args: False,
+        "USE_G": lambda args: not args["OUTPUT_UNGATED"],
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
 @triton.autotune(
-    configs=[triton.Config({"BK": BK}, num_warps=num_warps) for BK in [32, 64] for num_warps in [1, 2, 4]],
-    key=["H", "HV", "K", "BC", "OUTPUT_GATED", "MERGE_PRECISION"],
+    configs=[triton.Config({"BK": BK}, num_warps=num_warps) for BK in [32, 64] for num_warps in [1, 2, 4, 8]],
+    key=["T", "H", "HV", "K", "BC", "OUTPUT_GATED", "OUTPUT_UNGATED", "MERGE_PRECISION", "FULL_CHUNKS"],
 )
 @triton.jit(do_not_specialize=["T"])
 def _prepare_kernel(
@@ -70,21 +68,12 @@ def _prepare_kernel(
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     OUTPUT_GATED: tl.constexpr,
+    OUTPUT_UNGATED: tl.constexpr,
     MERGE_PRECISION: tl.constexpr,
+    FULL_CHUNKS: tl.constexpr,
 ):
-    """
-    Fused kernel: compute beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass.
-
-    This kernel fuses chunk_scaled_dot_kkt_fwd and solve_tril into a single kernel,
-    avoiding the HBM round-trip for the intermediate A matrix.
-
-    Steps:
-    1. Compute all 10 lower-triangular [BC, BC] blocks of beta * K @ K^T in registers
-    2. Apply gate and beta scaling
-    3. Forward substitution on diagonal blocks
-    4. Block merge to get full (I+A)^{-1}
-    5. Write result to A (output)
-    """
+    """Compute chunk gate prefixes and the requested triangular inverse in registers."""
+    tl.static_assert(USE_G == (not OUTPUT_UNGATED))
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // HV, i_bh % HV
 
@@ -109,7 +98,6 @@ def _prepare_kernel(
     i_tc3 = i_t * BT + 3 * BC
 
     k += (bos * H + i_h // (HV // H)) * K
-    A += (bos * HV + i_h) * BT
 
     o_i = tl.arange(0, BC)
     m_tc0 = (i_tc0 + o_i) < T
@@ -117,7 +105,6 @@ def _prepare_kernel(
     m_tc2 = (i_tc2 + o_i) < T
     m_tc3 = (i_tc3 + o_i) < T
 
-    # load beta for each sub-chunk
     p_b0 = tl.make_block_ptr(beta + bos * HV + i_h, (T,), (HV,), (i_tc0,), (BC,), (0,))
     p_b1 = tl.make_block_ptr(beta + bos * HV + i_h, (T,), (HV,), (i_tc1,), (BC,), (0,))
     p_b2 = tl.make_block_ptr(beta + bos * HV + i_h, (T,), (HV,), (i_tc2,), (BC,), (0,))
@@ -127,29 +114,21 @@ def _prepare_kernel(
     b_b2 = tl.load(p_b2, boundary_check=(0,), padding_option="zero").to(tl.float32)
     b_b3 = tl.load(p_b3, boundary_check=(0,), padding_option="zero").to(tl.float32)
 
-    # load gate if used
     if USE_G:
-        p_g0 = tl.make_block_ptr(g + bos * HV + i_h, (T,), (HV,), (i_tc0,), (BC,), (0,))
-        p_g1 = tl.make_block_ptr(g + bos * HV + i_h, (T,), (HV,), (i_tc1,), (BC,), (0,))
-        p_g2 = tl.make_block_ptr(g + bos * HV + i_h, (T,), (HV,), (i_tc2,), (BC,), (0,))
-        p_g3 = tl.make_block_ptr(g + bos * HV + i_h, (T,), (HV,), (i_tc3,), (BC,), (0,))
+        # Gated-only output applies the prefix diagonal before inversion.
+        prefix_log2 = prefix * 1.4426950408889634
+        b_g0 = tl.gather(prefix_log2, o_i, 0)
+        b_g1 = tl.gather(prefix_log2, BC + o_i, 0)
+        b_g2 = tl.gather(prefix_log2, 2 * BC + o_i, 0)
+        b_g3 = tl.gather(prefix_log2, 3 * BC + o_i, 0)
 
-        b_g0 = tl.load(p_g0, boundary_check=(0,), padding_option="zero").to(tl.float32)
-        b_g1 = tl.load(p_g1, boundary_check=(0,), padding_option="zero").to(tl.float32)
-        b_g2 = tl.load(p_g2, boundary_check=(0,), padding_option="zero").to(tl.float32)
-        b_g3 = tl.load(p_g3, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    # Four 16-token diagonal blocks and six lower off-diagonal KKT blocks.
 
-    ############################################################################
-    # Step 1: compute all 10 lower-triangular [BC, BC] blocks of K @ K^T
-    ############################################################################
-
-    # 4 diagonal blocks
     b_A00 = tl.zeros([BC, BC], dtype=tl.float32)
     b_A11 = tl.zeros([BC, BC], dtype=tl.float32)
     b_A22 = tl.zeros([BC, BC], dtype=tl.float32)
     b_A33 = tl.zeros([BC, BC], dtype=tl.float32)
 
-    # 6 off-diagonal blocks
     b_A10 = tl.zeros([BC, BC], dtype=tl.float32)
     b_A20 = tl.zeros([BC, BC], dtype=tl.float32)
     b_A21 = tl.zeros([BC, BC], dtype=tl.float32)
@@ -160,44 +139,32 @@ def _prepare_kernel(
     for i_k in range(tl.cdiv(K, BK)):
         p_k0 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
         b_k0 = tl.load(p_k0, boundary_check=(0, 1), padding_option="zero")
-        # diagonal block 0
         b_A00 += tl.dot(b_k0, tl.trans(b_k0))
 
         if i_tc1 < T:
             p_k1 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
             b_k1 = tl.load(p_k1, boundary_check=(0, 1), padding_option="zero")
-            # diagonal block 1
             b_A11 += tl.dot(b_k1, tl.trans(b_k1))
-            # off-diagonal (1,0)
             b_A10 += tl.dot(b_k1, tl.trans(b_k0))
 
             if i_tc2 < T:
                 p_k2 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
                 b_k2 = tl.load(p_k2, boundary_check=(0, 1), padding_option="zero")
-                # diagonal block 2
                 b_A22 += tl.dot(b_k2, tl.trans(b_k2))
-                # off-diagonal (2,0), (2,1)
                 b_A20 += tl.dot(b_k2, tl.trans(b_k0))
                 b_A21 += tl.dot(b_k2, tl.trans(b_k1))
 
                 if i_tc3 < T:
                     p_k3 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
                     b_k3 = tl.load(p_k3, boundary_check=(0, 1), padding_option="zero")
-                    # diagonal block 3
                     b_A33 += tl.dot(b_k3, tl.trans(b_k3))
-                    # off-diagonal (3,0), (3,1), (3,2)
                     b_A30 += tl.dot(b_k3, tl.trans(b_k0))
                     b_A31 += tl.dot(b_k3, tl.trans(b_k1))
                     b_A32 += tl.dot(b_k3, tl.trans(b_k2))
 
-    ############################################################################
-    # Step 2: apply gate and beta scaling
-    ############################################################################
+    # Beta scales the rows of the strictly lower KKT matrix.
 
-    # apply gate, beta scaling, and masking
-    # m_d: strictly lower triangular mask for diagonal blocks
-    # m_tc: boundary mask to prevent NaN from 0 * inf (IEEE 754) when
-    #   out-of-bounds g loads as 0 via boundary_check and exp2(0 - g_inbounds) overflows
+    # Padded KKT entries stay zero even when a gate factor overflows.
     m_d = o_i[:, None] > o_i[None, :]
     m_I = o_i[:, None] == o_i[None, :]
 
@@ -219,13 +186,11 @@ def _prepare_kernel(
         b_A22 = tl.where(m_d, b_A22, 0.0)
         b_A33 = tl.where(m_d, b_A33, 0.0)
 
-    # diagonal blocks: scaled by beta
     b_A00 = b_A00 * b_b0[:, None]
     b_A11 = b_A11 * b_b1[:, None]
     b_A22 = b_A22 * b_b2[:, None]
     b_A33 = b_A33 * b_b3[:, None]
 
-    # off-diagonal blocks: full block, scaled by beta
     b_A10 = b_A10 * b_b1[:, None]
     b_A20 = b_A20 * b_b2[:, None]
     b_A21 = b_A21 * b_b2[:, None]
@@ -233,48 +198,60 @@ def _prepare_kernel(
     b_A31 = b_A31 * b_b3[:, None]
     b_A32 = b_A32 * b_b3[:, None]
 
-    ############################################################################
-    # Step 3: forward substitution on diagonal blocks -> (I + A_diag)^{-1}
-    #
-    # Same algorithm as solve_tril, but rows are extracted from in-register
-    # [BC, BC] tensor via tl.sum(tl.where(mask, tensor, 0), 0) instead of
-    # tl.load from HBM.
-    ############################################################################
+    # Extract substitution rows from registers instead of reading KKT from HBM.
 
     b_Ai00 = -b_A00
     b_Ai11 = -b_A11
     b_Ai22 = -b_A22
     b_Ai33 = -b_A33
 
-    for i in range(2, min(BC, T - i_tc0)):
-        b_a00 = tl.sum(tl.where((o_i == i)[:, None], -b_A00, 0.0), 0)
-        b_a00 = tl.where(o_i < i, b_a00, 0.0)
-        b_a00 = b_a00 + tl.sum(b_a00[:, None] * b_Ai00, 0)
-        b_Ai00 = tl.where((o_i == i)[:, None], b_a00, b_Ai00)
-    for i in range(2, min(BC, T - i_tc1)):
-        b_a11 = tl.sum(tl.where((o_i == i)[:, None], -b_A11, 0.0), 0)
-        b_a11 = tl.where(o_i < i, b_a11, 0.0)
-        b_a11 = b_a11 + tl.sum(b_a11[:, None] * b_Ai11, 0)
-        b_Ai11 = tl.where((o_i == i)[:, None], b_a11, b_Ai11)
-    for i in range(2, min(BC, T - i_tc2)):
-        b_a22 = tl.sum(tl.where((o_i == i)[:, None], -b_A22, 0.0), 0)
-        b_a22 = tl.where(o_i < i, b_a22, 0.0)
-        b_a22 = b_a22 + tl.sum(b_a22[:, None] * b_Ai22, 0)
-        b_Ai22 = tl.where((o_i == i)[:, None], b_a22, b_Ai22)
-    for i in range(2, min(BC, T - i_tc3)):
-        b_a33 = tl.sum(tl.where((o_i == i)[:, None], -b_A33, 0.0), 0)
-        b_a33 = tl.where(o_i < i, b_a33, 0.0)
-        b_a33 = b_a33 + tl.sum(b_a33[:, None] * b_Ai33, 0)
-        b_Ai33 = tl.where((o_i == i)[:, None], b_a33, b_Ai33)
+    if FULL_CHUNKS:
+        # Interleave independent diagonal solves to hide reduction latency.
+        for i in range(2, BC):
+            b_a00 = tl.sum(tl.where((o_i == i)[:, None], -b_A00, 0.0), 0)
+            b_a00 = tl.where(o_i < i, b_a00, 0.0)
+            b_a00 = b_a00 + tl.sum(b_a00[:, None] * b_Ai00, 0)
+            b_Ai00 = tl.where((o_i == i)[:, None], b_a00, b_Ai00)
+            b_a11 = tl.sum(tl.where((o_i == i)[:, None], -b_A11, 0.0), 0)
+            b_a11 = tl.where(o_i < i, b_a11, 0.0)
+            b_a11 = b_a11 + tl.sum(b_a11[:, None] * b_Ai11, 0)
+            b_Ai11 = tl.where((o_i == i)[:, None], b_a11, b_Ai11)
+            b_a22 = tl.sum(tl.where((o_i == i)[:, None], -b_A22, 0.0), 0)
+            b_a22 = tl.where(o_i < i, b_a22, 0.0)
+            b_a22 = b_a22 + tl.sum(b_a22[:, None] * b_Ai22, 0)
+            b_Ai22 = tl.where((o_i == i)[:, None], b_a22, b_Ai22)
+            b_a33 = tl.sum(tl.where((o_i == i)[:, None], -b_A33, 0.0), 0)
+            b_a33 = tl.where(o_i < i, b_a33, 0.0)
+            b_a33 = b_a33 + tl.sum(b_a33[:, None] * b_Ai33, 0)
+            b_Ai33 = tl.where((o_i == i)[:, None], b_a33, b_Ai33)
+    else:
+        for i in range(2, min(BC, T - i_tc0)):
+            b_a00 = tl.sum(tl.where((o_i == i)[:, None], -b_A00, 0.0), 0)
+            b_a00 = tl.where(o_i < i, b_a00, 0.0)
+            b_a00 = b_a00 + tl.sum(b_a00[:, None] * b_Ai00, 0)
+            b_Ai00 = tl.where((o_i == i)[:, None], b_a00, b_Ai00)
+        for i in range(2, min(BC, T - i_tc1)):
+            b_a11 = tl.sum(tl.where((o_i == i)[:, None], -b_A11, 0.0), 0)
+            b_a11 = tl.where(o_i < i, b_a11, 0.0)
+            b_a11 = b_a11 + tl.sum(b_a11[:, None] * b_Ai11, 0)
+            b_Ai11 = tl.where((o_i == i)[:, None], b_a11, b_Ai11)
+        for i in range(2, min(BC, T - i_tc2)):
+            b_a22 = tl.sum(tl.where((o_i == i)[:, None], -b_A22, 0.0), 0)
+            b_a22 = tl.where(o_i < i, b_a22, 0.0)
+            b_a22 = b_a22 + tl.sum(b_a22[:, None] * b_Ai22, 0)
+            b_Ai22 = tl.where((o_i == i)[:, None], b_a22, b_Ai22)
+        for i in range(2, min(BC, T - i_tc3)):
+            b_a33 = tl.sum(tl.where((o_i == i)[:, None], -b_A33, 0.0), 0)
+            b_a33 = tl.where(o_i < i, b_a33, 0.0)
+            b_a33 = b_a33 + tl.sum(b_a33[:, None] * b_Ai33, 0)
+            b_Ai33 = tl.where((o_i == i)[:, None], b_a33, b_Ai33)
 
     b_Ai00 += m_I
     b_Ai11 += m_I
     b_Ai22 += m_I
     b_Ai33 += m_I
 
-    ############################################################################
-    # Step 4: block merge -> full (I + A)^{-1}
-    ############################################################################
+    # Merge the inverse blocks using the requested FP32 dot precision.
 
     b_Ai10 = -tl.dot(tl.dot(b_Ai11, b_A10, input_precision=MERGE_PRECISION), b_Ai00, input_precision=MERGE_PRECISION)
     b_Ai21 = -tl.dot(tl.dot(b_Ai22, b_A21, input_precision=MERGE_PRECISION), b_Ai11, input_precision=MERGE_PRECISION)
@@ -298,35 +275,34 @@ def _prepare_kernel(
         input_precision=MERGE_PRECISION,
     )
 
-    ############################################################################
-    # Step 5: store full (I + A)^{-1} to output A
-    ############################################################################
+    if USE_G:
+        A = AG
+    if OUTPUT_UNGATED or USE_G:
+        A += (bos * HV + i_h) * BT
+        p_A00 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc0, 0), (BC, BC), (1, 0))
+        p_A10 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc1, 0), (BC, BC), (1, 0))
+        p_A11 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc1, BC), (BC, BC), (1, 0))
+        p_A20 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc2, 0), (BC, BC), (1, 0))
+        p_A21 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc2, BC), (BC, BC), (1, 0))
+        p_A22 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc2, 2 * BC), (BC, BC), (1, 0))
+        p_A30 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc3, 0), (BC, BC), (1, 0))
+        p_A31 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc3, BC), (BC, BC), (1, 0))
+        p_A32 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc3, 2 * BC), (BC, BC), (1, 0))
+        p_A33 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc3, 3 * BC), (BC, BC), (1, 0))
 
-    p_A00 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc0, 0), (BC, BC), (1, 0))
-    p_A10 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc1, 0), (BC, BC), (1, 0))
-    p_A11 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc1, BC), (BC, BC), (1, 0))
-    p_A20 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc2, 0), (BC, BC), (1, 0))
-    p_A21 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc2, BC), (BC, BC), (1, 0))
-    p_A22 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc2, 2 * BC), (BC, BC), (1, 0))
-    p_A30 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc3, 0), (BC, BC), (1, 0))
-    p_A31 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc3, BC), (BC, BC), (1, 0))
-    p_A32 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc3, 2 * BC), (BC, BC), (1, 0))
-    p_A33 = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc3, 3 * BC), (BC, BC), (1, 0))
+        tl.store(p_A00, b_Ai00.to(A.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_A10, b_Ai10.to(A.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_A11, b_Ai11.to(A.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_A20, b_Ai20.to(A.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_A21, b_Ai21.to(A.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_A22, b_Ai22.to(A.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_A30, b_Ai30.to(A.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_A31, b_Ai31.to(A.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_A32, b_Ai32.to(A.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_A33, b_Ai33.to(A.dtype.element_ty), boundary_check=(0, 1))
 
-    tl.store(p_A00, b_Ai00.to(A.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_A10, b_Ai10.to(A.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_A11, b_Ai11.to(A.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_A20, b_Ai20.to(A.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_A21, b_Ai21.to(A.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_A22, b_Ai22.to(A.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_A30, b_Ai30.to(A.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_A31, b_Ai31.to(A.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_A32, b_Ai32.to(A.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_A33, b_Ai33.to(A.dtype.element_ty), boundary_check=(0, 1))
-
-    if OUTPUT_GATED:
-        # The raw forward API returns the gated inverse as an auxiliary output.
-        # Restore it from FP32 register blocks before A_0 is rounded for storage.
+    if OUTPUT_GATED and not USE_G:
+        # Restore gate factors before rounding the FP32 inverse for storage.
         AG += (bos * HV + i_h) * BT
         _store_gated_block(AG, b_Ai00, prefix, i_tc0, 0, 0, HV, BT, BC, T)
         _store_gated_block(AG, b_Ai10, prefix, i_tc0, 1, 0, HV, BT, BC, T)
@@ -339,27 +315,58 @@ def _prepare_kernel(
         _store_gated_block(AG, b_Ai32, prefix, i_tc0, 3, 2, HV, BT, BC, T)
         _store_gated_block(AG, b_Ai33, prefix, i_tc0, 3, 3, HV, BT, BC, T)
 
+    zero = tl.full((BC, BC), 0, k.dtype.element_ty)
+    for row in tl.static_range(0, 4):
+        for col in tl.static_range(row + 1, 4):
+            if OUTPUT_UNGATED or USE_G:
+                upper = tl.make_block_ptr(A, (T, BT), (HV * BT, 1), (i_tc0 + row * BC, col * BC), (BC, BC), (1, 0))
+                tl.store(upper, zero, boundary_check=(0, 1))
+            if OUTPUT_GATED and not USE_G:
+                upper_g = tl.make_block_ptr(AG, (T, BT), (HV * BT, 1), (i_tc0 + row * BC, col * BC), (BC, BC), (1, 0))
+                tl.store(upper_g, zero, boundary_check=(0, 1))
 
-def prepare_fused_tle_inputs(k, g, beta, output_gated=False, cu_seqlens=None, merge_precision="ieee"):
+
+def prepare_fused_tle_inputs(
+    k, g, beta, output_gated=False, cu_seqlens=None, merge_precision="ieee", output_ungated=True
+):
     """Shared chunk preparation; keep KKT and inverse subtiles in registers."""
     if merge_precision not in ("ieee", "tf32", "tf32x3"):
         raise ValueError("unsupported inverse merge precision")
+    if not (output_gated or output_ungated):
+        raise ValueError("at least one inverse output is required")
     B, T, Hg, K = k.shape
     H = beta.shape[-1]
     gc = torch.empty_like(g, dtype=torch.float32)
-    # Unwritten upper-triangular inverse tiles must remain zero.
-    a = torch.zeros(B, T, H, 64, device=k.device, dtype=k.dtype)
-    ag = torch.zeros_like(a) if output_gated else None
+    a = torch.zeros((B, T, H, 64), device=k.device, dtype=k.dtype) if output_ungated else None
+    ag = torch.zeros((B, T, H, 64), device=k.device, dtype=k.dtype) if output_gated else None
+    kernel_gc, kernel_a, kernel_ag = gc, a, ag
+    if (
+        cu_seqlens is None
+        and B > 1
+        and T % 64 == 0
+        and B * T < 2**31
+        and k.is_contiguous()
+        and g.is_contiguous()
+        and beta.is_contiguous()
+    ):
+        # Aligned dense chunks share a token axis without crossing chunk boundaries.
+        tokens = B * T
+        k = k.view(1, tokens, Hg, K)
+        g, beta = g.view(1, tokens, H), beta.view(1, tokens, H)
+        kernel_gc = gc.view(1, tokens, H)
+        kernel_a = a.view(1, tokens, H, 64) if a is not None else None
+        kernel_ag = ag.view(1, tokens, H, 64) if ag is not None else None
+        B, T = 1, tokens
     indices = prepare_chunk_indices(cu_seqlens, 64) if cu_seqlens is not None else None
     chunks = triton.cdiv(T, 64) if indices is None else indices.shape[0]
     if chunks:
         _prepare_kernel[(chunks, B * H if indices is None else H)](
             k=k,
             g=g,
-            g_out=gc,
+            g_out=kernel_gc,
             beta=beta,
-            A=a,
-            AG=ag,
+            A=kernel_a,
+            AG=kernel_ag,
             cu_seqlens=cu_seqlens,
             chunk_indices=indices,
             T=T,
@@ -368,8 +375,10 @@ def prepare_fused_tle_inputs(k, g, beta, output_gated=False, cu_seqlens=None, me
             K=K,
             BT=64,
             BC=16,
-            USE_G=False,
+            USE_G=not output_ungated,
             OUTPUT_GATED=output_gated,
+            OUTPUT_UNGATED=output_ungated,
             MERGE_PRECISION=merge_precision,
+            FULL_CHUNKS=cu_seqlens is None and T % 64 == 0,
         )
     return (gc, a, ag) if output_gated else (gc, a)

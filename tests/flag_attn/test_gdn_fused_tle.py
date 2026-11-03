@@ -1,12 +1,25 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 
 from flag_attn.FLA.gated_delta_rule import chunk_gated_delta_rule
 from flag_attn.utils import has_triton_tle
 
-pytestmark = [pytest.mark.gdn_forward, pytest.mark.chunk_gated_delta_rule]
 
-
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(not torch.cuda.is_available() or not has_triton_tle(3, 6, 0), reason="requires CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 16384, 16), (4, 2048, 16), (4, 4096, 64), (2, 2048, 16)])
@@ -39,7 +52,6 @@ def test_fused_tle_matches_fla(monkeypatch, dtype, shape, seed):
     monkeypatch.setenv("FLAG_ATTN_CHUNK_GDR_FUSED_TLE", "1")
     monkeypatch.setenv("FLAG_ATTN_CHUNK_GATED_DELTA_RULE_TLE", "1")
     expected = reference(q, k, v, g, beta, output_final_state=True)
-    # Repetition detects timing-dependent pipe lifetime errors.
     previous = None
     for _ in range(5):
         actual = chunk_gated_delta_rule(q, k, v, beta, g, head_first=False, output_final_state=True)
@@ -54,6 +66,7 @@ def test_fused_tle_matches_fla(monkeypatch, dtype, shape, seed):
     assert len(calls) == 5, "regression cases must exercise the fused TLE kernel"
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(not torch.cuda.is_available() or not has_triton_tle(3, 6, 0), reason="requires CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(

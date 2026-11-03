@@ -1,32 +1,22 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
-"""Single-token packed GDN decode using the shared recurrent TLE kernel.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-The gate transform is fused into that kernel, without materializing Q/K/V,
-g or beta. Cache state and the caller's output allocation are updated in place.
-"""
+"""Single-token GDN recurrence with packed QKV and fused gate transforms."""
 
 import torch
 
 from .fused_recurrent import _launch
-
-
-def _packed_views(mixed_qkv, a, b, initial_state):
-    n = mixed_qkv.shape[0]
-    hv, dv, dk = initial_state.shape[1:]
-    h = (mixed_qkv.shape[1] - hv * dv) // (2 * dk)
-    q, k, v = mixed_qkv.split((h * dk, h * dk, hv * dv), dim=-1)
-    # Keep one projection-row stride in all three views. For N=1, view() may
-    # otherwise invent different unused batch strides for Q/K and V, obscuring
-    # their shared base address and introducing extra address arithmetic.
-    row_stride = mixed_qkv.stride(0)
-    return (
-        q.as_strided((n, 1, h, dk), (row_stride, 0, dk, 1)),
-        k.as_strided((n, 1, h, dk), (row_stride, 0, dk, 1)),
-        v.as_strided((n, 1, hv, dv), (row_stride, 0, dv, 1)),
-        a.unsqueeze(1),
-        b.unsqueeze(1),
-    )
 
 
 def _launch_packed(
@@ -82,6 +72,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     mixed_qkv: [N, 2*H*K + HV*V], a/b: [N,HV], A_log/dt_bias: [HV].
     State: [pool,HV,V,K], output: [N,1,HV,V], indices: [N] CUDA int32/int64.
     g=-exp(A_log)*softplus(a+dt_bias, threshold=20), beta=sigmoid(b).
+    Beta is rounded to b.dtype before the FP32 state update, matching vLLM.
     H divides HV. K/V are in 1..256; N and HV each must be <=65535.
     Projection and gate rows may be padded; their last dimension is contiguous.
     State strides are honored. Indices <=0 give zero output and leave cache

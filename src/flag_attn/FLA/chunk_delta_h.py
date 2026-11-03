@@ -16,6 +16,20 @@ from flag_attn.FLA.utils import use_cuda_graph
 NUM_WARPS = [2, 4, 8, 16]
 
 
+def _prune_state_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    k = args["k"]
+    use_narrow = (
+        args["K"] <= 128
+        and not args["IS_VARLEN"]
+        and args["USE_G"]
+        and not args["USE_GK"]
+        and triton.runtime.driver.active.get_current_target().backend == "cuda"
+        and torch.cuda.get_device_capability(k.device)[0] == 9
+    )
+    return [config for config in configs if use_narrow or config.kwargs["BV"] != 16]
+
+
 @libentry()
 @triton.heuristics(
     {
@@ -32,10 +46,13 @@ NUM_WARPS = [2, 4, 8, 16]
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
-        for BV in [32, 64]
+        for BV in [16, 32, 64]
     ],
     key=[
+        "N",
+        "T",
         "H",
+        "Hg",
         "K",
         "V",
         "BT",
@@ -43,6 +60,7 @@ NUM_WARPS = [2, 4, 8, 16]
         "USE_INITIAL_STATE",
         "STORE_FINAL_STATE",
     ],
+    prune_configs_by={"early_config_prune": _prune_state_configs},
     use_cuda_graph=use_cuda_graph,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -71,6 +89,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    N: tl.constexpr = 1,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -282,8 +301,7 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # This kernel is slightly different from fla to support Q/K with different head numbers.
-    # In fla, Q/K always have the same head number, so Hg is always equal to H.
+    # Each group of value heads shares one query/key head.
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = chunk_size
@@ -326,5 +344,6 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
+        N=N,
     )
     return h, v_new, final_state

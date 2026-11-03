@@ -45,7 +45,9 @@ def can_use_two_kernel_fused_forward(
         return False
     if q.device.type != "cuda" or q.dtype not in (torch.float16, torch.bfloat16):
         return False
-    if not all(x.device == q.device and x.dtype == q.dtype for x in (k, v, beta, g)):
+    if not all(x.device == q.device for x in (k, v, beta, g)):
+        return False
+    if not all(x.dtype == q.dtype for x in (k, v)):
         return False
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         return False
@@ -54,8 +56,16 @@ def can_use_two_kernel_fused_forward(
 
     B, T, Hg, K = q.shape
     H, V = v.shape[2:]
-    # Wide-key state updates are substantially slower in this fused route on
-    # Hopper. Keep them on the staged path; the new pipeline covers K=128.
+    gate_dtypes = (q.dtype,)
+    if (
+        K == 64
+        and triton.runtime.driver.active.get_current_target().backend == "cuda"
+        and torch.cuda.get_device_capability(q.device)[0] == 9
+    ):
+        gate_dtypes += (torch.float32,)
+    if any(x.dtype not in gate_dtypes for x in (beta, g)):
+        return False
+    # The staged route limits register pressure for keys wider than 128.
     if (
         K > 128
         and triton.runtime.driver.active.get_current_target().backend == "cuda"

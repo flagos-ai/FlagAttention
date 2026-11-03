@@ -155,7 +155,6 @@ def _can_use_tle_chunk_gated_delta_rule(
         and H % Hg == 0
         and K == TLE_CHUNK_GDR_HEAD_DIM
         and v.shape[3] == TLE_CHUNK_GDR_HEAD_DIM
-        # Keep low-workload shapes on the numerically stable native path.
         and B * H >= 32
         and T >= 2048
         and T % TLE_CHUNK_GDR_BLOCK_S == 0
@@ -1050,8 +1049,6 @@ def chunk_gated_delta_rule(
         q_seq = _l2_normalize_last_dim(q_seq)
         k_seq = _l2_normalize_last_dim(k_seq)
 
-    # Keep the recurrent dependency chain within one compute worker. Independent
-    # producers prefetch inputs through pipes; no intermediate storage is aliased.
     if _can_use_fused_tle_chunk(q_seq, k_seq, v_seq, beta_seq, g_seq, initial_state, output_final_state, cu_seqlens):
         from flag_attn.FLA.gated_delta_rule.chunk_fused_tle import (
             _tle_chunk_gated_delta_rule_fwd as fused_tle_fwd,

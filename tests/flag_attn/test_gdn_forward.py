@@ -1,5 +1,17 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Shared GDN contracts across prefill, packed decode and speculative decode."""
 
 import pytest
@@ -12,7 +24,7 @@ from flag_attn import fused_recurrent_gated_delta_rule_fwd, fused_recurrent_gate
 from flag_attn.testing.packed_gdn import make_packed_case, reference_packed
 from flag_attn.testing.recurrent_gdn import make_case, reference, check_close
 
-pytestmark = [pytest.mark.gdn_forward, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
+pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
 
 
 def rms_close(actual, expected):
@@ -21,6 +33,7 @@ def rms_close(actual, expected):
     assert error / (expected.float().square().mean().sqrt() + 1e-8) < 0.01
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("fp32_gates", [False, True])
 @torch.inference_mode()
@@ -53,6 +66,7 @@ def test_raw_chunk_fused_contract(dtype, fp32_gates, monkeypatch):
     monkeypatch.setattr(module, "_tle_chunk_gated_delta_rule_fwd", tracked)
     actual = chunk_gated_delta_rule_fwd(**args)
     assert len(calls) == 1 and len(actual) == len(expected) == 7
+    assert actual[0].dtype == expected[0].dtype == g.dtype
     for a, b in zip(actual, expected):
         if b is None:
             assert a is None
@@ -63,6 +77,9 @@ def test_raw_chunk_fused_contract(dtype, fp32_gates, monkeypatch):
     assert torch.count_nonzero(a.triu(1)) == 0
 
 
+@pytest.mark.chunk_gated_delta_rule
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
@@ -89,6 +106,7 @@ def test_prefill_packed_and_speculative_state_handoff(dtype, state_dtype):
     check_close(*fused_recurrent_gated_delta_rule_fwd(**spec), *expected)
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_stateful_packed_chunk_keeps_fallback(dtype, monkeypatch):

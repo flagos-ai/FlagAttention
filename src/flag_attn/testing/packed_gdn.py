@@ -1,5 +1,17 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Packed gate inputs adapted to the shared independent GDN reference."""
 
 import torch
@@ -44,7 +56,7 @@ def make_packed_case(
 
 
 def unpack_reference_case(case):
-    """Gate math in FP32; recurrence is the same reference used for all decode."""
+    """Use FP32 gates, rounding sigmoid beta to b.dtype as in vLLM packed decode."""
     mixed = case["mixed_qkv"]
     n = mixed.shape[0]
     hv, dv, dk = case["initial_state"].shape[1:]
@@ -53,7 +65,7 @@ def unpack_reference_case(case):
     g = -case["A_log"].float().exp() * torch.nn.functional.softplus(
         case["a"].float() + case["dt_bias"].float(), threshold=20
     )
-    beta = case["b"].float().sigmoid()
+    beta = case["b"].float().sigmoid().to(case["b"].dtype).float()
     return dict(
         q=q.view(n, 1, h, dk),
         k=k.view(n, 1, h, dk),

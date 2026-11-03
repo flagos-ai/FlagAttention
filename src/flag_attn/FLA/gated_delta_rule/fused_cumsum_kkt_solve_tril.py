@@ -111,14 +111,12 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    # ---------- cumsum ----------
     p_g_in = tl.make_block_ptr(g_in + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     p_g_out = tl.make_block_ptr(g_out + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_g = tl.load(p_g_in, boundary_check=(0,)).to(tl.float32)
     b_g = tl.cumsum(b_g, axis=0)
     tl.store(p_g_out, b_g.to(p_g_out.dtype.element_ty), boundary_check=(0,))
 
-    # ---------- KKT (write L to A) ----------
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
     p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
@@ -151,7 +149,6 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
     )
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
 
-    # ---------- solve_tril (read A, write A_inv) ----------
     o_i = tl.arange(0, 16)
     m_A = o_i[:, None] > o_i[None, :]
     m_I = o_i[:, None] == o_i[None, :]
@@ -471,14 +468,19 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
 
         needs_gated = use_g_in_kkt or output_gated_from_ungated
         result = prepare_fused_tle_inputs(
-            k, g, beta, output_gated=needs_gated, cu_seqlens=cu_seqlens, merge_precision=FLA_TRIL_PRECISION
+            k,
+            g,
+            beta,
+            output_gated=needs_gated,
+            cu_seqlens=cu_seqlens,
+            merge_precision=FLA_TRIL_PRECISION,
+            output_ungated=not use_g_in_kkt,
         )
         gc, a_zero = result[:2]
         a_gated = result[2] if needs_gated else None
         if BT != 64:
-            # Dense short calls have a single 16/32-token chunk. Keep their
-            # existing auxiliary-output shape while sharing the padded solve.
-            a_zero = a_zero[..., :BT].contiguous()
+            # Preserve the 16/32-column auxiliary shape for short dense calls.
+            a_zero = a_zero[..., :BT].contiguous() if a_zero is not None else None
             a_gated = a_gated[..., :BT].contiguous() if a_gated is not None else None
         if use_g_in_kkt:
             return gc, a_gated
