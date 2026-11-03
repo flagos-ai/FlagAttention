@@ -1,3 +1,6 @@
+"""T-Head GDN API: validate layouts, normalize inputs, and dispatch native kernels."""
+
+
 import torch
 import triton
 import triton.language as tl
@@ -115,10 +118,6 @@ def _validate_inputs(
             )
 
 
-def _direct_contiguous(x: torch.Tensor) -> torch.Tensor:
-    return x if x.is_contiguous() else x.contiguous()
-
-
 def _l2_normalize_last_dim(x: torch.Tensor) -> torch.Tensor:
     B, T, H, K = x.shape
     out = torch.empty_like(x, memory_format=torch.contiguous_format)
@@ -174,7 +173,7 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k_seq.shape[-1] ** -0.5
 
-    B, T, Hg, K = q_seq.shape
+    _, T, Hg, K = q_seq.shape
     H, V = v_seq.shape[2], v_seq.shape[3]
     if (
         initial_state is None
@@ -184,11 +183,11 @@ def chunk_gated_delta_rule(
         and V <= 128
         and H % Hg == 0
     ):
-        q_direct = _direct_contiguous(q_seq)
-        k_direct = _direct_contiguous(k_seq)
-        v_direct = _direct_contiguous(v_seq)
-        g_direct = _direct_contiguous(g_seq)
-        beta_direct = _direct_contiguous(beta_seq)
+        q_direct = q_seq.contiguous()
+        k_direct = k_seq.contiguous()
+        v_direct = v_seq.contiguous()
+        g_direct = g_seq.contiguous()
+        beta_direct = beta_seq.contiguous()
         if can_use_chunk_gated_delta_rule_direct(
             q=q_direct,
             k=k_direct,
@@ -205,7 +204,6 @@ def chunk_gated_delta_rule(
                 g=g_direct,
                 beta=beta_direct,
                 scale=float(scale),
-                initial_state=None,
                 output_final_state=output_final_state,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
@@ -216,6 +214,7 @@ def chunk_gated_delta_rule(
     if use_qk_l2norm_in_kernel:
         q_seq = _l2_normalize_last_dim(q_seq)
         k_seq = _l2_normalize_last_dim(k_seq)
+
 
     _, o, _, final_state, _, _, _ = chunk_gated_delta_rule_fwd(
         q=q_seq,

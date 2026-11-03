@@ -20,7 +20,6 @@ _DIRECT_BV = 32
 @libentry()
 @triton.heuristics(
     {
-        "USE_INITIAL_STATE": lambda args: args["initial_state"] is not None,
         "STORE_FINAL_STATE": lambda args: args["final_state"] is not None,
     }
 )
@@ -32,7 +31,6 @@ def _chunk_gated_delta_rule_direct_fwd_kernel(
     g,
     beta,
     o,
-    initial_state,
     final_state,
     scale,
     T: tl.constexpr,
@@ -42,7 +40,6 @@ def _chunk_gated_delta_rule_direct_fwd_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
 ):
@@ -59,11 +56,6 @@ def _chunk_gated_delta_rule_direct_fwd_kernel(
     mask_h = mask_k[:, None] & mask_v[None, :]
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    if USE_INITIAL_STATE:
-        p_h0 = (
-            initial_state + ((i_b * H + i_h) * K * V) + o_k[:, None] * V + o_v[None, :]
-        )
-        b_h += tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
 
     q_base = q + ((i_b * T * Hg + i_hg) * K)
     k_base = k + ((i_b * T * Hg + i_hg) * K)
@@ -137,7 +129,6 @@ def chunk_gated_delta_rule_direct_fwd(
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
-    initial_state: torch.Tensor | None,
     output_final_state: bool,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -166,7 +157,6 @@ def chunk_gated_delta_rule_direct_fwd(
         g=g,
         beta=beta,
         o=o,
-        initial_state=initial_state,
         final_state=final_state,
         scale=float(scale),
         T=T,

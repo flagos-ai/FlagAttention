@@ -4,11 +4,7 @@
 
 from __future__ import annotations
 
-import json
 import os
-from functools import lru_cache
-from pathlib import Path
-from typing import Any
 
 import torch
 import triton
@@ -16,46 +12,11 @@ import triton.language as tl
 
 from flag_attn.FLA.compat import libentry, libtuner
 from flag_attn.FLA.index import prepare_chunk_indices
-from flag_attn.FLA.utils import is_tma_supported
-from flag_attn.FLA.utils import exp, make_tensor_descriptor
-
-_CONFIG_PATH = Path(__file__).resolve().parents[2] / "tune_configs.yaml"
-
-
-@lru_cache(maxsize=1)
-def _load_tuned_config() -> dict[str, list[dict[str, Any]]]:
-    if not _CONFIG_PATH.is_file():
-        return {}
-    data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError(f"Autotune config must be a mapping: {_CONFIG_PATH}")
-    return data
-
-
-def _autotune_configs(kernel_name: str, defaults: list[triton.Config]) -> list[triton.Config]:
-    """Use tune_configs.yaml unless FLAG_ATTN_THEAD_GDR_TUNED_CONFIGS=0."""
-    if os.environ.get("FLAG_ATTN_THEAD_GDR_TUNED_CONFIGS", "1") == "0":
-        return defaults
-    entries = _load_tuned_config().get(kernel_name)
-    if not entries:
-        return defaults
-    configs: list[triton.Config] = []
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            raise ValueError(f"{kernel_name}[{index}] must be a mapping")
-        meta = entry.get("META", {})
-        if not isinstance(meta, dict):
-            raise ValueError(f"{kernel_name}[{index}].META must be a mapping")
-        kwargs = {
-            name: entry[name]
-            for name in ("num_warps", "num_stages", "num_ctas", "maxnreg")
-            if name in entry
-        }
-        configs.append(triton.Config(meta, **kwargs))
-    return configs
+from flag_attn.FLA.utils import exp
 
 
 FLA_TRIL_PRECISION = os.environ.get("FLAG_ATTN_TRIL_PRECISION", "ieee")
+BLOCK16_TRIL_PRECISION = os.environ.get("FLAG_ATTN_TRIL_PRECISION", "tf32x3")
 ALLOWED_TRIL_PRECISIONS = {"ieee", "tf32", "tf32x3"}
 if FLA_TRIL_PRECISION not in ALLOWED_TRIL_PRECISIONS:
     raise ValueError(
@@ -64,62 +25,20 @@ if FLA_TRIL_PRECISION not in ALLOWED_TRIL_PRECISIONS:
     )
 
 
-@triton.jit
-def _store_gated_inverse_block(
-    A_g_inv_base,
-    g_base,
-    block,
-    T,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    ROW: tl.constexpr,
-    COL: tl.constexpr,
-):
-    offsets = tl.arange(0, 16)
-    remaining = T - tl.program_id(0) * BT
-    rows = ROW + offsets
-    cols = COL + offsets
-    g_rows = tl.load(g_base + rows * H, mask=rows < remaining, other=0.0).to(
-        tl.float32
-    )
-    g_cols = tl.load(g_base + cols * H, mask=cols < remaining, other=0.0).to(
-        tl.float32
-    )
-    gated = block * exp(g_rows[:, None] - g_cols[None, :])
-    output = tl.make_block_ptr(
-        A_g_inv_base,
-        (T, BT),
-        (H * BT, 1),
-        (tl.program_id(0) * BT + ROW, COL),
-        (16, 16),
-        (1, 0),
-    )
-    tl.store(
-        output,
-        gated.to(output.dtype.element_ty, fp_downcast_rounding="rtne"),
-        boundary_check=(0, 1),
-    )
-
-
 @libentry()
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "USE_G": lambda args: args.get("USE_G", True),
     }
 )
 @libtuner(
-    configs=_autotune_configs(
-        "chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel",
-        [
-            triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-            for BK in [32, 64, 128]
-            for num_warps in [2, 4, 8]
-            for num_stages in [2, 3, 4]
-        ],
-    ),
+    configs=[
+        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64, 128]
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
     key=["H", "K", "BT", "IS_VARLEN"],
-    cache_results=True,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
@@ -129,7 +48,6 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
     beta,
     A,
     A_inv,
-    A_g_inv,
     cu_seqlens,
     chunk_indices,
     T,
@@ -139,9 +57,6 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    USE_G: tl.constexpr,
-    OUTPUT_GATED: tl.constexpr,
-    USE_TMA: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
@@ -190,9 +105,8 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kb = b_k * b_beta[:, None]
         b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
-    if USE_G:
-        b_g_diff = b_g[:, None] - b_g[None, :]
-        b_A = b_A * exp(b_g_diff)
+    b_g_diff = b_g[:, None] - b_g[None, :]
+    b_A = b_A * exp(b_g_diff)
     m_A_kkt = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A_kkt, b_A, 0)
     p_A = tl.make_block_ptr(
@@ -211,31 +125,23 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
     m_I = o_i[:, None] == o_i[None, :]
     A_base = A + (bos * H + i_h) * BT
     A_inv_base = A_inv + (bos * H + i_h) * BT
-    A_g_inv_base = A_g_inv + (bos * H + i_h) * BT
 
-    if not USE_TMA:
-        p_A_11 = tl.make_block_ptr(
-            A_base, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
-        )
-        p_A_22 = tl.make_block_ptr(
-            A_base, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
-        )
-        p_A_33 = tl.make_block_ptr(
-            A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 32), (16, 16), (1, 0)
-        )
-        p_A_44 = tl.make_block_ptr(
-            A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 48), (16, 16), (1, 0)
-        )
-        b_Ai_11 = tl.load(p_A_11, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_22 = tl.load(p_A_22, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_33 = tl.load(p_A_33, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_44 = tl.load(p_A_44, boundary_check=(0, 1)).to(tl.float32)
-    else:
-        desc = make_tensor_descriptor(A_base, [T, BT], [H * BT, 1], [16, 16])
-        b_Ai_11 = desc.load([i_t * BT + 0, 0]).to(tl.float32)
-        b_Ai_22 = desc.load([i_t * BT + 16, 16]).to(tl.float32)
-        b_Ai_33 = desc.load([i_t * BT + 32, 32]).to(tl.float32)
-        b_Ai_44 = desc.load([i_t * BT + 48, 48]).to(tl.float32)
+    p_A_11 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
+    )
+    p_A_22 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
+    )
+    p_A_33 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 32), (16, 16), (1, 0)
+    )
+    p_A_44 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 48), (16, 16), (1, 0)
+    )
+    b_Ai_11 = tl.load(p_A_11, boundary_check=(0, 1)).to(tl.float32)
+    b_Ai_22 = tl.load(p_A_22, boundary_check=(0, 1)).to(tl.float32)
+    b_Ai_33 = tl.load(p_A_33, boundary_check=(0, 1)).to(tl.float32)
+    b_Ai_44 = tl.load(p_A_44, boundary_check=(0, 1)).to(tl.float32)
 
     b_Ai_11 = -tl.where(m_A, b_Ai_11, 0)
     b_Ai_22 = -tl.where(m_A, b_Ai_22, 0)
@@ -263,38 +169,30 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
     b_Ai_33 += m_I
     b_Ai_44 += m_I
 
-    if not USE_TMA:
-        p_A_21 = tl.make_block_ptr(
-            A_base, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
-        )
-        p_A_31 = tl.make_block_ptr(
-            A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 0), (16, 16), (1, 0)
-        )
-        p_A_32 = tl.make_block_ptr(
-            A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 16), (16, 16), (1, 0)
-        )
-        p_A_41 = tl.make_block_ptr(
-            A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0)
-        )
-        p_A_42 = tl.make_block_ptr(
-            A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0)
-        )
-        p_A_43 = tl.make_block_ptr(
-            A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0)
-        )
-        b_A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
-        b_A_31 = tl.load(p_A_31, boundary_check=(0, 1)).to(tl.float32)
-        b_A_32 = tl.load(p_A_32, boundary_check=(0, 1)).to(tl.float32)
-        b_A_41 = tl.load(p_A_41, boundary_check=(0, 1)).to(tl.float32)
-        b_A_42 = tl.load(p_A_42, boundary_check=(0, 1)).to(tl.float32)
-        b_A_43 = tl.load(p_A_43, boundary_check=(0, 1)).to(tl.float32)
-    else:
-        b_A_21 = desc.load([i_t * BT + 16, 0]).to(tl.float32)
-        b_A_31 = desc.load([i_t * BT + 32, 0]).to(tl.float32)
-        b_A_32 = desc.load([i_t * BT + 32, 16]).to(tl.float32)
-        b_A_41 = desc.load([i_t * BT + 48, 0]).to(tl.float32)
-        b_A_42 = desc.load([i_t * BT + 48, 16]).to(tl.float32)
-        b_A_43 = desc.load([i_t * BT + 48, 32]).to(tl.float32)
+    p_A_21 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
+    )
+    p_A_31 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 0), (16, 16), (1, 0)
+    )
+    p_A_32 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 16), (16, 16), (1, 0)
+    )
+    p_A_41 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0)
+    )
+    p_A_42 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0)
+    )
+    p_A_43 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0)
+    )
+    b_A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
+    b_A_31 = tl.load(p_A_31, boundary_check=(0, 1)).to(tl.float32)
+    b_A_32 = tl.load(p_A_32, boundary_check=(0, 1)).to(tl.float32)
+    b_A_41 = tl.load(p_A_41, boundary_check=(0, 1)).to(tl.float32)
+    b_A_42 = tl.load(p_A_42, boundary_check=(0, 1)).to(tl.float32)
+    b_A_43 = tl.load(p_A_43, boundary_check=(0, 1)).to(tl.float32)
 
     b_Ai_21 = -tl.dot(
         tl.dot(b_Ai_22, b_A_21, input_precision=DOT_PRECISION),
@@ -331,187 +229,131 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
         input_precision=DOT_PRECISION,
     )
 
-    if not USE_TMA:
-        p_Ai_11 = tl.make_block_ptr(
-            A_inv_base, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
-        )
-        p_Ai_22 = tl.make_block_ptr(
-            A_inv_base,
-            (T, BT),
-            (H * BT, 1),
-            (i_t * BT + 16, 16),
-            (16, 16),
-            (1, 0),
-        )
-        p_Ai_33 = tl.make_block_ptr(
-            A_inv_base,
-            (T, BT),
-            (H * BT, 1),
-            (i_t * BT + 32, 32),
-            (16, 16),
-            (1, 0),
-        )
-        p_Ai_44 = tl.make_block_ptr(
-            A_inv_base,
-            (T, BT),
-            (H * BT, 1),
-            (i_t * BT + 48, 48),
-            (16, 16),
-            (1, 0),
-        )
-        p_Ai_21 = tl.make_block_ptr(
-            A_inv_base,
-            (T, BT),
-            (H * BT, 1),
-            (i_t * BT + 16, 0),
-            (16, 16),
-            (1, 0),
-        )
-        p_Ai_31 = tl.make_block_ptr(
-            A_inv_base,
-            (T, BT),
-            (H * BT, 1),
-            (i_t * BT + 32, 0),
-            (16, 16),
-            (1, 0),
-        )
-        p_Ai_32 = tl.make_block_ptr(
-            A_inv_base,
-            (T, BT),
-            (H * BT, 1),
-            (i_t * BT + 32, 16),
-            (16, 16),
-            (1, 0),
-        )
-        p_Ai_41 = tl.make_block_ptr(
-            A_inv_base,
-            (T, BT),
-            (H * BT, 1),
-            (i_t * BT + 48, 0),
-            (16, 16),
-            (1, 0),
-        )
-        p_Ai_42 = tl.make_block_ptr(
-            A_inv_base,
-            (T, BT),
-            (H * BT, 1),
-            (i_t * BT + 48, 16),
-            (16, 16),
-            (1, 0),
-        )
-        p_Ai_43 = tl.make_block_ptr(
-            A_inv_base,
-            (T, BT),
-            (H * BT, 1),
-            (i_t * BT + 48, 32),
-            (16, 16),
-            (1, 0),
-        )
-        tl.store(
-            p_Ai_11,
-            b_Ai_11.to(p_Ai_11.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_22,
-            b_Ai_22.to(p_Ai_22.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_33,
-            b_Ai_33.to(p_Ai_33.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_44,
-            b_Ai_44.to(p_Ai_44.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_21,
-            b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_31,
-            b_Ai_31.to(p_Ai_31.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_32,
-            b_Ai_32.to(p_Ai_32.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_41,
-            b_Ai_41.to(p_Ai_41.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_42,
-            b_Ai_42.to(p_Ai_42.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_43,
-            b_Ai_43.to(p_Ai_43.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-    else:
-        desc_o = make_tensor_descriptor(A_inv_base, [T, BT], [H * BT, 1], [16, 16])
-        desc_o.store(
-            [i_t * BT + 0, 0],
-            b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne"),
-        )
-        desc_o.store(
-            [i_t * BT + 16, 16],
-            b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne"),
-        )
-        desc_o.store(
-            [i_t * BT + 32, 32],
-            b_Ai_33.to(desc_o.dtype, fp_downcast_rounding="rtne"),
-        )
-        desc_o.store(
-            [i_t * BT + 48, 48],
-            b_Ai_44.to(desc_o.dtype, fp_downcast_rounding="rtne"),
-        )
-        desc_o.store(
-            [i_t * BT + 16, 0],
-            b_Ai_21.to(desc_o.dtype, fp_downcast_rounding="rtne"),
-        )
-        desc_o.store(
-            [i_t * BT + 32, 0],
-            b_Ai_31.to(desc_o.dtype, fp_downcast_rounding="rtne"),
-        )
-        desc_o.store(
-            [i_t * BT + 32, 16],
-            b_Ai_32.to(desc_o.dtype, fp_downcast_rounding="rtne"),
-        )
-        desc_o.store(
-            [i_t * BT + 48, 0],
-            b_Ai_41.to(desc_o.dtype, fp_downcast_rounding="rtne"),
-        )
-        desc_o.store(
-            [i_t * BT + 48, 16],
-            b_Ai_42.to(desc_o.dtype, fp_downcast_rounding="rtne"),
-        )
-        desc_o.store(
-            [i_t * BT + 48, 32],
-            b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne"),
-        )
-
-    if OUTPUT_GATED:
-        g_base = g_out + (bos + i_t * BT) * H + i_h
-        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_11, T, H, BT, 0, 0)
-        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_22, T, H, BT, 16, 16)
-        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_33, T, H, BT, 32, 32)
-        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_44, T, H, BT, 48, 48)
-        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_21, T, H, BT, 16, 0)
-        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_31, T, H, BT, 32, 0)
-        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_32, T, H, BT, 32, 16)
-        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_41, T, H, BT, 48, 0)
-        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_42, T, H, BT, 48, 16)
-        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_43, T, H, BT, 48, 32)
+    p_Ai_11 = tl.make_block_ptr(
+        A_inv_base, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
+    )
+    p_Ai_22 = tl.make_block_ptr(
+        A_inv_base,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + 16, 16),
+        (16, 16),
+        (1, 0),
+    )
+    p_Ai_33 = tl.make_block_ptr(
+        A_inv_base,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + 32, 32),
+        (16, 16),
+        (1, 0),
+    )
+    p_Ai_44 = tl.make_block_ptr(
+        A_inv_base,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + 48, 48),
+        (16, 16),
+        (1, 0),
+    )
+    p_Ai_21 = tl.make_block_ptr(
+        A_inv_base,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + 16, 0),
+        (16, 16),
+        (1, 0),
+    )
+    p_Ai_31 = tl.make_block_ptr(
+        A_inv_base,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + 32, 0),
+        (16, 16),
+        (1, 0),
+    )
+    p_Ai_32 = tl.make_block_ptr(
+        A_inv_base,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + 32, 16),
+        (16, 16),
+        (1, 0),
+    )
+    p_Ai_41 = tl.make_block_ptr(
+        A_inv_base,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + 48, 0),
+        (16, 16),
+        (1, 0),
+    )
+    p_Ai_42 = tl.make_block_ptr(
+        A_inv_base,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + 48, 16),
+        (16, 16),
+        (1, 0),
+    )
+    p_Ai_43 = tl.make_block_ptr(
+        A_inv_base,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + 48, 32),
+        (16, 16),
+        (1, 0),
+    )
+    tl.store(
+        p_Ai_11,
+        b_Ai_11.to(p_Ai_11.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_22,
+        b_Ai_22.to(p_Ai_22.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_33,
+        b_Ai_33.to(p_Ai_33.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_44,
+        b_Ai_44.to(p_Ai_44.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_21,
+        b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_31,
+        b_Ai_31.to(p_Ai_31.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_32,
+        b_Ai_32.to(p_Ai_32.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_41,
+        b_Ai_41.to(p_Ai_41.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_42,
+        b_Ai_42.to(p_Ai_42.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_43,
+        b_Ai_43.to(p_Ai_43.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
 
 
 def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
@@ -521,36 +363,36 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     output_dtype: torch.dtype | None = None,
-    *,
-    use_g_in_kkt: bool = True,
-    output_gated_from_ungated: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor
-]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused kernel: cumsum(g) + KKT(L) + solve_tril(L -> inv). Returns (g_out, A_inv).
     w_u stays a separate kernel (e.g. recompute_w_u_fwd) for HGMMA."""
     B, T, Hg, K = k.shape
     H = beta.shape[-1]
     BT = chunk_size
     output_dtype = output_dtype or k.dtype
-    if use_g_in_kkt and output_gated_from_ungated:
-        raise ValueError("dual A output requires use_g_in_kkt=False")
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     g_out = torch.empty_like(g)
-    A = torch.empty(B, T, H, BT, device=g.device, dtype=torch.float32)
     A_inv = torch.zeros(B, T, H, BT, device=g.device, dtype=output_dtype)
-    A_g_inv = torch.zeros_like(A_inv) if output_gated_from_ungated else A_inv
 
     def grid(meta):
         # Varlen kernels derive the sequence from chunk_indices. The batch id
         # from i_bh is unused there, so H programs are sufficient for B > 1 too.
         return (NT, H if cu_seqlens is not None else B * H)
 
-
+    if BT == 64 and k.dtype in (torch.float16, torch.bfloat16):
+        chunk_gated_delta_rule_block16_kernel[grid](
+            g_in=g, g_out=g_out, k=k, beta=beta, A_inv=A_inv,
+            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+            T=T, H=H, Hg=Hg, K=K, BK=64,
+            DOT_PRECISION=BLOCK16_TRIL_PRECISION,
+            num_warps=1, num_stages=1,
+        )
+        return g_out, A_inv
+    A = torch.empty(B, T, H, BT, device=g.device, dtype=torch.float32)
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel[grid](
         g_in=g,
         g_out=g_out,
@@ -558,7 +400,6 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         beta=beta,
         A=A,
         A_inv=A_inv,
-        A_g_inv=A_g_inv,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
@@ -567,11 +408,133 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         K=K,
         BT=BT,
         IS_VARLEN=cu_seqlens is not None,
-        USE_G=use_g_in_kkt,
-        OUTPUT_GATED=output_gated_from_ungated,
-        USE_TMA=is_tma_supported and BT == 64,
         DOT_PRECISION=FLA_TRIL_PRECISION,
     )
-    if output_gated_from_ungated:
-        return g_out, A_inv, A_g_inv
     return g_out, A_inv
+
+
+@triton.jit
+def _kkt16_ppu(
+    k, beta, gate, bos, T, i_t, i_h,
+    H: tl.constexpr, Hg: tl.constexpr, K: tl.constexpr,
+    ROW: tl.constexpr, COL: tl.constexpr, BK: tl.constexpr,
+):
+    qh = i_h // (H // Hg)
+    key_base = k + (bos * Hg + qh).to(tl.int64) * K
+    p_beta = tl.make_block_ptr(
+        beta + bos * H + i_h, (T,), (H,),
+        (i_t * 64 + ROW,), (16,), (0,),
+    )
+    strength = tl.load(p_beta, boundary_check=(0,))
+    lower = tl.zeros((16, 16), tl.float32)
+    for block in range(tl.cdiv(K, BK)):
+        left = tl.make_block_ptr(
+            key_base, (T, K), (Hg * K, 1),
+            (i_t * 64 + ROW, block * BK), (16, BK), (1, 0),
+        )
+        right = tl.make_block_ptr(
+            key_base, (K, T), (1, Hg * K),
+            (block * BK, i_t * 64 + COL), (BK, 16), (0, 1),
+        )
+        keys_left = tl.load(left, boundary_check=(0, 1))
+        keys_right = tl.load(right, boundary_check=(0, 1))
+        weighted = (keys_left * strength[:, None]).to(keys_left.dtype)
+        lower += tl.dot(weighted, keys_right)
+    offsets = tl.arange(0, 16)
+    gate_rows = tl.gather(gate, ROW + offsets, axis=0)
+    gate_cols = tl.gather(gate, COL + offsets, axis=0)
+    lower *= exp(gate_rows[:, None] - gate_cols[None, :])
+    if ROW == COL:
+        lower = tl.where(offsets[:, None] > offsets[None, :], lower, 0.0)
+    return lower
+
+
+@triton.jit
+def _invert16_ppu(lower, DOT_PRECISION: tl.constexpr):
+    # Strictly lower 16x16 matrices satisfy L**16 = 0.
+    # Three doublings form I-L+L**2-...-L**15 with FP32 accumulation.
+    offsets = tl.arange(0, 16)
+    power = -lower
+    inverse = power + (offsets[:, None] == offsets[None, :])
+    for _ in tl.static_range(3):
+        power = tl.dot(power, power, input_precision=DOT_PRECISION)
+        inverse += tl.dot(inverse, power, input_precision=DOT_PRECISION)
+    return inverse
+
+
+@triton.jit
+def _store_inverse16_ppu(
+    output, block, T, i_t,
+    H: tl.constexpr, ROW: tl.constexpr, COL: tl.constexpr,
+):
+    p_out = tl.make_block_ptr(
+        output, (T, 64), (H * 64, 1),
+        (i_t * 64 + ROW, COL), (16, 16), (1, 0),
+    )
+    tl.store(p_out, block.to(p_out.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+
+
+@libentry()
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.jit(do_not_specialize=["T"])
+def chunk_gated_delta_rule_block16_kernel(
+    g_in, g_out, k, beta, A_inv, cu_seqlens, chunk_indices, T,
+    H: tl.constexpr, Hg: tl.constexpr, K: tl.constexpr,
+    BK: tl.constexpr, IS_VARLEN: tl.constexpr, DOT_PRECISION: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        sequence = tl.load(chunk_indices + 2 * i_t).to(tl.int32)
+        i_t = tl.load(chunk_indices + 2 * i_t + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + sequence).to(tl.int32)
+        eos = tl.load(cu_seqlens + sequence + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos = i_b * T
+    p_gate = tl.make_block_ptr(g_in + bos * H + i_h, (T,), (H,), (i_t * 64,), (64,), (0,))
+    gate = tl.cumsum(tl.load(p_gate, boundary_check=(0,)).to(tl.float32), 0)
+    p_gate_out = tl.make_block_ptr(g_out + bos * H + i_h, (T,), (H,), (i_t * 64,), (64,), (0,))
+    tl.store(p_gate_out, gate.to(p_gate_out.dtype.element_ty), boundary_check=(0,))
+    # A native 16x16 Tensor Cell tile stays warp-local throughout each solve.
+    d11 = _invert16_ppu(_kkt16_ppu(k, beta, gate, bos, T, i_t, i_h, H, Hg, K, 0, 0, BK), DOT_PRECISION)
+    d22 = _invert16_ppu(_kkt16_ppu(k, beta, gate, bos, T, i_t, i_h, H, Hg, K, 16, 16, BK), DOT_PRECISION)
+    d33 = _invert16_ppu(_kkt16_ppu(k, beta, gate, bos, T, i_t, i_h, H, Hg, K, 32, 32, BK), DOT_PRECISION)
+    d44 = _invert16_ppu(_kkt16_ppu(k, beta, gate, bos, T, i_t, i_h, H, Hg, K, 48, 48, BK), DOT_PRECISION)
+    l21 = _kkt16_ppu(k, beta, gate, bos, T, i_t, i_h, H, Hg, K, 16, 0, BK)
+    d21 = -tl.dot(tl.dot(d22, l21, input_precision=DOT_PRECISION), d11, input_precision=DOT_PRECISION)
+    l32 = _kkt16_ppu(k, beta, gate, bos, T, i_t, i_h, H, Hg, K, 32, 16, BK)
+    d32 = -tl.dot(tl.dot(d33, l32, input_precision=DOT_PRECISION), d22, input_precision=DOT_PRECISION)
+    l43 = _kkt16_ppu(k, beta, gate, bos, T, i_t, i_h, H, Hg, K, 48, 32, BK)
+    d43 = -tl.dot(tl.dot(d44, l43, input_precision=DOT_PRECISION), d33, input_precision=DOT_PRECISION)
+    l31 = _kkt16_ppu(k, beta, gate, bos, T, i_t, i_h, H, Hg, K, 32, 0, BK)
+    d31 = -tl.dot(
+        d33,
+        tl.dot(l31, d11, input_precision=DOT_PRECISION) + tl.dot(l32, d21, input_precision=DOT_PRECISION),
+        input_precision=DOT_PRECISION,
+    )
+    l42 = _kkt16_ppu(k, beta, gate, bos, T, i_t, i_h, H, Hg, K, 48, 16, BK)
+    d42 = -tl.dot(
+        d44,
+        tl.dot(l42, d22, input_precision=DOT_PRECISION) + tl.dot(l43, d32, input_precision=DOT_PRECISION),
+        input_precision=DOT_PRECISION,
+    )
+    l41 = _kkt16_ppu(k, beta, gate, bos, T, i_t, i_h, H, Hg, K, 48, 0, BK)
+    d41 = -tl.dot(
+        d44,
+        tl.dot(l41, d11, input_precision=DOT_PRECISION)
+        + tl.dot(l42, d21, input_precision=DOT_PRECISION)
+        + tl.dot(l43, d31, input_precision=DOT_PRECISION),
+        input_precision=DOT_PRECISION,
+    )
+    output_base = A_inv + (bos * H + i_h).to(tl.int64) * 64
+    _store_inverse16_ppu(output_base, d11, T, i_t, H, 0, 0)
+    _store_inverse16_ppu(output_base, d22, T, i_t, H, 16, 16)
+    _store_inverse16_ppu(output_base, d33, T, i_t, H, 32, 32)
+    _store_inverse16_ppu(output_base, d44, T, i_t, H, 48, 48)
+    _store_inverse16_ppu(output_base, d21, T, i_t, H, 16, 0)
+    _store_inverse16_ppu(output_base, d31, T, i_t, H, 32, 0)
+    _store_inverse16_ppu(output_base, d32, T, i_t, H, 32, 16)
+    _store_inverse16_ppu(output_base, d41, T, i_t, H, 48, 0)
+    _store_inverse16_ppu(output_base, d42, T, i_t, H, 48, 16)
+    _store_inverse16_ppu(output_base, d43, T, i_t, H, 48, 32)

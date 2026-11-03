@@ -4,12 +4,19 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+"""Native GDN pipeline: preprocess, recompute W/U, update state, project output."""
+
 import logging
 
 import torch
 
-from flag_attn.runtime.backend._thead.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from flag_attn.runtime.backend._thead.FLA.chunk_o import chunk_fwd_o
+from flag_attn.FLA.utils import SUPPRESS_LEVEL
+
+from flag_attn.runtime.backend._thead.FLA.gated_delta_rule.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
+    chunk_gated_delta_rule_fused_wu_h,
+)
+from flag_attn.runtime.backend._thead.FLA.gated_delta_rule.chunk_o import chunk_fwd_o
 from flag_attn.runtime.backend._thead.FLA.gated_delta_rule.chunk_fused_tail_vblock import (
     can_use_fused_tail_vblock,
     chunk_gated_delta_rule_fused_tail_vblock,
@@ -18,7 +25,6 @@ from flag_attn.runtime.backend._thead.FLA.gated_delta_rule.fused_cumsum_kkt_solv
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril,
 )
 from flag_attn.runtime.backend._thead.FLA.gated_delta_rule.wy_fast import recompute_w_u_fwd
-from flag_attn.FLA.utils import SUPPRESS_LEVEL
 
 logger = logging.getLogger(__name__)
 
@@ -41,36 +47,15 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
 ):
     logger.debug("GEMS CHUNK GATED DELTA RULE FWD")
-    q_contiguous = q.is_contiguous()
-    k_contiguous = k.is_contiguous()
-    v_contiguous = v.is_contiguous()
-    g_contiguous = g.is_contiguous()
-    beta_contiguous = beta.is_contiguous()
-    initial_state_contiguous = initial_state is None or initial_state.is_contiguous()
-    cu_seqlens_contiguous = cu_seqlens is None or cu_seqlens.is_contiguous()
-    if not (
-        q_contiguous
-        and k_contiguous
-        and v_contiguous
-        and g_contiguous
-        and beta_contiguous
-        and initial_state_contiguous
-        and cu_seqlens_contiguous
-    ):
-        if not q_contiguous:
-            q = q.contiguous()
-        if not k_contiguous:
-            k = k.contiguous()
-        if not v_contiguous:
-            v = v.contiguous()
-        if not g_contiguous:
-            g = g.contiguous()
-        if not beta_contiguous:
-            beta = beta.contiguous()
-        if not initial_state_contiguous:
-            initial_state = initial_state.contiguous()
-        if not cu_seqlens_contiguous:
-            cu_seqlens = cu_seqlens.contiguous()
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    g = g.contiguous()
+    beta = beta.contiguous()
+    if initial_state is not None:
+        initial_state = initial_state.contiguous()
+    if cu_seqlens is not None:
+        cu_seqlens = cu_seqlens.contiguous()
 
     chunk_size = _chunk_size_for_sequence(q.shape[1], cu_seqlens is not None)
 
@@ -82,6 +67,16 @@ def chunk_gated_delta_rule_fwd(
         chunk_size=chunk_size,
         output_dtype=k.dtype,
     )
+    if (
+        SUPPRESS_LEVEL < 3 and initial_state is None and cu_seqlens is None
+        and output_final_state and chunk_size == 64 and q.shape[1] % 64 == 0
+        and q.shape[-1] == 128 and v.shape[-1] == 128
+        and k.dtype in (torch.float16, torch.bfloat16)
+    ):
+        h, v_new, final_state = chunk_gated_delta_rule_fused_wu_h(k, v, beta, g, A)
+        o = chunk_fwd_o(q=q, k=k, v=v_new, h=h, g=g, scale=scale, chunk_size=64)
+        return g, o, A, final_state, None, None, None
+
     block_v = 128 if v.shape[-1] == 128 else 64
     w, u = recompute_w_u_fwd(
         k=k,
@@ -135,5 +130,4 @@ def chunk_gated_delta_rule_fwd(
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
-    elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, final_state, w, h, v_new
+    return g, o, A, final_state, w, h, v_new

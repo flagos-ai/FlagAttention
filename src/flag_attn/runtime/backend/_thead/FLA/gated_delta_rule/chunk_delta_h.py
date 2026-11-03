@@ -19,7 +19,7 @@ from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 from flag_attn.FLA.utils import exp
 from flag_attn.FLA.utils import use_cuda_graph
 
-_CONFIG_PATH = Path(__file__).resolve().parents[1] / "tune_configs.yaml"
+_CONFIG_PATH = Path(__file__).resolve().parents[2] / "tune_configs.yaml"
 
 
 @lru_cache(maxsize=1)
@@ -399,5 +399,107 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
+    )
+    return h, v_new, final_state
+
+@libentry()
+@triton.jit(do_not_specialize=["T"])
+def chunk_gated_delta_rule_fused_wu_h_kernel(
+    k, v, beta, g, A, h, v_new, ht, T,
+    H: tl.constexpr, Hg: tl.constexpr, K: tl.constexpr,
+    V: tl.constexpr, BT: tl.constexpr, BV: tl.constexpr,
+    TRANSPOSED: tl.constexpr,
+):
+    i_v, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    i_hg = i_h // (H // Hg)
+    k += (i_b * T * Hg + i_hg).to(tl.int64) * K
+    v += (i_b * T * H + i_h).to(tl.int64) * V
+    v_new += (i_b * T * H + i_h).to(tl.int64) * V
+    beta += i_b * T * H + i_h
+    g += i_b * T * H + i_h
+    A += (i_b * T * H + i_h).to(tl.int64) * BT
+    h += (i_b * tl.cdiv(T, BT) * H + i_h).to(tl.int64) * K * V
+    ht += i_bh.to(tl.int64) * K * V
+    rows = tl.arange(0, BT)
+    offs_k = tl.arange(0, K)
+    offs_v = i_v * BV + tl.arange(0, BV)
+    if TRANSPOSED:
+        # Keep each operand-B tile at K64 and reuse the FP32 accumulator.
+        state1 = tl.zeros((BV, 64), tl.float32)
+        state2 = tl.zeros((BV, 64), tl.float32)
+        for chunk in range(tl.cdiv(T, BT)):
+            p_h1 = tl.make_block_ptr(h + chunk * H * K * V, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
+            p_h2 = tl.make_block_ptr(h + chunk * H * K * V, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
+            tl.store(p_h1, tl.trans(state1).to(p_h1.dtype.element_ty))
+            tl.store(p_h2, tl.trans(state2).to(p_h2.dtype.element_ty))
+            t = chunk * BT + rows
+            p_k1 = tl.make_block_ptr(k, (T, K), (Hg * K, 1), (chunk * BT, 0), (BT, 64), (1, 0))
+            p_k2 = tl.make_block_ptr(k, (T, K), (Hg * K, 1), (chunk * BT, 64), (BT, 64), (1, 0))
+            keys1 = tl.load(p_k1)
+            prediction = tl.dot(state1.to(keys1.dtype), tl.trans(keys1), allow_tf32=False)
+            keys2 = tl.load(p_k2)
+            prediction = tl.dot(state2.to(keys2.dtype), tl.trans(keys2), acc=prediction, allow_tf32=False)
+            p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (chunk * BT, i_v * BV), (BT, BV), (1, 0))
+            values = tl.load(p_v)
+            gate = tl.load(g + t * H).to(tl.float32)
+            strength = tl.load(beta + t * H).to(tl.float32)
+            residual = (tl.trans(values).to(tl.float32) - tl.exp(gate)[None, :] * prediction) * strength[None, :]
+            p_A = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (chunk * BT, 0), (BT, BT), (1, 0))
+            inverse = tl.load(p_A)
+            updated = tl.dot(residual.to(values.dtype), tl.trans(inverse), allow_tf32=False)
+            p_new = tl.make_block_ptr(v_new, (T, V), (H * V, 1), (chunk * BT, i_v * BV), (BT, BV), (1, 0))
+            tl.store(p_new, tl.trans(updated).to(p_new.dtype.element_ty))
+            last_gate = tl.load(g + (chunk * BT + BT - 1) * H).to(tl.float32)
+            decay = tl.exp(last_gate)
+            weighted = (updated * tl.exp(last_gate - gate)[None, :]).to(values.dtype)
+            # Reload after the public intermediate store; do not retain both B fragments.
+            update_keys1 = tl.load(p_k1)
+            state1 = tl.dot(weighted, update_keys1, acc=state1 * decay, allow_tf32=False)
+            update_keys2 = tl.load(p_k2)
+            state2 = tl.dot(weighted, update_keys2, acc=state2 * decay, allow_tf32=False)
+        cols = tl.arange(0, 64)
+        tl.store(ht + cols[None, :] * V + offs_v[:, None], state1)
+        tl.store(ht + (cols[None, :] + 64) * V + offs_v[:, None], state2)
+    else:
+        state = tl.zeros((K, BV), tl.float32)
+        for chunk in range(tl.cdiv(T, BT)):
+            p_h = tl.make_block_ptr(h + chunk * H * K * V, (K, V), (V, 1), (0, i_v * BV), (K, BV), (1, 0))
+            tl.store(p_h, state.to(p_h.dtype.element_ty))
+            t = chunk * BT + rows
+            p_k = tl.make_block_ptr(k, (T, K), (Hg * K, 1), (chunk * BT, 0), (BT, K), (1, 0))
+            p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (chunk * BT, i_v * BV), (BT, BV), (1, 0))
+            p_A = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (chunk * BT, 0), (BT, BT), (1, 0))
+            keys = tl.load(p_k)
+            values = tl.load(p_v)
+            gate = tl.load(g + t * H).to(tl.float32)
+            strength = tl.load(beta + t * H).to(tl.float32)
+            prediction = tl.dot(keys, state.to(keys.dtype), allow_tf32=False)
+            residual = (values.to(tl.float32) - tl.exp(gate)[:, None] * prediction) * strength[:, None]
+            inverse = tl.load(p_A)
+            updated = tl.dot(inverse, residual.to(values.dtype), allow_tf32=False)
+            p_new = tl.make_block_ptr(v_new, (T, V), (H * V, 1), (chunk * BT, i_v * BV), (BT, BV), (1, 0))
+            tl.store(p_new, updated.to(p_new.dtype.element_ty))
+            last_gate = tl.load(g + (chunk * BT + BT - 1) * H).to(tl.float32)
+            weighted = updated * tl.exp(last_gate - gate)[:, None]
+            state = state * tl.exp(last_gate) + tl.dot(tl.trans(keys), weighted.to(keys.dtype), allow_tf32=False)
+        tl.store(ht + offs_k[:, None] * V + offs_v[None, :], state)
+
+def chunk_gated_delta_rule_fused_wu_h(
+    k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
+    g: torch.Tensor, A: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, T, Hg, K = k.shape
+    H, V = v.shape[-2:]
+    h = k.new_empty(B, triton.cdiv(T, 64), H, K, V)
+    v_new = torch.empty_like(v)
+    final_state = k.new_empty(B, H, K, V, dtype=torch.float32)
+    # Four warps each own 16 value rows; retain more tasks for small grids.
+    transposed = B * H >= 32
+    block_v = 64 if transposed else 32
+    chunk_gated_delta_rule_fused_wu_h_kernel[(triton.cdiv(V, block_v), B * H)](
+        k, v, beta, g, A, h, v_new, final_state, T,
+        H=H, Hg=Hg, K=K, V=V, BT=64, BV=block_v, TRANSPOSED=transposed,
+        num_warps=4, num_stages=2,
     )
     return h, v_new, final_state

@@ -22,7 +22,7 @@ from flag_attn.FLA.utils import is_nvidia_hopper
 from flag_attn.utils import check_shared_mem
 from flag_attn.FLA.utils import FLA_GDN_FIX_BT
 
-_CONFIG_PATH = Path(__file__).resolve().parents[1] / "tune_configs.yaml"
+_CONFIG_PATH = Path(__file__).resolve().parents[2] / "tune_configs.yaml"
 
 
 @lru_cache(maxsize=1)
