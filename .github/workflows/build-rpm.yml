@@ -14,15 +14,16 @@
 
 name: Build RPM Packages
 
+# Verifies that the packaging definition still builds and installs. It is
+# not a release path: packages published to the FlagOS repositories are
+# built and uploaded by flagos-ai/build-infra from a pinned ref, so no tag
+# triggers a build here.
 on:
-  push:
-    tags:
-      - 'v*'
   pull_request:
     branches: [main]
-    # Only what changes the package. A .deb or .rpm built on a source
-    # PR is published nowhere and downloaded by no one; release tags
-    # above still build, and a build can be requested by hand.
+    # Only what changes the package. A .deb or .rpm built on a source PR is
+    # published nowhere and downloaded by no one. A build can be requested by
+    # hand.
     paths:
       - 'packaging/rpm/**'
       - '.github/workflows/build-rpm.yml'
