@@ -42,7 +42,18 @@ test = [
     "pytest>=7.1.0",
     "PyYAML>=6.0",
     "distro==1.9.0",
+]
+
+nvidia = [
     "flash-linear-attention[cuda]",
+]
+
+[tool.uv]
+# These hardware-specific packages are already supplied by the runtime image.
+exclude-dependencies = [
+    "numpy",
+    "torch",
+    "triton",
 ]
 
 [project.urls]
@@ -69,6 +80,7 @@ namespaces = false
 addopts = "--import-mode=importlib"
 testpaths = [
     "tests",
+    "benchmark",
 ]
 
 pythonpath = [

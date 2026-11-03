@@ -18,10 +18,10 @@
 # user-side pip install incantation.
 %global __requires_exclude ^python3(\.[0-9]+)?dist\((triton)\)$
 Name:           python3-flag-attention
-# NOTE: version is duplicated across 3 packaging locations — keep them in sync:
+# NOTE: version is duplicated across 2 packaging locations — keep them in sync:
 #   1. this Version: line
-#   2. packaging/debian/changelog (latest entry)
-#   3. packaging/debian/rules SETUPTOOLS_SCM_PRETEND_VERSION
+#   2. packaging/debian/changelog (latest entry; debian/rules derives
+#      SETUPTOOLS_SCM_PRETEND_VERSION from it)
 # (spec %%build / %%install pass SETUPTOOLS_SCM_PRETEND_VERSION=%%{version} so
 #  they self-update with the Version: line above. %% escaped: openEuler's
 #  rpm expands macros even in comments and a bare %%install here would

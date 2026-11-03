@@ -9,9 +9,9 @@ import torch
 import triton
 import triton.language as tl
 
-from .index import prepare_chunk_indices
-from .utils import check_shared_mem, input_guard
-from flag_attn.gated_delta_rule.compat import libentry, libtuner
+from flag_attn.runtime.backend._hygon.FLA.index import prepare_chunk_indices
+from flag_attn.runtime.backend._hygon.FLA.utils import check_shared_mem, input_guard
+from flag_attn.FLA.compat import libentry, libtuner
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 

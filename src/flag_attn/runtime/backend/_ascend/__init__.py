@@ -5,6 +5,9 @@ import importlib
 
 _OPERATOR_EXPORTS = {
     "chunk_gdn2": (".gdn2", "chunk_gdn2"),
+    "parallel_parallax": (".parallax", "parallel_parallax"),
+    "parallax_decode": (".parallax", "parallax_decode"),
+    "parallax_attn_with_kvcache": (".parallax", "parallax_attn_with_kvcache"),
     "forward": (".attn_qk_int8_per_block", "forward"),
     "per_block_int8": (".ops", "quant_per_block_int8"),
     "quant_per_block_int8": (".ops", "quant_per_block_int8"),
