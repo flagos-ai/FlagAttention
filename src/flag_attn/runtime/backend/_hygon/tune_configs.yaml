@@ -12,4 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-{}
+# Curated launch settings for AttnRes. The first entry is selected directly
+# by the Hygon wrapper; this kernel does not run runtime autotuning.
+_fused_attnres_fwd_kernel:
+  - META: {}
+    num_warps: 4
+    num_stages: 2

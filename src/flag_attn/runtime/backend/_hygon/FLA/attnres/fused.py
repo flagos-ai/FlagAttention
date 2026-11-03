@@ -15,13 +15,44 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
 
 import torch
 import triton
 import triton.language as tl
 
+from flag_attn.runtime.backend._hygon.device_info import get_device_info
+from flag_attn.runtime.backend._hygon.heuristics_config_utils import HEURISTICS_CONFIGS
+
 # Hygon gfx936 uses the regular Triton/HIP backend.
 HAS_TRITON_ATTNRES = True
+
+
+@lru_cache(maxsize=1)
+def _get_attnres_runtime_config():
+    device_info = get_device_info()
+    op_heuristics = HEURISTICS_CONFIGS.get("fused_attnres", {})
+    device_heuristics = op_heuristics.get("by_sm_count", {}).get(
+        device_info.sm_count, op_heuristics.get("default", {})
+    )
+
+    try:
+        from flag_attn.runtime import get_tuned_config
+
+        tuned_configs = get_tuned_config("_fused_attnres_fwd_kernel")
+    except (ImportError, OSError, TypeError, ValueError):
+        tuned_configs = []
+
+    if tuned_configs:
+        # This kernel uses the curated first entry to avoid runtime autotuning.
+        launch_config = tuned_configs[0]
+        num_warps = launch_config.num_warps or 4
+        num_stages = launch_config.num_stages or 2
+        kernel_meta = dict(launch_config.kwargs)
+    else:
+        num_warps, num_stages, kernel_meta = 4, 2, {}
+    return device_heuristics, num_warps, num_stages, kernel_meta
+
 
 @triton.jit
 def _score_source(
@@ -194,8 +225,9 @@ def _validate_inputs(
     reference_shape = reference.shape
     reference_device = reference.device
     reference_dtype = reference.dtype
+    # PyTorch exposes Hygon HIP tensors through its is_cuda compatibility flag.
     if not reference.is_cuda:
-        raise ValueError("fused_attnres requires CUDA tensors")
+        raise ValueError("fused_attnres requires Hygon accelerator tensors")
     if reference.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"fused_attnres supports float16 and bfloat16 residuals, got {reference.dtype}")
     if reference.ndim == 0:
@@ -356,6 +388,13 @@ def fused_attnres(
     else:
         logit = lse = None
 
+    heuristic_config, num_warps, num_stages, kernel_meta = (
+        _get_attnres_runtime_config()
+    )
+    join_reductions_max_rows = heuristic_config.get(
+        "join_reductions_max_rows", 1024
+    )
+
     _fused_attnres_fwd_kernel[(num_rows,)](
         query=query_flat,
         residuals=flat_residuals,
@@ -369,7 +408,7 @@ def fused_attnres(
         N=num_rows,
         L=len(residuals),
         D=hidden_size,
-        JOIN_REDUCTIONS=num_rows <= 1024,
+        JOIN_REDUCTIONS=num_rows <= join_reductions_max_rows,
         eps=rms_eps,
         scale=scale,
         BD=triton.next_power_of_2(hidden_size),
@@ -377,8 +416,9 @@ def fused_attnres(
         HAS_ONORM_BIAS=output_rms_bias is not None,
         HAS_POST_SCALE=post_scale is not None,
         RETURN_WEIGHTS=return_weights,
-        num_warps=4,
-        num_stages=2,
+        **kernel_meta,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     if len(output_shape) != 2:
