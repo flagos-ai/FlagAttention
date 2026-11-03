@@ -116,8 +116,8 @@ def _score_kernel(
                     residual_ptr + offsets, mask=rows[:, None] < N, other=0.0
                 )
             residual_values = residual_values.to(tl.float32)
-            acc_square += residual_values * residual_values
-            acc_dot += residual_values * query_weight[None, :]
+            acc_square = tl.fma(residual_values, residual_values, acc_square)
+            acc_dot = tl.fma(residual_values, query_weight[None, :], acc_dot)
         source_logit = tl.sum(acc_dot, axis=1) * tl.rsqrt(tl.sum(acc_square, axis=1) / D + eps)
         if EVEN:
             tl.store(logit + source * N + rows, source_logit)
@@ -181,7 +181,7 @@ def _mix_kernel(
                 residual_values = tl.load(
                     residual_ptr + offsets, mask=rows[:, None] < N, other=0.0
                 )
-            accumulator += probability[:, None] * residual_values.to(tl.float32)
+            accumulator = tl.fma(probability[:, None], residual_values.to(tl.float32), accumulator)
         if HAS_ONORM:
             squared_norm += tl.sum(accumulator * accumulator, axis=1)
         output_offsets = rows[:, None] * D + cols[None, :]
