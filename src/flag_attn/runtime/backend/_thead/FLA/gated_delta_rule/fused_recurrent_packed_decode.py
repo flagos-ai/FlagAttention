@@ -208,7 +208,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
-    BV = min(triton.next_power_of_2(V), 32)
+    BV = min(triton.next_power_of_2(V), 8)
     num_stages = 3
     num_warps = 1
 
