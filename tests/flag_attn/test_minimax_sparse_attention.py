@@ -988,7 +988,12 @@ def _non_pow2_prefill_inputs(head_dim: int, group_size: int, num_kv_heads: int):
 # head_dim 96 is supported but every other prefill case here runs at 128, which
 # hid a defect: the TMA descriptor box width and V's column origin both have to
 # stay distinct from head_dim once it is not a power of two.
-@pytest.mark.parametrize("head_dim", (96, 128))
+#
+# 100 is the other half of the contract: V's box would start 200 bytes into the
+# row, which is not 16-byte aligned, so no legal TMA descriptor exists and the
+# dispatcher has to route it to a non-TMA kernel. Left unguarded it builds a
+# descriptor and then faults on the device with an illegal instruction.
+@pytest.mark.parametrize("head_dim", (96, 100, 128))
 @pytest.mark.parametrize("group_size", (8, 16))
 @pytest.mark.minimax_sparse_attention_prefill
 @pytest.mark.minimax_m3_sparse_attn

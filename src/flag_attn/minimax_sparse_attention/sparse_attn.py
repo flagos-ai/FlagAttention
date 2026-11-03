@@ -2079,13 +2079,37 @@ def _tma_box_width(head_dim: int) -> int:
     breaks at 96 twice over: the descriptor is rejected, and the box would be
     narrower than the tile copied into.
 
-    Over-wide is safe because the descriptor's ``shape`` stays the true
-    ``2 * head_dim``, so TMA zero-fills past the row. Those pad columns are
-    inert: Q is loaded ``padding_option="zero"`` so QK contributes nothing over
-    them, and the output store is ``boundary_check``ed. V's copies take
-    ``head_dim`` as their column origin, not this width.
+    The box is wider than ``head_dim`` when head_dim is not a power of two, so
+    each tile picks up ``BLOCK_SIZE_D - head_dim`` junk columns. They are inert,
+    but for two different reasons depending on the half -- the descriptor rows
+    are ``2 * head_dim`` wide, so only V's overhang is actually past the row:
+
+    - K (origin 0) overhangs into V's leading columns, which are **in bounds
+      and real data**, not zero-fill.
+    - V (origin ``head_dim``) overhangs past the row end, which TMA zero-fills.
+
+    Either way nothing reaches the output: ``BLOCK_SIZE_D`` is the QK
+    contraction dim and Q is loaded ``padding_option="zero"``, so every junk
+    column is multiplied by a zero Q lane and adds nothing to the logits; and
+    the accumulator's junk rows are dropped by the output store's
+    ``boundary_check``. Verified at head_dim 96 by scaling V by 1e5, which
+    leaves the K-overhang columns enormous while the result stays bit-identical
+    to the non-TMA path.
     """
     return triton.next_power_of_2(head_dim)
+
+
+def _tma_supports_head_dim(head_dim: int, itemsize: int) -> bool:
+    """Whether a packed KV row admits a legal TMA box for both halves.
+
+    V's box starts at column ``head_dim``, i.e. ``head_dim * itemsize`` bytes
+    into the row, and TMA requires a 16-byte-aligned box origin. bf16 therefore
+    needs ``head_dim % 8 == 0`` -- true for 96 and 128, false for e.g. 100,
+    where the descriptor builds fine and then faults on the device with an
+    illegal instruction. Callers must route the remainder to a non-TMA kernel
+    rather than letting it reach a descriptor.
+    """
+    return (head_dim * itemsize) % 16 == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2398,10 +2422,15 @@ def minimax_m3_sparse_attn(
     grid = (max_query_len, num_kv_heads, batch)
     block_size_h = triton.next_power_of_2(gqa_group_size)
 
+    # Head dimensions whose V box origin is not 16-byte aligned cannot form a
+    # legal TMA descriptor, so they must reach a non-TMA kernel; treat them the
+    # same as a TLE-less build.
+    tma_ok = _tma_supports_head_dim(head_dim, kv_cache.element_size())
+
     # Dispatch order mirrors upstream: no-TLE fallback, then the tl.dot kernel
     # for cases that cannot form a legal WGMMA (fp8 KV has a dtype mismatch with
     # BF16 Q; a GQA tile below eight heads has an illegal WGMMA N), then TLE.
-    if not use_fp8 and block_size_h >= 8 and tle is None:
+    if not use_fp8 and block_size_h >= 8 and (tle is None or not tma_ok):
         _gqa_sparse_fwd_fallback_kernel[grid](
             q, kv_cache, k_scale_arg, v_scale_arg, topk_idx, output,
             block_table, cu_seqlens_q, cu_seqlens_q, seq_lens, prefix_lens,
@@ -2441,6 +2470,7 @@ def minimax_m3_sparse_attn(
     use_fp8_tle = (
         use_fp8
         and tle is not None
+        and tma_ok
         and kv_scale_mode == _KV_SCALE_SCALAR
         and block_size_h >= _MSA_PREFILL_FP8_MIN_QH
     )
