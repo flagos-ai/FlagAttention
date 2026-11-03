@@ -31,6 +31,7 @@ Uses generic Triton forward/backward kernels without NVIDIA-specific dispatch.
 # This module has no runtime dependency on the source FLA repository.
 
 import os
+from contextvars import ContextVar
 
 import torch
 import triton
@@ -911,6 +912,19 @@ class WallParallelAttentionFunction(torch.autograd.Function):
         return dq.to(q), dk.to(k), dv.to(v), dg, dsink_bias, None, None, None, dg_scalar, None
 
 
+_LAST_ROUTE: ContextVar[str | None] = ContextVar("wall_attn_route", default=None)
+
+
+def get_last_route() -> str | None:
+    """Return the route used by the T-Head implementation."""
+    return _LAST_ROUTE.get()
+
+
+def select_route(*args, **kwargs) -> str:
+    """Select the generic Triton implementation."""
+    return "thead_triton_generic"
+
+
 def parallel_wall_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -953,6 +967,7 @@ def parallel_wall_attn(
     Returns:
         Attention output of shape ``[B, T, HQ, V]``.
     """
+    _LAST_ROUTE.set("thead_triton_generic")
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if g_scalar is not None and g_scalar.shape != q.shape[:-1]:
@@ -966,4 +981,4 @@ def parallel_wall_attn(
     )
 
 
-__all__ = ["parallel_wall_attn"]
+__all__ = ["parallel_wall_attn", "select_route", "get_last_route"]
