@@ -218,6 +218,3 @@ def chunk_gated_delta_rule(
     if head_first:
         o = o.transpose(1, 2)
     return o, final_state if output_final_state else None
-
-
-__all__ = ["chunk_gated_delta_rule"]

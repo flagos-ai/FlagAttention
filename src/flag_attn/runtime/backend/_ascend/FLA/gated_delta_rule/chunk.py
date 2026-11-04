@@ -432,6 +432,3 @@ def chunk_gated_delta_rule_fwd(
             cu_seqlens, min(chunk_size, 32),
         )
     return g_cum, o, A, final_state, None, None, None
-
-
-__all__ = ["chunk_gated_delta_rule_fwd", "ascend_chunk_size"]
