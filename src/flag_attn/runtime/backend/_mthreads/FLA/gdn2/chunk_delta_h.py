@@ -8,8 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.gated_delta_rule.compat import libentry, libtuner
-from flag_attn.gated_delta_rule.triton_ops_helper import exp
+from flag_attn.FLA.compat import libentry, libtuner
+from flag_attn.FLA.utils import exp
 
 from ..index import prepare_chunk_indices, prepare_chunk_offsets
 from ..utils import use_cuda_graph
