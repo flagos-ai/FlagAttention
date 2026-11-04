@@ -184,6 +184,10 @@ class _MarkCollector:
             marks = _operator_marks(item)
             self.items.append({"nodeid": item.nodeid, "marks": sorted(marks)})
 
+        # Mark discovery must never execute the collected test suite, even if
+        # the caller omits pytest's --collect-only option.
+        items.clear()
+
     def pytest_sessionfinish(
         self, session: pytest.Session, exitstatus: pytest.ExitCode
     ) -> None:
