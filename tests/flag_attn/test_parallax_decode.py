@@ -46,12 +46,9 @@ try:
         )
     from parallax import parallax_attn_with_kvcache as cute_kvcache
     from parallax import parallax_decode as cute_decode
-except Exception as exc:  # parallax-kernel is an optional test baseline.
+except Exception:  # parallax-kernel is an optional test baseline.
     cute_kvcache = None
     cute_decode = None
-    CUTE_IMPORT_ERROR = exc
-else:
-    CUTE_IMPORT_ERROR = None
 
 
 def _rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -106,14 +103,6 @@ def _inputs(B, L, HQ, H, D, dtype, seed=0):
 def _require_tle():
     if not test_backend.supports_operator("parallax_decode", tle=True):
         pytest.skip("selected Parallax decode implementation is unavailable")
-
-
-@pytest.mark.sm90
-def test_cute_baseline_importable():
-    """Report the exact optional-baseline import failure without hiding TLE tests."""
-    _require_tle()
-    if cute_decode is None:
-        pytest.skip(f"CuTeDSL baseline is unavailable: {CUTE_IMPORT_ERROR!r}")
 
 
 @pytest.mark.sm90
