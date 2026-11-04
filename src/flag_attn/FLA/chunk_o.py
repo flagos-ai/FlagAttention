@@ -9,15 +9,14 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_attn import runtime
 from flag_attn.FLA.compat import libentry, libtuner
 from flag_attn.FLA.index import prepare_chunk_indices
 from flag_attn.FLA.utils import exp
-from flag_attn.FLA.utils import is_nvidia_hopper
 from flag_attn.utils import check_shared_mem
 from flag_attn.FLA.utils import FLA_GDN_FIX_BT
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
-NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
 
 @libentry()
@@ -28,13 +27,9 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
     }
 )
 @libtuner(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
+    configs=runtime.get_tuned_config(
+        "chunk_fwd_kernel_o" if BKV_LIST[0] == 64 else "chunk_fwd_kernel_o_small_shared"
+    ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
