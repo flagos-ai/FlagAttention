@@ -1,35 +1,8 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Ascend orchestration for the GDN v1 chunk forward.
-
-Three paths:
-
-* **fused path** (bf16/fp16, ``K <= 128``, ``V <= 128``, default chunk 64): three
-  Triton launches -- ``cumsum(+fp32 beta)`` -> ``prep_w_u`` -> ``fwd_h_o``.
-  ``fused_ascend.py`` merges the KKT/Newton inverse with ``recompute_w_u``
-  (``A_inv`` never hits GM) and the state scan with the output stage (``h`` and
-  ``v_new`` never hit GM).  This is the default because the staged pipeline is
-  launch/host bound on this backend, not compute bound.
-  ``FLAG_ATTN_ASCEND_GDN_FUSE=0`` selects the staged fast path (5 launches)
-  instead.
-* **staged fast path**: the same math in five Ascend kernels
-  (``wy_fast_ascend.py``, ``fwd_h_ascend.py``, ``chunk_o_ascend.py``), kept as
-  an explicit alternative.
-* **fallback path** (``K``/``V`` > 128, or
-  ``FLAG_ATTN_ASCEND_GDN_FAST=0``): the generic implementation -- ``kkt.py``
-  prep plus the generic ``wy_fast``/``chunk_delta_h``/``chunk_o`` kernels at
-  ``BT=32``, so fp16 and K=256 keep working.
-
-All Ascend kernels here share the same backend rules (see the module
-docstrings): no autotune, K in a single tile, and per-token decay applied
-through *2D factor tiles gathered from fp32 buffers* -- a 1D->2D broadcast
-multiply is slow on this backend, and bf16 2D gathers are much slower than
-fp32 gathers.
-
-``FLAG_ATTN_ASCEND_GDN_BT`` selects the internal chunk size (default 64, the
-same chunk CANN's AscendC fused op uses); BT=32 remains available as an
-explicit request and as the fallback chunk size.
+"""Ascend orchestration for the GDN v1 chunk forward (fused, staged and fallback
+paths).
 """
 
 from __future__ import annotations

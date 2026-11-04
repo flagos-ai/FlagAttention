@@ -3,21 +3,8 @@
 
 """Public GDN v1 entry point for the Ascend backend.
 
-Signature and layout conversions mirror ``flag_attn.FLA.gated_delta_rule.api``;
-the NVIDIA-only TLE/direct fast paths are intentionally not used here.  ``BT``
-keeps the upstream contract (only 16/32/64 are meaningful); the internal chunk
-length is ``ascend_chunk_size()`` for the default BT=64.
-
-The fast path is host-bound: a handful of kernel launches per call, where the
-Python/Triton launch side costs more than the device work, so this wrapper keeps
-the per-call Python as lean as possible while preserving exactly the same
-validation semantics as the generic entry point:
-
-* the five ``_as_seq_first`` calls and the ``_validate_inputs`` dict/loop are
-  inlined into straight-line checks (same exceptions and messages);
-* ``is_contiguous()`` is checked directly instead of through the helper, so a
-  contiguous input skips the call entirely;
-* the orchestration call is positional (no kwargs dict).
+Mirrors the generic signature and validation; the NVIDIA-only TLE fast paths are
+not used here.
 """
 
 from __future__ import annotations

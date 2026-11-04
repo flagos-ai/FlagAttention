@@ -1,16 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fixed-length TLE-Raw inverse preparation for eligible GDN workloads.
-
-This module is deliberately separate from the generic prep implementation.
-It materializes a dense contiguous FP32 64x64 chunk-local KKT matrix, applies
-the Raw inverse to its two diagonal 32x32 blocks, stitches the full 64x64
-inverse, then computes the same two-pass affine outputs as the generic path.
-The dense KKT write avoids the severe serialization seen with dynamic
-compact-block addressing on CANN 9.1. Dispatch is restricted to the
-large-workload class and can be disabled with
-``FLAG_ATTN_ASCEND_GDN_RAW_INVERSE=0``.
+"""Raw inverse prep helpers for the Ascend GDN prep path.
 """
 from __future__ import annotations
 

@@ -1,41 +1,8 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Ascend-only GDN v1 chunk-local cumsum, KKT/solve_tril and ``recompute_w_u``.
-
-This module holds Ascend replacements for
-``flag_attn.FLA.gated_delta_rule.fused_cumsum_kkt_solve_tril`` (the version in
-``kkt.py``) and ``flag_attn.FLA.gated_delta_rule.wy_fast.recompute_w_u_fwd``.
-The generic and ``kkt.py`` files are left untouched.
-
-Why a separate copy
--------------------
-``kkt.py`` folds the decay into the KKT dot operands and uses Newton doubling,
-but that fold uses a 1D->2D broadcast multiply::
-
-    b_L = tl.dot(b_k * (b_beta * b_e)[:, None], ...)
-
-On Ascend any broadcast of a ``[BT]`` vector into a ``[BT, K]`` tile
-(``v[:, None] * tile``) is much slower than a plain 2D x 2D multiply, and a
-per-program broadcast multiply can dominate the cost of the whole pipeline.
-
-The form used here (and in ``chunk_o_ascend.py`` / ``fwd_h_ascend.py``) is to
-materialise the per-token factor as a *2D tile* with a broadcast *address*
-computation instead of broadcasting a loaded 1D vector::
-
-    o_t = i_t * BT + tl.arange(0, BT)
-    b_g2 = tl.load(g + base + o_t[:, None] * H + 0 * tl.arange(0, K)[None, :],
-                   mask=..., other=0.)
-
-The integer address arithmetic is cheap and the resulting ``[BT, K]`` tile
-multiplies a loaded tile at full 2D speed.  Same trick for the transposed
-``[K, BT]`` factor used by the KKT dot.
-
-Numerics/behaviour are unchanged relative to ``kkt.py``:
-``A_inv = (I + L)^-1`` with ``L[i, j] = beta_i (k_i . k_j) exp(g_i - g_j)``
-strictly lower triangular, inverted by Newton doubling with
-``log2(BT) - 1`` steps.  ``g`` is the chunk-local cumsum in fp32, which is also
-returned because ``fwd_h``/``chunk_o`` need it.
+"""Ascend-only chunk-local cumsum, KKT/solve_tril and ``recompute_w_u`` for GDN
+v1.
 """
 
 from __future__ import annotations

@@ -2,33 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Ascend recurrent (decode) kernels for GDN v1.
-
-Three interfaces, each pinned to an upstream implementation:
-
-* :func:`fused_recurrent_gated_delta_rule_fwd` -- FLA
-  (``fla/ops/gated_delta_rule/fused_recurrent.py``): per-token recurrence over
-  a (possibly variable-length) sequence, key-major state ``[N, HV, K, V]``,
-  optional ``g`` / ``gk`` / ``gv`` / ``beta`` / ``scale``, optional initial and
-  final state, optional in-kernel q/k L2 normalization.
-* :func:`fused_recurrent_gated_delta_rule_fwd_decode` -- the vLLM decode
-  variant of the same name: value-major state ``[N, HV, V, K]``, in-place final
-  state, continuous batching (``ssm_state_indices``) and speculative-decoding
-  state slots (``num_accepted_tokens``), per-token state writes.
-* :func:`fused_recurrent_gated_delta_rule_packed_decode` -- vLLM's packed
-  decode: single token from a packed ``mixed_qkv`` row with the gate/beta
-  computed in-kernel from ``a``/``b``/``A_log``/``dt_bias``.
-
-Math is the GDN v1 recurrence used by the chunk path and upstream FLA::
-
-    S_t = diag(exp(g_t)) S_{t-1}
-    v_new = beta_t (v_t - k_t^T S_t)
-    S_t = S_t + k_t v_new^T
-    o_t = scale q_t^T S_t
-
-The kernels keep the state ``[BV, BK]`` in fp32 registers, use int32 offsets
-(the Ascend AIV path prefers int32), and do not use dots: the recurrent step is
-bandwidth/latency bound and the two reductions are vector reductions over
-``BK``.
 """
 
 from __future__ import annotations

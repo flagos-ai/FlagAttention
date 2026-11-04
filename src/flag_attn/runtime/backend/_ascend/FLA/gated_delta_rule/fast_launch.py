@@ -1,34 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Explicit cached launcher for this backend's Triton kernels.
-
-The GDN fast path is host-bound on small shapes: four ``kernel[grid](...)``
-calls per forward, and every call re-runs Triton's Python side (option/kwargs
-parsing, device/stream lookup, generated binder, cache-key build, global-value
-check, grid canonicalization).  That Python work outweighs the actual C launch
-on this backend, so caching the compiled launcher removes a large part of the
-per-call host cost.
-
-This module exposes one explicit entry point, :func:`fast_launch`, that a call
-site opts into: the first call of a site compiles the kernel (Triton's
-compile-only ``warmup``) and keeps the compiled launcher; later calls with the
-same site invoke that launcher directly.  Nothing is patched globally, so
-kernels outside the opt-in call sites keep Triton's regular launch path.
-
-Every call site keeps the regular ``kernel[grid](*args, ...)`` as a fallback.
-The launcher uses it when the mechanism is disabled
-(``FLAG_ATTN_ASCEND_GDN_FASTLAUNCH=0``), when a profiler/launch hook or
-``debug`` is active, when a tensor argument is not 16-byte aligned (the
-compile-only ``warmup`` path models pointers as divisible), when the grid is
-callable, when the kernel reads global values, or when the installed Triton
-build does not expose the internals used here.  A fallback is correct but
-slower; it does not change results.
-
-The per-site cache is keyed by ``(function identity, grid, num_warps,
-num_stages)``.  Kernels and grids are shape-specialized at the call site, so a
-site corresponds to one shape/config.  Arguments may be passed positionally or
-by keyword (keyword arguments are folded into the kernel signature order).
+"""Cached Triton launcher for the opt-in Ascend kernels.
 """
 
 from __future__ import annotations

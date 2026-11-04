@@ -2,40 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Ascend-only ``chunk_fwd_o`` for GDN v1.
-
-Math identical to ``flag_attn.FLA.chunk_o``; the generic module is untouched.
-The differences below are all driven by this backend:
-
-1. **No autotune.**  ``check_shared_mem()`` is False on Ascend, so the generic
-   kernel searches 36 configs per new ``(H, K, V, BT)`` key, paying a long
-   per-process cold start.  The tile is fixed here instead (``BV``=min(V,128),
-   4 warps), which is the empirical choice for this backend: fewer, larger
-   programs beat more, smaller ones.
-2. **K is a single tile** (``BK = K``): the generic loop over ``cdiv(K, 64)``
-   trips twice for K=128 and carries a ``BT x BV`` fp32 cube accumulator
-   across the loop, which is miscompiled on this backend (see ``kkt.py``).
-3. **Decay applied through 2D factor tiles.**  The generic form
-   ``dot(q, k^T) * exp(g_i - g_j)`` / ``o * exp(g_i)`` does elementwise work on
-   cube outputs (layout conversion), and the obvious fix
-   ``q * exp(g)[:, None]`` is worse: 1D->2D broadcast multiplies are slow on
-   this backend, while a 2D x 2D multiply is cheap.  The decay factors are
-   therefore *gathered as 2D tiles*
-
-       b_g2 = tl.load(g + base + o_t[:, None] * H + 0 * arange(K)[None, :], ...)
-
-   and folded into the dot operands:
-
-       A[i, j] = (q_i exp(g_i)) . (k_j exp(-g_j))
-       o       = (q exp(g)) @ h + (masked A) @ v
-
-   ``exp(-g_j)`` is clamped to ``e^80`` like ``kkt.py``; with the causal mask
-   the kept entries satisfy ``exp(g_i - g_j) <= 1``, so the clamp only touches
-   contributions below fp32 resolution.
-4. **No ``o_t < T`` term in the causal mask.**  Every load is
-   ``boundary_check``-guarded and pads with 0, so out-of-range rows/cols
-   already contribute nothing.  The generic kernel's extra broadcast
-   ``o_t < T`` mask is what pushes the BT=64 UB footprint over the 192KB
-   budget.
 """
 
 from __future__ import annotations

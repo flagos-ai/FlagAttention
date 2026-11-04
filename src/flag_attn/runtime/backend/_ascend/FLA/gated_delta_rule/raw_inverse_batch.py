@@ -1,18 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Batched KKT / stitch launches for the Raw GDN inverse prep.
-
-Both kernels are chunk-parallel over ``B*NT*H`` independent jobs.  The affine
-prep kernel already amortises its per-program scalar/scheduling cost by
-processing four consecutive chunks per program; the KKT and stitch kernels use
-the same idea, with the batch size chosen from the job count.
-
-The Raw diagonal inverse itself is *not* per-program-overhead bound (wider
-batches do not help, and four jobs exceed the 192 KB UB budget), so it keeps
-its current schedule.  Small grids keep the smaller batch sizes because the
-extra batching does not pay off there.  ``FLAG_ATTN_ASCEND_GDN_INVBATCH=0``
-disables the wider batching.
+"""Batched Raw inverse launchers for the Ascend GDN prep path.
 """
 
 from __future__ import annotations

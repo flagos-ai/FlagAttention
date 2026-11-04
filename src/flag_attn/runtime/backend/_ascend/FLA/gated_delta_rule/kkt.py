@@ -1,43 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Ascend prep kernel for GDN v1: chunk-local cumsum + KKT + solve_tril.
-
-The generic ``flag_attn.FLA.gated_delta_rule.fused_cumsum_kkt_solve_tril``
-fuses cumsum, the KKT matrix and its triangular inverse into a single kernel
-whose UB footprint at BT=64 is 4_243_456 bits (530KB) against 192KB, so it
-cannot compile for Ascend 910B.  Its inverse is also hard-coded to four 16x16
-diagonal blocks, so simply lowering ``chunk_size`` produces wrong results.
-
-This module keeps BT a parameter (default 32) and computes the inverse the
-generic kernel expects, ``(I + L)^-1``, by Newton doubling on BT x BT fp32
-tiles: ``L`` is strictly lower triangular (nilpotent, ``L^BT = 0``), so starting
-from ``X0 = I - L`` (residual ``L^2``) each step
-``X_{k+1} = X_k (2I - (I + L) X_k)`` squares the residual and ``log2(BT) - 1``
-steps are exact -- 2*4 = 8 small ``tl.dot`` for BT=32 instead of BT-1 sequential
-masked reductions.  The input-side decay folding described below removes the
-elementwise pass over the BT x BT dot result.
-
-``L`` is the strictly-lower chunk matrix ``beta_i * (k_i . k_j) * exp(g_i - g_j)``
-(the same quantity the generic kernel stores in ``A``), so the result matches
-the generic ``A_inv`` up to the BT granularity.
-
-Three backend constraints shape the kernel:
-
-* the KKT dot must cover the *whole* head dim in a single ``tl.dot``.  The
-  usual ``for i_k in range(cdiv(K, BK)): b_L += tl.dot(...)`` accumulator form
-  is miscompiled as soon as the loop has more than one trip; loading the full
-  head dim in one block and issuing one dot keeps the accumulator exact.
-* the decay ``exp(g_i - g_j)`` is folded into the operands of that single dot
-  (``beta_i exp(g_i) k_i`` against ``exp(-g_j) k_j``) instead of being applied
-  to the BT x BT dot result.  Elementwise work on the cube output of a dot
-  (in particular the broadcast outer product of the gate) forces a layout
-  conversion, so the decay is folded into the dot operands and the whole
-  L/Newton chain stays in one layout.
-* the chunk-local cumsum is written as fp32 (see
-  ``chunk_gated_delta_rule_prep``).  bf16 cumsum storage accumulates too much
-  error because ``|sum(g)| ~ 0.5 * BT`` makes the bf16 ulp of the exponent
-  huge compared with ``exp(g_i - g_j)``.
+"""Ascend prep kernel for GDN v1: chunk-local cumsum, KKT and solve_tril.
 """
 
 from __future__ import annotations

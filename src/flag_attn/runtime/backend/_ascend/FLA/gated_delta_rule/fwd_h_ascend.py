@@ -2,25 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Ascend-only ``chunk_gated_delta_rule_fwd_h`` for GDN v1.
-
-Same recurrence as ``flag_attn.FLA.chunk_delta_h`` (per chunk ``i_t``:
-``v_new = u - w h``, ``h <- exp(g_last) h + k^T (v_new * exp(g_last - g))``,
-storing the chunk-start state ``h`` for ``chunk_o``), with three Ascend
-changes; the generic module is left untouched:
-
-* **No autotune.**  The generic wrapper searched 4 warps * 3 stages * 2 BV = 24
-  configs per shape key, which costs a long per-process cold start while the
-  kernel only has ``V/BV * N*H`` programs.
-* **K is a single tile.**  The generic kernel keeps ``64 x BV`` fp32 state
-  tiles (``b_h1..b_h4``) and walks K in 64-wide slabs; for K=128 that is two
-  slabs, two cube dots per chunk and two state stores/loads.  Here the state
-  tile is ``K x BV`` (single tile for K<=128) so each chunk is one ``BT x K @
-  K x BV`` dot and one ``K x BT @ BT x BV`` dot (no loop-carried accumulator
-  over K slabs).
-* **V-axis splitting** (``bv``): the recurrence is sequential over chunks, so
-  the only parallelism is over the ``V/BV`` state column tiles times ``N*H``
-  heads.  Fewer, larger programs win on this backend, so ``bv`` defaults to 64
-  at BT=64 (an empirical value for this backend).
 """
 
 from __future__ import annotations

@@ -1,67 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fused Ascend stages for the GDN v1 fast path.
-
-The pipeline is three Triton launches:
-
-1. ``fold`` (grid ``(chunks, B*H)``) -- a **vector-only** kernel: chunk-local
-   cumsum (fp32), then all per-token decay/beta folds written out in the
-   input dtype (FP32 for FP16 inputs): ``q_e = q*exp(g)``,
-   ``k_e = k*beta*exp(g)``, ``k_r = k*exp(-g)``,
-   ``v_beta = v*beta``, ``k_s = k*exp(G-g)`` (``G`` = chunk-total log decay, so
-   the state recurrence becomes ``h <- exp(G) h + k_s @ v_new`` with no
-   per-token decay in the sequential loop).  No ``tl.dot`` in this kernel.
-2. ``prep_w_u`` (grid ``(chunks, B*H)``) -- a **cube-only** kernel: KKT
-   ``L = k_e @ k_r^T``, Newton inverse, ``A = tril(q_e @ k_r^T)``,
-   ``w = A_inv @ k_e`` and ``u = A_inv @ v_beta`` from block-pointer loads.
-   ``A_inv`` never hits GM.
-3. ``fwd_h_o`` (grid ``(V/BV, N*H)``) -- state scan fused with the output
-   stage; ``h`` and ``v_new`` never hit GM.
-
-Why fold and prep are separate kernels
---------------------------------------
-``prep_w_u`` is cube-only because both of its 2D dot operands (``k_e`` and
-``k_r``) come straight from GM as tiles.  A dot operand produced by the vector
-pipeline has to be re-laid out before it can feed a cube dot, which is
-expensive per program per tile on this backend; feeding the same folded values
-into *stores* (vector layout) is cheap.  The folds therefore live in a vector
-kernel and the prep kernel stays cube-only.
-
-The fold itself is split into ``factor`` + ``fold`` because several vector
-patterns serialize across the grid on this backend instead of running in
-parallel: a bf16 2D gather, two or more 2D gathers, and arithmetic on a 1D
-vector (e.g. ``exp``) whose result is then broadcast into a 2D tile.
-Block-ptr 2D loads/stores, 2D ``cumsum``, multiple stores and plain 1D-load +
-``[:, None]`` broadcast multiplies all parallelize fine.
-
-The fold is therefore two kernels:
-
-* ``factor``: 1D only -- ``g_cum``, ``exp(g_cum)``, ``exp(-g_cum)``, fp32
-  ``beta`` and ``beta*exp(g_cum)``, each written to a 1D fp32 buffer;
-* ``fold``: plain 1D block loads of those buffers + ``[:, None]`` broadcast
-  multiplies + 4 stores.  No 1D arithmetic is ever broadcast, no gathers.
-
-Fast-path invariants (see ``wy_fast_ascend.py``): fp32 buffers for
-anything gathered as a 2D tile, so 2D gathers read fp32 rather than fp16/bf16;
-gathered factors never feed a dot; K must cover the whole head dimension in a
-single dot tile; multi-trip dot loops are unreliable on this backend; no
-autotune.
-
-Two-pass state scan (``_affine_kernel`` + ``_fwd_h_o_2pass_kernel``, enabled for
-``NT >= 32`` / ``FLAG_ATTN_ASCEND_GDN_TWOPASS=1``)
-    The delta-rule chunk recurrence is affine *with a matrix transition*:
-    ``S' = a S + kr (u - w S) = (a I - a kr w) S + a kr u``.  Pass 1
-    (chunk-parallel) precomputes ``qe2 = qe - A w``, ``Au = A u``,
-    ``Cu = kr u`` and ``Mw = kr w``; pass 2 then needs only two dots per chunk
-    (``o = qe2 S + Au``, ``S' = a (S + Cu - Mw S)``) instead of four, halving
-    the serial chain.  Note that dropping the ``Mw S`` term (i.e. using only
-    ``C_c = sum_j exp(G-g_j) k_j u_j^T`` and scalar prefix factors) is *not*
-    exact; a fully parallel prefix scan would have to compose the K x K
-    matrices per chunk and is more expensive than the sequential scan at these
-    sizes.  The affine pass costs extra device time plus a host launch, so the
-    two-pass path is enabled only once the serial chain is long (NT >= 32);
-    below that it is a net loss.
+"""Fused Ascend stages for the GDN v1 fast path: fold, prep_w_u and fwd_h_o.
 """
 
 from __future__ import annotations
