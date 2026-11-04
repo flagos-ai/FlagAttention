@@ -21,8 +21,8 @@ row counts and avoid carrying a source-logit tile through the scoring loop.
 
 The mixture kernel computes the source log-sum-exp for its row batch, writes
 it to ``lse``, then streams column tiles to form the weighted
-mixture. With output RMSNorm, it accumulates the fp32 mixture's norm and scales
-an fp32 scratch mixture in a final loop before storing the output.
+mixture. With output RMSNorm, it accumulates the norm in fp32 and reuses the
+output buffer for the intermediate mixture before scaling it in a final loop.
 """
 
 from __future__ import annotations
@@ -88,7 +88,6 @@ def _mix_kernel(
     lse,
     output_rms_weight,
     output,
-    mixture,
     N,
     L: tl.constexpr,
     D: tl.constexpr,
@@ -141,22 +140,17 @@ def _mix_kernel(
         output_offsets = rows[:, None] * D + cols[None, :]
         if HAS_ONORM:
             squared_norm += tl.sum(accumulator * accumulator, axis=1)
-            if EVEN:
-                tl.store(mixture + output_offsets, accumulator)
-            else:
-                tl.store(mixture + output_offsets, accumulator, mask=rows[:, None] < N)
+        if EVEN:
+            tl.store(output + output_offsets, accumulator.to(output.dtype.element_ty))
         else:
-            if EVEN:
-                tl.store(output + output_offsets, accumulator.to(output.dtype.element_ty))
-            else:
-                tl.store(
-                    output + output_offsets,
-                    accumulator.to(output.dtype.element_ty),
-                    mask=rows[:, None] < N,
-                )
+            tl.store(
+                output + output_offsets,
+                accumulator.to(output.dtype.element_ty),
+                mask=rows[:, None] < N,
+            )
 
     if HAS_ONORM:
-        # Normalize the fp32 mixture before casting to the output dtype.
+        # Reuse the stored mixture rather than allocating a separate scratch.
         row_scale = tl.rsqrt(squared_norm / D + eps)
         tail = tl.arange(0, TB)
         for block in tl.range(0, D // TB):
@@ -164,11 +158,11 @@ def _mix_kernel(
             output_values = tl.load(output_rms_weight + cols).to(tl.float32)
             offsets = rows[:, None] * D + cols[None, :]
             if EVEN:
-                accumulated = tl.load(mixture + offsets)
+                accumulated = tl.load(output + offsets).to(tl.float32)
             else:
                 accumulated = tl.load(
-                    mixture + offsets, mask=rows[:, None] < N, other=0.0
-                )
+                    output + offsets, mask=rows[:, None] < N, other=0.0
+                ).to(tl.float32)
             normalized = accumulated * row_scale[:, None] * output_values[None, :]
             if EVEN:
                 tl.store(output + offsets, normalized.to(output.dtype.element_ty))
@@ -224,20 +218,15 @@ def plan(hidden_size: int, num_rows: int, num_sources: int, has_onorm: bool) -> 
     return config
 
 
-def launch(values, config, *, eps: float, scale: float, has_onorm: bool, mixture=None) -> None:
+def launch(values, config, *, eps: float, scale: float, has_onorm: bool) -> None:
     """Launch both passes with the standard Triton launch interface.
 
     ``values`` contains query, residual0, residual_ptrs, rms_weight,
-    output_rms_weight, output, logit, lse, and num_rows. ``mixture`` is
-    fp32 scratch storage required when output RMSNorm is enabled.
+    output_rms_weight, output, logit, lse, and num_rows.
     """
-    if has_onorm and mixture is None:
-        raise ValueError("output RMSNorm requires fp32 mixture scratch")
     num_rows = values[8]
     score_values = [values[i] for i in (0, 1, 2, 3, 6, 8)]
-    mix_values = [values[i] for i in (1, 2, 6, 7, 4, 5)]
-    # An unused pointer is still passed for the specialization without RMSNorm.
-    mix_values.extend((mixture if has_onorm else values[5], num_rows))
+    mix_values = [values[i] for i in (1, 2, 6, 7, 4, 5, 8)]
     _score_kernel[(config["L"] * triton.cdiv(num_rows, config["BR1"]),)](
         *score_values,
         D=config["D"], BR=config["BR1"], BDB=config["BDB1"],

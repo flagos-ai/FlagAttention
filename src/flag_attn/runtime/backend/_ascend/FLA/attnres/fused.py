@@ -322,7 +322,6 @@ def fused_attnres(
                 eps=rms_eps,
                 scale=scale,
                 has_onorm=output_rms_weight is not None,
-                mixture=torch.empty_like(output, dtype=torch.float32) if output_rms_weight is not None else None,
             )
         else:
             _fused_attnres_fwd_kernel[(num_rows,)](*values, **constexprs)
