@@ -19,9 +19,8 @@ sources in a tuple kernel argument. triton-ascend has no tuple-of-tensor
 arguments, so the sources stay as separate tensors: the host passes a small
 int64 table of their base addresses and the kernel casts each entry back to a
 pointer, which avoids materialising a stacked copy of the residuals. A single
-source is read directly, and the launch goes through a cached raw launcher
-because the device time of this one-kernel operator is small enough that
-Triton's per-call Python launch path dominates.
+source is read directly. Kernels use the standard Triton launch interface so
+specialization, hooks and backend launch behavior remain under Triton's control.
 
 The single-row kernel is bound by fp32 vector throughput rather than bandwidth,
 so with several sources it rotates two residual buffers to overlap the next
@@ -29,10 +28,9 @@ source's load with the current source's arithmetic, and it folds the trailing
 RMSNorm into the softmax denominator to keep that epilogue to one full-width
 pass.
 
-One row per program caps that kernel near 380 GB/s of the ~1.08 TB/s this part
-can reach, so wide row counts (>= ``_TWO_PASS_MIN_ROWS``) are handed to
-``two_pass``: row-batched kernels that score every source once with [BR, BDB]
-tiles and then mix them in a second pass, both at the HBM ceiling.
+Wide row counts (>= ``_TWO_PASS_MIN_ROWS``) are handed to ``two_pass``:
+row-batched kernels that score every source once with [BR, BDB] tiles and
+then mix them in a second pass to improve memory access efficiency.
 """
 
 from __future__ import annotations
@@ -43,23 +41,20 @@ import torch
 import triton
 import triton.language as tl
 
-from . import fast_launch as _fast_launch
 from . import two_pass as _two_pass
 
 _INT32_MAX = 2**31 - 1
 
-# The row-batched path reads the sources twice, so it only pays off once the row
-# count keeps both passes at the HBM ceiling. Measured on D=7168 with the
-# benchmark protocol, cost relative to the single-row kernel: 1.45x at N=128/256,
-# 1.09x at N=512, 0.70x at N=1024, 0.39x at N=2048 and 0.87x for 9x8192.
+# Two passes trade another launch and source read for larger vector tiles.
+# Public-API comparisons at D=7168 favor this path from 1024 rows on the
+# measured shapes; keep smaller row counts on the single-pass kernel.
 _TWO_PASS_MIN_ROWS = 1024
 
 _BD_CACHE: dict = {}
-_LAUNCH_SITE: dict = {}
 
-# Small per-call address tables are reused when a caller keeps the same residual
-# tensors across steps (the common decode/benchmark case); the key holds the
-# exact addresses, so a rebuilt allocation can never alias a stale table.
+# Reuse immutable address tables only on their allocation stream. On eviction,
+# the allocator then keeps the table alive until that stream's reads finish;
+# callers never need to manage the lifetime of this internal tensor.
 _PTR_TABLE_CACHE: dict = {}
 _MAX_PTR_TABLES = 64
 
@@ -80,10 +75,12 @@ def _flat_1d(tensor: torch.Tensor) -> torch.Tensor:
 
 def _residual_ptr_table(flat_residuals: Sequence[torch.Tensor]) -> torch.Tensor:
     ptrs = tuple(residual.data_ptr() for residual in flat_residuals)
-    key = (flat_residuals[0].device, ptrs)
+    device = flat_residuals[0].device
+    stream = torch.npu.current_stream(device)
+    key = (device, stream.npu_stream, ptrs)
     table = _PTR_TABLE_CACHE.get(key)
     if table is None:
-        table = torch.tensor(list(ptrs), dtype=torch.int64, device=flat_residuals[0].device)
+        table = torch.tensor(list(ptrs), dtype=torch.int64, device=device)
         if len(_PTR_TABLE_CACHE) >= _MAX_PTR_TABLES:
             _PTR_TABLE_CACHE.clear()
         _PTR_TABLE_CACHE[key] = table
@@ -110,7 +107,6 @@ def _fused_attnres_fwd_kernel(
     RETURN_WEIGHTS: tl.constexpr,
     SINGLE: tl.constexpr,
     PREFETCH: tl.constexpr,
-    NOMAX: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets_d = tl.arange(0, BD)
@@ -157,20 +153,12 @@ def _fused_attnres_fwd_kernel(
         source_logit = tl.sum(residual_values * query_weight) * rstd
         source_score = source_logit * scale
 
-        if NOMAX:
-            # With the standard scale (1/sqrt(D)) the scores are O(1) after RMS
-            # normalisation, so the max subtraction and its rescale tile are
-            # redundant; dropping them removes one full-width vector op.
-            probability = tl.exp(source_score)
-            running_sum += probability
-            output_values += probability * residual_values
-        else:
-            previous_max = running_max
-            running_max = tl.maximum(running_max, source_score)
-            rescale = tl.exp(previous_max - running_max)
-            probability = tl.exp(source_score - running_max)
-            running_sum = running_sum * rescale + probability
-            output_values = output_values * rescale + probability * residual_values
+        previous_max = running_max
+        running_max = tl.maximum(running_max, source_score)
+        rescale = tl.exp(previous_max - running_max)
+        probability = tl.exp(source_score - running_max)
+        running_sum = running_sum * rescale + probability
+        output_values = output_values * rescale + probability * residual_values
 
         if RETURN_WEIGHTS:
             tl.store(logit + source * N + row, source_logit)
@@ -191,10 +179,7 @@ def _fused_attnres_fwd_kernel(
 
     tl.store(output + row * D + offsets_d, output_values.to(output.dtype.element_ty), mask=mask_d)
     if RETURN_WEIGHTS:
-        if NOMAX:
-            tl.store(lse + row, tl.log(running_sum))
-        else:
-            tl.store(lse + row, running_max + tl.log(running_sum))
+        tl.store(lse + row, running_max + tl.log(running_sum))
 
 
 def _validate_inputs(
@@ -246,30 +231,6 @@ def _prefetch_enabled(num_sources: int, has_output_norm: bool) -> bool:
     tile on this device, so output-norm specializations keep the plain loop.
     """
     return num_sources > 1 and not has_output_norm
-
-
-def _launch(grid, values, constexprs) -> None:
-    """Launch through the cached raw launcher; fall back to Triton when needed."""
-    key = (
-        grid,
-        values[0].dtype,
-        values[0].device,
-        constexprs["L"],
-        constexprs["D"],
-        constexprs["BD"],
-        constexprs["eps"],
-        constexprs["scale"],
-        constexprs["HAS_ONORM"],
-        constexprs["RETURN_WEIGHTS"],
-        constexprs["SINGLE"],
-        constexprs["PREFETCH"],
-        constexprs["NOMAX"],
-    )
-    entry = _LAUNCH_SITE.get(key)
-    if entry is None:
-        entry = _fast_launch.build(_fused_attnres_fwd_kernel, grid, values, constexprs)
-        _LAUNCH_SITE[key] = entry
-    entry(values)
 
 
 def fused_attnres(
@@ -353,7 +314,6 @@ def fused_attnres(
             RETURN_WEIGHTS=return_weights,
             SINGLE=single,
             PREFETCH=_prefetch_enabled(len(residuals), output_rms_weight is not None),
-            NOMAX=scale <= hidden_size ** -0.5,
         )
         if plan is not None:
             _two_pass.launch(
@@ -362,15 +322,17 @@ def fused_attnres(
                 eps=rms_eps,
                 scale=scale,
                 has_onorm=output_rms_weight is not None,
-                nomax=constexprs["NOMAX"],
+                mixture=torch.empty_like(output, dtype=torch.float32) if output_rms_weight is not None else None,
             )
         else:
-            _launch((num_rows,), values, constexprs)
+            _fused_attnres_fwd_kernel[(num_rows,)](*values, **constexprs)
 
     if output.shape != output_shape:
         output = output.view(output_shape)
     if return_weights:
-        probability = (logit * scale - lse[None, :]).exp()
+        # A stable softmax preserves the normalization even when a large logit
+        # makes the fp32 LSE unable to represent its small log-normalizer.
+        probability = (logit * scale).softmax(dim=0)
         return output, probability.view(len(residuals), *output_shape[:-1])
     return output
 

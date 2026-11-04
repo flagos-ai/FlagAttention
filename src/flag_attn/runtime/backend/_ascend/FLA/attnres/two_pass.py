@@ -20,13 +20,9 @@ reducing once. Independent sources fill otherwise idle vector cores at small
 row counts and avoid carrying a source-logit tile through the scoring loop.
 
 The mixture kernel computes the source log-sum-exp for its row batch, writes
-it for ``return_weights``, then streams column tiles to form the weighted
+it to ``lse``, then streams column tiles to form the weighted
 mixture. With output RMSNorm, it accumulates the fp32 mixture's norm and scales
-the stored output in a final loop. This retains the existing extra rounding
-of the intermediate mixture to the output dtype.
-
-Both stages use cached raw launchers. Their cache key includes the row count
-because it determines both launch grids, as well as every specialization.
+an fp32 scratch mixture in a final loop before storing the output.
 """
 
 from __future__ import annotations
@@ -34,10 +30,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-from . import fast_launch as _fast_launch
-
 _PLANS: dict = {}
-_LAUNCH_SITE: dict = {}
 
 
 @triton.jit
@@ -95,6 +88,7 @@ def _mix_kernel(
     lse,
     output_rms_weight,
     output,
+    mixture,
     N,
     L: tl.constexpr,
     D: tl.constexpr,
@@ -105,7 +99,6 @@ def _mix_kernel(
     eps: tl.constexpr,
     HAS_ONORM: tl.constexpr,
     LP: tl.constexpr,
-    NOMAX: tl.constexpr,
     EVEN: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -120,11 +113,9 @@ def _mix_kernel(
     # Mask after scaling: padded -inf logits become NaN at scale=0 or +inf
     # at negative scales, and must never participate in the source reduction.
     scores = tl.where(sources[None, :] < L, logits * scale, -float("inf"))
-    if NOMAX:
-        row_lse = tl.log(tl.sum(tl.exp(scores), axis=1))
-    else:
-        row_max = tl.max(scores, axis=1)
-        row_lse = row_max + tl.log(tl.sum(tl.exp(scores - row_max[:, None]), axis=1))
+    row_max = tl.max(scores, axis=1)
+    row_sum = tl.sum(tl.exp(scores - row_max[:, None]), axis=1)
+    row_lse = row_max + tl.log(row_sum)
     tl.store(lse + rows, row_lse, mask=rows < N)
 
     # The weights are the normalised softmax, so the mixture needs no further
@@ -135,7 +126,9 @@ def _mix_kernel(
         accumulator = tl.zeros([BR, BDB], tl.float32)
         for source in tl.range(0, L):
             source_logit = tl.load(logit + source * N + rows, mask=rows < N, other=0.0)
-            probability = tl.exp(source_logit * scale - row_lse)
+            # Normalize shifted exponentials directly: subtracting a rounded
+            # large LSE would lose the small log-normalizer between close scores.
+            probability = tl.exp(source_logit * scale - row_max) / row_sum
             residual_ptr = tl.cast(tl.load(residual_ptrs + source), residual0.dtype)
             offsets = rows[:, None] * D + cols[None, :]
             if EVEN:
@@ -145,22 +138,25 @@ def _mix_kernel(
                     residual_ptr + offsets, mask=rows[:, None] < N, other=0.0
                 )
             accumulator = tl.fma(probability[:, None], residual_values.to(tl.float32), accumulator)
+        output_offsets = rows[:, None] * D + cols[None, :]
         if HAS_ONORM:
             squared_norm += tl.sum(accumulator * accumulator, axis=1)
-        output_offsets = rows[:, None] * D + cols[None, :]
-        if EVEN:
-            tl.store(output + output_offsets, accumulator.to(output.dtype.element_ty))
+            if EVEN:
+                tl.store(mixture + output_offsets, accumulator)
+            else:
+                tl.store(mixture + output_offsets, accumulator, mask=rows[:, None] < N)
         else:
-            tl.store(
-                output + output_offsets,
-                accumulator.to(output.dtype.element_ty),
-                mask=rows[:, None] < N,
-            )
+            if EVEN:
+                tl.store(output + output_offsets, accumulator.to(output.dtype.element_ty))
+            else:
+                tl.store(
+                    output + output_offsets,
+                    accumulator.to(output.dtype.element_ty),
+                    mask=rows[:, None] < N,
+                )
 
     if HAS_ONORM:
-        # The RMSNorm needs the finished row, so the mixture above is stored
-        # unnormalised and this loop folds the scale in. ``output`` is 117 MB
-        # for the largest case, i.e. still in the 168 MB L2.
+        # Normalize the fp32 mixture before casting to the output dtype.
         row_scale = tl.rsqrt(squared_norm / D + eps)
         tail = tl.arange(0, TB)
         for block in tl.range(0, D // TB):
@@ -168,12 +164,12 @@ def _mix_kernel(
             output_values = tl.load(output_rms_weight + cols).to(tl.float32)
             offsets = rows[:, None] * D + cols[None, :]
             if EVEN:
-                accumulated = tl.load(output + offsets).to(tl.float32)
+                accumulated = tl.load(mixture + offsets)
             else:
                 accumulated = tl.load(
-                    output + offsets, mask=rows[:, None] < N, other=0.0
-                ).to(tl.float32)
-            normalized = accumulated * output_values[None, :] * row_scale[:, None]
+                    mixture + offsets, mask=rows[:, None] < N, other=0.0
+                )
+            normalized = accumulated * row_scale[:, None] * output_values[None, :]
             if EVEN:
                 tl.store(output + offsets, normalized.to(output.dtype.element_ty))
             else:
@@ -206,8 +202,7 @@ def plan(hidden_size: int, num_rows: int, num_sources: int, has_onorm: bool) -> 
     # two [BR, BDB] fp32 accumulators plus one residual tile live.  A 128-wide
     # block keeps that footprint small enough to stay under the UB budget with
     # 32 rows per program, which measured fastest both at 1024 and 8192 rows.
-    row_batch = 32 if num_rows % 32 == 0 else (16 if num_rows % 16 == 0 else 8)
-    row_batch = row_batch if num_rows % row_batch == 0 else 1
+    row_batch = 32
     block_b = min(128, lowbit)
     config = dict(
         L=num_sources,
@@ -216,8 +211,7 @@ def plan(hidden_size: int, num_rows: int, num_sources: int, has_onorm: bool) -> 
         BDB1=block_b,
         EVEN1=num_rows % row_batch == 0,
         # Pass 2 needs an accumulator *and* a source tile live, and its best
-        # measured point is BR=8/BDB=1024 (1.09 ms, 1082 GB/s = HBM ceiling);
-        # BR=16/BDB=512 reaches the same bandwidth but leaves the tail less room.
+        # measured point is BR=8/BDB=1024; BR=16/BDB=512 leaves the tail less room.
         BR2=8,
         BDB2=min(1024, lowbit),
         EVEN2=num_rows % 8 == 0,
@@ -230,76 +224,31 @@ def plan(hidden_size: int, num_rows: int, num_sources: int, has_onorm: bool) -> 
     return config
 
 
-def launch(values, config, *, eps: float, scale: float, has_onorm: bool, nomax: bool) -> None:
-    """Launch both passes through the cached raw launcher.
+def launch(values, config, *, eps: float, scale: float, has_onorm: bool, mixture=None) -> None:
+    """Launch both passes with the standard Triton launch interface.
 
-    ``values`` is ordered as the public entry point builds it::
-
-        query, residual0, residual_ptrs, rms_weight, output_rms_weight,
-        output, logit, lse, num_rows
+    ``values`` contains query, residual0, residual_ptrs, rms_weight,
+    output_rms_weight, output, logit, lse, and num_rows. ``mixture`` is
+    fp32 scratch storage required when output RMSNorm is enabled.
     """
+    if has_onorm and mixture is None:
+        raise ValueError("output RMSNorm requires fp32 mixture scratch")
     num_rows = values[8]
     score_values = [values[i] for i in (0, 1, 2, 3, 6, 8)]
-    mix_values = [values[i] for i in (1, 2, 6, 7, 4, 5, 8)]
-    key = (
-        num_rows,
-        values[0].dtype,
-        values[0].device,
-        config["L"],
-        config["D"],
-        config["BR1"],
-        config["BDB1"],
-        config["BR2"],
-        config["BDB2"],
-        config["TB"],
-        config["LP"],
-        config["EVEN1"],
-        config["EVEN2"],
-        eps,
-        scale,
-        has_onorm,
-        nomax,
+    mix_values = [values[i] for i in (1, 2, 6, 7, 4, 5)]
+    # An unused pointer is still passed for the specialization without RMSNorm.
+    mix_values.extend((mixture if has_onorm else values[5], num_rows))
+    _score_kernel[(config["L"] * triton.cdiv(num_rows, config["BR1"]),)](
+        *score_values,
+        D=config["D"], BR=config["BR1"], BDB=config["BDB1"],
+        eps=eps, EVEN=config["EVEN1"],
     )
-    entry = _LAUNCH_SITE.get(key)
-    if entry is None:
-        entry = (
-            _fast_launch.build(
-                _score_kernel,
-                (config["L"] * triton.cdiv(num_rows, config["BR1"]),),
-                score_values,
-                dict(
-                    D=config["D"],
-                    BR=config["BR1"],
-                    BDB=config["BDB1"],
-                    eps=eps,
-                    EVEN=config["EVEN1"],
-                ),
-            ),
-            _fast_launch.build(
-                _mix_kernel,
-                (triton.cdiv(num_rows, config["BR2"]),),
-                mix_values,
-                dict(
-                    L=config["L"],
-                    D=config["D"],
-                    BR=config["BR2"],
-                    BDB=config["BDB2"],
-                    TB=config["TB"],
-                    scale=scale,
-                    eps=eps,
-                    HAS_ONORM=has_onorm,
-                    LP=config["LP"],
-                    NOMAX=nomax,
-                    EVEN=config["EVEN2"],
-                ),
-            ),
-        )
-        if len(_LAUNCH_SITE) >= 64:
-            _LAUNCH_SITE.clear()
-        _LAUNCH_SITE[key] = entry
-    score, mix = entry
-    score(score_values)
-    mix(mix_values)
+    _mix_kernel[(triton.cdiv(num_rows, config["BR2"]),)](
+        *mix_values,
+        L=config["L"], D=config["D"], BR=config["BR2"], BDB=config["BDB2"],
+        TB=config["TB"], scale=scale, eps=eps, HAS_ONORM=has_onorm,
+        LP=config["LP"], EVEN=config["EVEN2"],
+    )
 
 
 __all__ = ["plan", "launch"]
