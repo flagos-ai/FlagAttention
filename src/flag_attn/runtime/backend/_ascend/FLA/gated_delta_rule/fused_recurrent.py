@@ -677,10 +677,3 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     finally:
         end_forward()
     return out, initial_state
-
-
-__all__ = [
-    "fused_recurrent_gated_delta_rule_fwd",
-    "fused_recurrent_gated_delta_rule_fwd_decode",
-    "fused_recurrent_gated_delta_rule_packed_decode",
-]
