@@ -12,47 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Row-batched two-pass AttnRes kernels for Ascend.
+"""Row-batched score and mixture kernels for Ascend AttnRes.
 
-``fused_attnres`` has to score every residual source before it can weight any of
-them, so a one-row-per-program kernel streams the sources twice through the
-vector pipeline at well under the HBM ceiling (measured ~380 GB/s against
-~1.08 TB/s achievable on this part): one row leaves too little work per DMA.
+The score grid spans both residual sources and row batches. Each program
+streams one source, accumulating its row norms and query dots in fp32 before
+reducing once. Independent sources fill otherwise idle vector cores at small
+row counts and avoid carrying a source-logit tile through the scoring loop.
 
-Here the operator is split into two row-batched kernels:
+The mixture kernel computes the source log-sum-exp for its row batch, writes
+it for ``return_weights``, then streams column tiles to form the weighted
+mixture. With output RMSNorm, it accumulates the fp32 mixture's norm and scales
+the stored output in a final loop. This retains the existing extra rounding
+of the intermediate mixture to the output dtype.
 
-``_score_kernel``
-    Streams every source once with ``[BR, BDB]`` tiles and accumulates
-    ``sum(r^2)`` and ``dot(r, q*w)`` per source, holding one row batch of
-    residuals in the unified buffer at a time (BR=16/BDB=1024 is 64 KB of fp32
-    and measured fastest). The raw logits and the log-sum-exp of the source
-    softmax are written out; they are exactly what
-    ``fused_attnres(..., return_weights=True)`` returns, so the weights path
-    costs nothing extra.
-
-``_mix_kernel``
-    Streams the sources again and accumulates ``sum(p * r)`` block by block,
-    reading each source's probability from the logits in global memory (that
-    read is 32 B per program per block, and keeping the weights out of the
-    unified buffer is what lets this pass run at the HBM ceiling). The mixture
-    is written once. With the trailing RMSNorm fused in, its row sum of squares
-    is accumulated on the fly and one extra in-kernel loop re-reads the (still
-    L2-resident) output, scales it and writes it back.
-
-Two kernels rather than one: the unified buffer only holds ~190 KB, and the
-compiler keeps each loop's tiles live across the whole program, so a single
-kernel has to trade pass 1's tile against pass 2's. Measured on L9_N8192, that
-trade costs 0.66 ms (pass 1 drops from 1.53 ms at BR=16/BDB=1024 to 2.19 ms at
-BR=8) -- far more than the ~21 us of the extra launch.
-
-Numerics: pass 1 accumulates in fp32 from bf16 products, and the caller's
-weights come out at <= 3.6e-7 absolute (5e-5 allowed). The fused RMSNorm does
-round the *mixture* to the output dtype before rescaling it, so its output
-carries one extra rounding step (<= 1 ulp) compared with the single-row kernel:
-the benchmark tolerance (atol 5e-3, rtol 1e-2) sees no violation, while the
-unit-test tolerance (atol = rtol = 5e-3) sees ~0.25% of the elements at 1 ulp
-on the 9x8192 case. Keeping the mixture in fp32 would cost +0.23 GB of traffic
-(~0.25 ms) and would blow the L9 budget by more than it saves.
+Both stages use cached raw launchers. Their cache key includes the row count
+because it determines both launch grids, as well as every specialization.
 """
 
 from __future__ import annotations
@@ -73,72 +47,44 @@ def _score_kernel(
     residual_ptrs,
     rms_weight,
     logit,
-    lse,
     N,
-    L: tl.constexpr,
     D: tl.constexpr,
     BR: tl.constexpr,
     BDB: tl.constexpr,
-    LP: tl.constexpr,
     eps: tl.constexpr,
-    scale: tl.constexpr,
-    NOMAX: tl.constexpr,
     EVEN: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    rows = pid * BR + tl.arange(0, BR)
-    sources = tl.arange(0, LP)
+    groups = tl.cdiv(N, BR)
+    source = pid // groups
+    rows = (pid % groups) * BR + tl.arange(0, BR)
     blocks = tl.arange(0, BDB)
-
-    # The logits ride along as one [BR, LP] tile (a few hundred bytes) so the
-    # log-sum-exp below needs no second global round trip, while the two
-    # reduction accumulators stay per-source row vectors: carrying them through
-    # a block-outer loop as tiles measured 0.25 ms slower on L9_N8192.
-    logits = tl.zeros([BR, LP], tl.float32)
-
-    for source in tl.range(0, L):
-        residual_ptr = tl.cast(tl.load(residual_ptrs + source), residual0.dtype)
-        # Two [BR, BDB] tiles accumulate the products over the whole row and are
-        # reduced once per source; reducing per block instead costs one extra
-        # full-width op per block (measured ~10% of pass 1 on L9_N8192).
-        acc_square = tl.zeros([BR, BDB], tl.float32)
-        acc_dot = tl.zeros([BR, BDB], tl.float32)
-        for block in tl.range(0, D // BDB):
-            cols = block * BDB + blocks
-            query_values = tl.load(query + cols).to(tl.float32)
-            weight_values = tl.load(rms_weight + cols).to(tl.float32)
-            query_weight = query_values * weight_values
-            offsets = rows[:, None] * D + cols[None, :]
-            if EVEN:
-                residual_values = tl.load(residual_ptr + offsets)
-            else:
-                residual_values = tl.load(
-                    residual_ptr + offsets, mask=rows[:, None] < N, other=0.0
-                )
-            residual_values = residual_values.to(tl.float32)
-            acc_square = tl.fma(residual_values, residual_values, acc_square)
-            acc_dot = tl.fma(residual_values, query_weight[None, :], acc_dot)
-        source_logit = tl.sum(acc_dot, axis=1) * tl.rsqrt(tl.sum(acc_square, axis=1) / D + eps)
+    residual_ptr = tl.cast(tl.load(residual_ptrs + source), residual0.dtype)
+    # Two [BR, BDB] tiles accumulate the products over the whole row and are
+    # reduced once per source; reducing per block instead costs one extra
+    # full-width op per block (measured ~10% of pass 1 on L9_N8192).
+    acc_square = tl.zeros([BR, BDB], tl.float32)
+    acc_dot = tl.zeros([BR, BDB], tl.float32)
+    for block in tl.range(0, D // BDB):
+        cols = block * BDB + blocks
+        query_values = tl.load(query + cols).to(tl.float32)
+        weight_values = tl.load(rms_weight + cols).to(tl.float32)
+        query_weight = query_values * weight_values
+        offsets = rows[:, None] * D + cols[None, :]
         if EVEN:
-            tl.store(logit + source * N + rows, source_logit)
+            residual_values = tl.load(residual_ptr + offsets)
         else:
-            tl.store(logit + source * N + rows, source_logit, mask=rows < N)
-        logits = tl.where(sources[None, :] == source, source_logit[:, None], logits)
-
-    masked = sources[None, :] < L
-    if NOMAX:
-        # With the standard scale (1/sqrt(D)) the scores stay O(1) after RMS
-        # normalisation, so the max shift is redundant; the single-row kernel
-        # makes the same choice and both must agree for ``return_weights``.
-        row_lse = tl.log(tl.sum(tl.where(masked, tl.exp(logits * scale), 0.0), axis=1))
-    else:
-        scores = tl.where(masked, logits * scale, -float("inf"))
-        row_max = tl.max(scores, axis=1)
-        row_lse = row_max + tl.log(tl.sum(tl.exp(scores - row_max[:, None]), axis=1))
+            residual_values = tl.load(
+                residual_ptr + offsets, mask=rows[:, None] < N, other=0.0
+            )
+        residual_values = residual_values.to(tl.float32)
+        acc_square = tl.fma(residual_values, residual_values, acc_square)
+        acc_dot = tl.fma(residual_values, query_weight[None, :], acc_dot)
+    source_logit = tl.sum(acc_dot, axis=1) * tl.rsqrt(tl.sum(acc_square, axis=1) / D + eps)
     if EVEN:
-        tl.store(lse + rows, row_lse)
+        tl.store(logit + source * N + rows, source_logit)
     else:
-        tl.store(lse + rows, row_lse, mask=rows < N)
+        tl.store(logit + source * N + rows, source_logit, mask=rows < N)
 
 
 @triton.jit
@@ -158,12 +104,28 @@ def _mix_kernel(
     scale: tl.constexpr,
     eps: tl.constexpr,
     HAS_ONORM: tl.constexpr,
+    LP: tl.constexpr,
+    NOMAX: tl.constexpr,
     EVEN: tl.constexpr,
 ):
     pid = tl.program_id(0)
     rows = pid * BR + tl.arange(0, BR)
     blocks = tl.arange(0, BDB)
-    row_lse = tl.load(lse + rows)
+    sources = tl.arange(0, LP)
+    logits = tl.load(
+        logit + sources[None, :] * N + rows[:, None],
+        mask=(sources[None, :] < L) & (rows[:, None] < N),
+        other=-float("inf"),
+    )
+    # Mask after scaling: padded -inf logits become NaN at scale=0 or +inf
+    # at negative scales, and must never participate in the source reduction.
+    scores = tl.where(sources[None, :] < L, logits * scale, -float("inf"))
+    if NOMAX:
+        row_lse = tl.log(tl.sum(tl.exp(scores), axis=1))
+    else:
+        row_max = tl.max(scores, axis=1)
+        row_lse = row_max + tl.log(tl.sum(tl.exp(scores - row_max[:, None]), axis=1))
+    tl.store(lse + rows, row_lse, mask=rows < N)
 
     # The weights are the normalised softmax, so the mixture needs no further
     # division and the fused RMSNorm reduces to rsqrt(mean(out^2) + eps).
@@ -172,7 +134,8 @@ def _mix_kernel(
         cols = block * BDB + blocks
         accumulator = tl.zeros([BR, BDB], tl.float32)
         for source in tl.range(0, L):
-            probability = tl.exp(tl.load(logit + source * N + rows) * scale - row_lse)
+            source_logit = tl.load(logit + source * N + rows, mask=rows < N, other=0.0)
+            probability = tl.exp(source_logit * scale - row_lse)
             residual_ptr = tl.cast(tl.load(residual_ptrs + source), residual0.dtype)
             offsets = rows[:, None] * D + cols[None, :]
             if EVEN:
@@ -239,7 +202,7 @@ def plan(hidden_size: int, num_rows: int, num_sources: int, has_onorm: bool) -> 
         # a large power-of-two divisor leave the DMA too little to stream.
         return None
 
-    # Pass 1 hoists the per-row reduce out of the column-block loop, so it keeps
+    # Pass 1 reduces once per source, after the column-block loop, and keeps
     # two [BR, BDB] fp32 accumulators plus one residual tile live.  A 128-wide
     # block keeps that footprint small enough to stay under the UB budget with
     # 32 rows per program, which measured fastest both at 1024 and 8192 rows.
@@ -276,9 +239,10 @@ def launch(values, config, *, eps: float, scale: float, has_onorm: bool, nomax: 
         output, logit, lse, num_rows
     """
     num_rows = values[8]
-    score_values = [values[i] for i in (0, 1, 2, 3, 6, 7, 8)]
+    score_values = [values[i] for i in (0, 1, 2, 3, 6, 8)]
     mix_values = [values[i] for i in (1, 2, 6, 7, 4, 5, 8)]
     key = (
+        num_rows,
         values[0].dtype,
         values[0].device,
         config["L"],
@@ -301,17 +265,13 @@ def launch(values, config, *, eps: float, scale: float, has_onorm: bool, nomax: 
         entry = (
             _fast_launch.build(
                 _score_kernel,
-                (triton.cdiv(num_rows, config["BR1"]),),
+                (config["L"] * triton.cdiv(num_rows, config["BR1"]),),
                 score_values,
                 dict(
-                    L=config["L"],
                     D=config["D"],
                     BR=config["BR1"],
                     BDB=config["BDB1"],
-                    LP=config["LP"],
                     eps=eps,
-                    scale=scale,
-                    NOMAX=nomax,
                     EVEN=config["EVEN1"],
                 ),
             ),
@@ -328,6 +288,8 @@ def launch(values, config, *, eps: float, scale: float, has_onorm: bool, nomax: 
                     scale=scale,
                     eps=eps,
                     HAS_ONORM=has_onorm,
+                    LP=config["LP"],
+                    NOMAX=nomax,
                     EVEN=config["EVEN2"],
                 ),
             ),
