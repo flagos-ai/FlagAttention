@@ -18,6 +18,8 @@ import hashlib
 import importlib
 import inspect
 import os
+import statistics
+import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable
@@ -30,8 +32,12 @@ from benchmark.recording import BenchmarkRecorder, benchmark_metric, record_benc
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gated_delta_rule
+from flag_attn.FLA.gated_delta_rule import (
+    fused_recurrent_gated_delta_rule_fwd,
+    fused_recurrent_gated_delta_rule_packed_decode,
+)
 from flag_attn.utils import has_triton_tle
-from flag_attn.testing.gdn import measure_providers
+from gdn_utils import check_close, make_case, make_packed_case, reference, reference_packed
 
 
 ASSERT_RATIO = 0.01
@@ -51,6 +57,14 @@ SHAPES = [
     (8, 2048, 32, 256, 256),
 ]
 DTYPES = (torch.float16, torch.bfloat16)
+
+HEADS = [(16, 32), (8, 16), (4, 8), (2, 4), (16, 48), (8, 24), (4, 12), (4, 16), (2, 8)]
+PREFILL_SHAPES = [
+    (batch, length, h, hv, 128, 128) for h, hv in HEADS for batch, length in ((1, 512), (1, 2048), (4, 2048), (1, 8192))
+] + [(b, t, h, h, k, v) for b, t, h, k, v in SHAPES]
+DECODE_SHAPES = [(n, 1, h, hv) for h, hv in HEADS for n in (1, 2, 4, 8, 16, 32, 64, 128, 256)]
+MTP_SHAPES = [(n, length, h, hv) for h, hv in HEADS for n in (1, 4, 16, 64, 128) for length in (2, 3, 4, 8)]
+EXTRA_BATCH_SHAPES = [(n, 1, h, hv) for h, hv in HEADS for n in (24, 48, 96, 192, 512)]
 
 
 def _cuda_tle_available() -> bool:
@@ -210,6 +224,164 @@ def _record_result(
     record_property(f"{prefix}.speedup_vs_vllm", _speedup(vllm_ms, flag_attn_ms))
 
 
+def run_benchmark(
+    record_property: Callable[[str, object], None] | None = None,
+) -> None:
+    if not test_backend.is_available():
+        raise RuntimeError("GDN benchmark requires an available accelerator")
+    compare_vllm = test_backend.is_nvidia()
+
+    if record_property is not None:
+        record_property("scope", "operator_only")
+        record_property("baseline", "vLLM" if compare_vllm else None)
+
+    _print_header()
+    for dtype in DTYPES:
+        recorder = BenchmarkRecorder(
+            record_property,
+            op_name="chunk_gated_delta_rule",
+            dtype=str(dtype),
+            baseline="vLLM" if compare_vllm else None,
+            phase="forward",
+        )
+        print("\ndtype:", dtype)
+        for shape in SHAPES:
+            vllm_ms, flag_attn_ms = _benchmark_case(dtype, shape)
+            _print_row(dtype, shape, vllm_ms, flag_attn_ms)
+            recorder.add(shape_detail=shape, latency_base=vllm_ms, latency=flag_attn_ms)
+            _record_result(
+                record_property,
+                dtype,
+                shape,
+                vllm_ms,
+                flag_attn_ms,
+            )
+            test_backend.device_fn.empty_cache()
+        recorder.record()
+    _print_footer()
+
+
+def _measure_providers(providers, *, state=None, cache="warm", warmup_ms=1000, rep_ms=100, rounds=7):
+    """Return GPU milliseconds; state restoration and cache eviction are untimed."""
+    original = state.clone() if state is not None else None
+    eviction = torch.empty(256 * 1024**2, device="cuda", dtype=torch.uint8) if cache == "cold" else None
+    measurements = {}
+
+    def capture(fn):
+        if state is not None:
+            state.copy_(original)
+        fn()
+        torch.cuda.synchronize()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        start = torch.cuda.Event(enable_timing=True, external=True)
+        end = torch.cuda.Event(enable_timing=True, external=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            start.record()
+            fn()
+            end.record()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        return graph, start, end
+
+    def samples(name, budget_ms):
+        graph, start, end = measurements[name]
+        stop = time.perf_counter() + budget_ms / 1000
+        values = []
+        while len(values) < 5 or time.perf_counter() < stop:
+            if state is not None:
+                state.copy_(original)
+            if eviction is not None:
+                eviction.zero_()
+            graph.replay()
+            end.synchronize()
+            values.append(start.elapsed_time(end))
+        return values
+
+    try:
+        for name, fn in providers.items():
+            measurements[name] = capture(fn)
+        for name in providers:
+            samples(name, warmup_ms)
+        medians = {name: [] for name in providers}
+        counts = {name: [] for name in providers}
+        names = list(providers)
+        for index in range(rounds):
+            order = names[index % len(names) :] + names[: index % len(names)]
+            for name in order:
+                values = samples(name, rep_ms)
+                medians[name].append(statistics.median(values))
+                counts[name].append(len(values))
+        return {name: statistics.median(values) for name, values in medians.items()}, {
+            "round_medians_ms": medians,
+            "samples_per_round": counts,
+            "warmup_ms": warmup_ms,
+            "rep_ms": rep_ms,
+            "cache": cache,
+            "scope": "one operator call per CUDA Graph; external events; reset/eviction excluded",
+        }
+    finally:
+        if state is not None:
+            state.copy_(original)
+
+
+@pytest.fixture(scope="module")
+def vllm_gdn():
+    try:
+        importlib.import_module("vllm")
+    except ModuleNotFoundError as exc:
+        if exc.name == "vllm":
+            pytest.skip("the vLLM baseline must be installed to run decode benchmarks")
+        raise
+    for name in (
+        "vllm.third_party.flash_linear_attention.ops.fused_recurrent",
+        "vllm.model_executor.layers.fla.ops.fused_recurrent",
+    ):
+        try:
+            return importlib.import_module(name)
+        except ModuleNotFoundError as exc:
+            if not exc.name or not (name == exc.name or name.startswith(exc.name + ".")):
+                raise
+    pytest.fail("installed vLLM does not expose the required FLA recurrent operators")
+
+
+def _record(record_property, op_name, shape, state_dtype, module, latency, measurement):
+    source = Path(module.__file__)
+    import vllm
+
+    record_benchmark_result(
+        record_property,
+        op_name=op_name,
+        dtype="bfloat16",
+        mode="operator_gpu_graph_" + measurement["cache"],
+        result=[
+            benchmark_metric(
+                case_id="N{}_L{}_H{}_HV{}_{}_{}".format(
+                    *shape, str(state_dtype).removeprefix("torch."), measurement["cache"]
+                ),
+                shape_detail=dict(
+                    zip(("N", "L", "H", "HV"), shape),
+                    K=128,
+                    V=128,
+                    state_dtype=str(state_dtype),
+                    cache=measurement["cache"],
+                    workload="mtp" if shape[1] > 1 else "decode",
+                ),
+                latency=latency["candidate"],
+                latency_base=latency["vllm"],
+                speedup=latency["vllm"] / latency["candidate"],
+                accuracy="passed",
+            )
+        ],
+        baseline_name="vllm",
+        baseline_version=vllm.__version__,
+        baseline_source=str(source),
+        baseline_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        measurement=measurement,
+    )
+
+
 @pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not test_backend.supports_operator("chunk_gated_delta_rule"), reason="requires an available accelerator"
@@ -220,14 +392,6 @@ def test_chunk_gated_delta_rule_benchmark(
     if _cuda_tle_available() and torch.cuda.get_device_capability()[0] == 9:
         pytest.skip("Hopper coverage is parametrized in test_chunk_gdn_forward_benchmark")
     run_benchmark(record_property)
-
-
-PREFILL_HEADS = [(16, 32), (8, 16), (4, 8), (2, 4), (16, 48), (8, 24), (4, 12), (4, 16), (2, 8)]
-PREFILL_SHAPES = [
-    (batch, length, h, hv, 128, 128)
-    for h, hv in PREFILL_HEADS
-    for batch, length in ((1, 512), (1, 2048), (4, 2048), (1, 8192))
-] + [(b, t, h, h, k, v) for b, t, h, k, v in SHAPES]
 
 
 @pytest.mark.chunk_gated_delta_rule
@@ -272,7 +436,7 @@ def test_chunk_gdn_forward_benchmark(shape, dtype, cache, baseline, record_prope
     _assert_close("o_vk", adapted[1], expected[1])
     _assert_close("final_state_vk", adapted[3], expected[3])
     assert adapted[3].is_contiguous()
-    latency, measurement = measure_providers(providers, cache=cache)
+    latency, measurement = _measure_providers(providers, cache=cache)
     source = Path(inspect.getfile(inspect.unwrap(reference)))
     for provider in ("candidate", "candidate_vk"):
         mode = "raw_forward_vllm_" + ("state_abi_" if provider == "candidate_vk" else "native_") + cache
@@ -302,38 +466,58 @@ def test_chunk_gdn_forward_benchmark(shape, dtype, cache, baseline, record_prope
         )
 
 
-def run_benchmark(
-    record_property: Callable[[str, object], None] | None = None,
-) -> None:
-    if not test_backend.is_available():
-        raise RuntimeError("GDN benchmark requires an available accelerator")
-    compare_vllm = test_backend.is_nvidia()
+@pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.parametrize("shape", DECODE_SHAPES + MTP_SHAPES, ids=lambda s: "N{}_L{}_H{}_HV{}".format(*s))
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32_state", "bf16_state"])
+@pytest.mark.parametrize("cache", ["cold", "warm"])
+@torch.inference_mode()
+def test_fused_recurrent_gdn_benchmark(shape, state_dtype, cache, vllm_gdn, record_property):
+    n, length, h, hv = shape
+    case = make_case(n, length, h, hv, state_dtype=state_dtype, spec=length > 1, pool_min=1024, seed=2026)
+    original = case["initial_state"].clone()
+    expected = reference(case)
+    # vLLM requires contiguous Q/K/V; their conversion is outside this kernel comparison.
+    baseline_case = {**case, **{key: case[key].contiguous() for key in ("q", "k", "v", "g", "beta")}}
+    providers = {
+        "vllm": lambda: vllm_gdn.fused_recurrent_gated_delta_rule_fwd(**baseline_case),
+        "candidate": lambda: fused_recurrent_gated_delta_rule_fwd(**case),
+    }
+    for fn in providers.values():
+        case["initial_state"].copy_(original)
+        check_close(*fn(), *expected)
+    case["initial_state"].copy_(original)
+    # make_case allocates all accessed slots in [1, N*L]; other pool rows stay untouched.
+    latency, measurement = _measure_providers(providers, state=case["initial_state"][: n * length + 1], cache=cache)
+    _record(record_property, "fused_recurrent_gated_delta_rule_fwd", shape, state_dtype, vllm_gdn, latency, measurement)
 
-    if record_property is not None:
-        record_property("scope", "operator_only")
-        record_property("baseline", "vLLM" if compare_vllm else None)
 
-    _print_header()
-    for dtype in DTYPES:
-        recorder = BenchmarkRecorder(
-            record_property,
-            op_name="chunk_gated_delta_rule",
-            dtype=str(dtype),
-            baseline="vLLM" if compare_vllm else None,
-            phase="forward",
-        )
-        print("\ndtype:", dtype)
-        for shape in SHAPES:
-            vllm_ms, flag_attn_ms = _benchmark_case(dtype, shape)
-            _print_row(dtype, shape, vllm_ms, flag_attn_ms)
-            recorder.add(shape_detail=shape, latency_base=vllm_ms, latency=flag_attn_ms)
-            _record_result(
-                record_property,
-                dtype,
-                shape,
-                vllm_ms,
-                flag_attn_ms,
-            )
-            test_backend.device_fn.empty_cache()
-        recorder.record()
-    _print_footer()
+@pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
+@pytest.mark.parametrize("shape", DECODE_SHAPES + EXTRA_BATCH_SHAPES, ids=lambda s: "N{}_L{}_H{}_HV{}".format(*s))
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32_state", "bf16_state"])
+@pytest.mark.parametrize("cache", ["cold", "warm"])
+@torch.inference_mode()
+def test_packed_gdn_benchmark(shape, state_dtype, cache, vllm_gdn, record_property):
+    n, _, h, hv = shape
+    case = make_packed_case(n, h, hv, state_dtype=state_dtype, pool_min=1024, seed=2026)
+    original = case["initial_state"].clone()
+    expected = reference_packed(case)
+    providers = {
+        "vllm": lambda: vllm_gdn.fused_recurrent_gated_delta_rule_packed_decode(**case),
+        "candidate": lambda: fused_recurrent_gated_delta_rule_packed_decode(**case),
+    }
+    for fn in providers.values():
+        case["initial_state"].copy_(original)
+        check_close(*fn(), *expected)
+    case["initial_state"].copy_(original)
+    latency, measurement = _measure_providers(providers, state=case["initial_state"][: n + 1], cache=cache)
+    _record(
+        record_property,
+        "fused_recurrent_gated_delta_rule_packed_decode",
+        shape,
+        state_dtype,
+        vllm_gdn,
+        latency,
+        measurement,
+    )
