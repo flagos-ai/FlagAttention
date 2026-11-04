@@ -782,7 +782,6 @@ def test_prefill_bf16(case: tuple) -> None:
 @pytest.mark.parametrize(
     "case", PREFILL_QH8_CASES, ids=("selection", "long_ragged")
 )
-@pytest.mark.minimax_sparse_attention_prefill
 @pytest.mark.minimax_m3_sparse_attn
 def test_prefill_bf16_qh8_kernel_choices(
     case: tuple, choice: str, monkeypatch: pytest.MonkeyPatch
