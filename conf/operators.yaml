@@ -13,6 +13,36 @@
 # limitations under the License.
 
 ops:
+  - id: fused_recurrent_gated_delta_rule_packed_decode
+    description: TLE packed single-token GDN decode with fused gates and indexed state updates.
+    for:
+      - fused_recurrent_gated_delta_rule_packed_decode
+    labels:
+      - fused
+      - FLA
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_gated_delta_rule.py
+    benchmark: benchmark/test_gated_delta_rule_benchmark.py
+  - id: fused_recurrent_gated_delta_rule_fwd
+    description: TLE scalar GDN inference recurrence with indexed state snapshots on NVIDIA GPUs.
+    for:
+      - fused_recurrent_gated_delta_rule_fwd
+    labels:
+      - fused
+      - FLA
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_gated_delta_rule.py
+    benchmark: benchmark/test_gated_delta_rule_benchmark.py
   - id: parallel_wall_attn
     description: Run Wall-Attention correctness and performance tests on the selected backend.
     for:
@@ -59,7 +89,6 @@ ops:
     description: Run the forward path for chunked gated delta rule attention.
     for:
       - chunk_gated_delta_rule
-      - chunk_gated_delta_rule_fwd
     labels:
       - fused
       - FLA
@@ -69,14 +98,7 @@ ops:
     stages:
       - alpha: 'unreleased'
     tests:
-      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_recompute_tle_matches_native
-      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_full_tle_matches_native
-      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_public_api_matches_native
-      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_two_kernel_matches_native
-      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_two_kernel_configs
-      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_hybrid_matches_two_kernel
-      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_hybrid_matches_fla
-      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_public_api_uses_two_kernel
+      - tests/flag_attn/test_gated_delta_rule.py
     benchmark: benchmark/test_gated_delta_rule_benchmark.py
   - id: chunk_gdn2
     description: Compare native and TLE chunked GDN2 implementations and resource controls.

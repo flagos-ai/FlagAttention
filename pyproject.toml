@@ -89,6 +89,8 @@ pythonpath = [
     "tests/flag_attn",
 ]
 markers = [
+    "fused_recurrent_gated_delta_rule_packed_decode: packed gated delta rule tests and benchmarks",
+    "fused_recurrent_gated_delta_rule_fwd: recurrent gated delta rule tests and benchmarks",
     "hy3_attention: Hy3 prefill and BF16/FP8 static/dynamic decode tests and benchmarks",
     "fused_attnres: fused attention residual tests and benchmarks",
     "parallel_forgetting_attn: ACP-enabled forgetting attention tests and benchmarks",
