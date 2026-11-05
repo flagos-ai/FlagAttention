@@ -245,6 +245,3 @@ def fused_attnres(
         )
         return output, probability.view(len(residuals), *output_shape[:-1])
     return output
-
-
-__all__ = ["fused_attnres"]
