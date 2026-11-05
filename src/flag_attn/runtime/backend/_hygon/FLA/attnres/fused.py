@@ -427,6 +427,3 @@ def fused_attnres(
         probability = (logit * scale - lse[None, :]).exp()
         return output, probability.view(len(residuals), *output_shape[:-1])
     return output
-
-
-__all__ = ["HAS_TRITON_ATTNRES", "fused_attnres"]
