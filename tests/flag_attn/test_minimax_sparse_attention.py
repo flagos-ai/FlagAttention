@@ -987,7 +987,6 @@ def _non_pow2_prefill_inputs(head_dim: int, group_size: int, num_kv_heads: int):
 # descriptor and then faults on the device with an illegal instruction.
 @pytest.mark.parametrize("head_dim", (96, 100, 128))
 @pytest.mark.parametrize("group_size", (8, 16))
-@pytest.mark.minimax_sparse_attention_prefill
 @pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn"), reason=test_backend.skip_reason("minimax_m3_sparse_attn"))
 def test_prefill_bf16_non_pow2_head_dim(head_dim: int, group_size: int) -> None:
