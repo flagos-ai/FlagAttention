@@ -14,23 +14,13 @@
 
 """Ascend Triton implementation of fused Attention Residuals.
 
-The generic CUDA implementation in ``flag_attn.FLA.attnres.fused`` keeps the
-sources in a tuple kernel argument. triton-ascend has no tuple-of-tensor
-arguments, so the sources stay as separate tensors: the host passes a small
-int64 table of their base addresses and the kernel casts each entry back to a
-pointer, which avoids materialising a stacked copy of the residuals. A single
-source is read directly. Kernels use the standard Triton launch interface so
-specialization, hooks and backend launch behavior remain under Triton's control.
-
-The single-row kernel is bound by fp32 vector throughput rather than bandwidth,
-so with several sources it rotates two residual buffers to overlap the next
-source's load with the current source's arithmetic, and it folds the trailing
-RMSNorm into the softmax denominator to keep that epilogue to one full-width
-pass.
-
-Wide row counts (>= ``_TWO_PASS_MIN_ROWS``) are handed to ``two_pass``:
-row-batched kernels that score every source once with [BR, BDB] tiles and
-then mix them in a second pass to improve memory access efficiency.
+triton-ascend has no tuple-of-tensor kernel arguments, so the residual sources
+stay separate tensors: a small int64 table of their base addresses is cast back
+to pointers in the kernel (a single source is read directly). The single-row
+kernel rotates two residual buffers to overlap the next source's load with the
+current arithmetic and folds the trailing RMSNorm into the softmax denominator.
+Wide row counts go through ``two_pass``, which scores with [BR, BDB] tiles and
+mixes in a second pass for better memory access.
 """
 
 from __future__ import annotations
@@ -45,9 +35,8 @@ from . import two_pass as _two_pass
 
 _INT32_MAX = 2**31 - 1
 
-# Two passes trade another launch and source read for larger vector tiles.
-# Public-API comparisons at D=7168 favor this path from 1024 rows on the
-# measured shapes; keep smaller row counts on the single-pass kernel.
+# Two passes trade another launch and source read for larger vector tiles;
+# smaller row counts stay on the single-pass kernel.
 _TWO_PASS_MIN_ROWS = 1024
 
 _BD_CACHE: dict = {}

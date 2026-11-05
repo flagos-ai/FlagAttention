@@ -14,15 +14,12 @@
 
 """Row-batched score and mixture kernels for Ascend AttnRes.
 
-The score grid spans both residual sources and row batches. Each program
-streams one source, accumulating its row norms and query dots in fp32 before
-reducing once. Independent sources fill otherwise idle vector cores at small
-row counts and avoid carrying a source-logit tile through the scoring loop.
+The score grid spans residual sources and row batches; each program streams one
+source and reduces its row norms and query dots once, so independent sources
+fill idle vector cores and no source-logit tile is carried through the loop.
 
-The mixture kernel computes the source log-sum-exp for its row batch, writes
-it to ``lse``, then streams column tiles to form the weighted
-mixture. With output RMSNorm, it accumulates the norm in fp32 and reuses the
-output buffer for the intermediate mixture before scaling it in a final loop.
+The mixture kernel computes the source log-sum-exp for its row batch, then
+streams column tiles to form the weighted mixture and its RMSNorm in one write.
 """
 
 from __future__ import annotations
@@ -55,7 +52,7 @@ def _score_kernel(
     residual_ptr = tl.cast(tl.load(residual_ptrs + source), residual0.dtype)
     # Two [BR, BDB] tiles accumulate the products over the whole row and are
     # reduced once per source; reducing per block instead costs one extra
-    # full-width op per block (measured ~10% of pass 1 on L9_N8192).
+    # full-width op per block.
     acc_square = tl.zeros([BR, BDB], tl.float32)
     acc_dot = tl.zeros([BR, BDB], tl.float32)
     for block in tl.range(0, D // BDB):
@@ -194,8 +191,7 @@ def plan(hidden_size: int, num_rows: int, num_sources: int, has_onorm: bool) -> 
 
     # Pass 1 reduces once per source, after the column-block loop, and keeps
     # two [BR, BDB] fp32 accumulators plus one residual tile live.  A 128-wide
-    # block keeps that footprint small enough to stay under the UB budget with
-    # 32 rows per program, which measured fastest both at 1024 and 8192 rows.
+    # block keeps that footprint under the UB budget with 32 rows per program.
     row_batch = 32
     block_b = min(128, lowbit)
     config = dict(
@@ -204,8 +200,8 @@ def plan(hidden_size: int, num_rows: int, num_sources: int, has_onorm: bool) -> 
         BR1=row_batch,
         BDB1=block_b,
         EVEN1=num_rows % row_batch == 0,
-        # Pass 2 needs an accumulator *and* a source tile live, and its best
-        # measured point is BR=8/BDB=1024; BR=16/BDB=512 leaves the tail less room.
+        # Pass 2 needs an accumulator and a source tile live; BR=8/BDB=1024
+        # leaves the tail room.
         BR2=8,
         BDB2=min(1024, lowbit),
         EVEN2=num_rows % 8 == 0,
