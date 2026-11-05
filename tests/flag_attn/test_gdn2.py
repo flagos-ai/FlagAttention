@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from flag_attn import runtime
 from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gdn2
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
@@ -33,12 +34,12 @@ GDN2_TEST_CASES = [
 ]
 
 
-def _cuda_available() -> bool:
+def _gdn2_available() -> bool:
     return test_backend.supports_operator("chunk_gdn2")
 
 
 pytestmark = [
-    pytest.mark.skipif(not _cuda_available(), reason="chunk_gdn2 tests require CUDA"),
+    pytest.mark.skipif(not _gdn2_available(), reason="chunk_gdn2 is unavailable on the active backend"),
 ]
 
 
@@ -164,7 +165,9 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
 @pytest.mark.chunk_gdn2
 @pytest.mark.parametrize(
     "impl",
-    [pytest.param("tle", id="tle"), pytest.param("native", id="native")],
+    [pytest.param("backend", id="backend")]
+    if runtime.device.vendor_name == "mthreads"
+    else [pytest.param("tle", id="tle"), pytest.param("native", id="native")],
 )
 @pytest.mark.parametrize(
     "shape,dtype",
@@ -190,18 +193,19 @@ def test_chunk_gdn2_matches_native_triton(impl, dtype, shape):
 
     expected, expected_final = _native_gdn2_reference(*args, **kwargs)
 
-    force_native = impl == "native"
     actual_kwargs = dict(kwargs)
-    if impl == "tle":
-        # Public TLE inference currently requires BT=16. The baseline remains
-        # the original native Triton path with BT=64.
+    if impl != "native":
+        # The fused inference path uses 16-token chunks; the reference uses 64.
         actual_kwargs["chunk_size"] = 16
 
-    module, old = _set_public_gdn2_native_for_call(force_native)
-    try:
+    if impl == "backend":
         actual, actual_final = chunk_gdn2(*args, **actual_kwargs)
-    finally:
-        module.HAS_TLE_GDN2 = old
+    else:
+        module, old = _set_public_gdn2_native_for_call(impl == "native")
+        try:
+            actual, actual_final = chunk_gdn2(*args, **actual_kwargs)
+        finally:
+            module.HAS_TLE_GDN2 = old
 
     _assert_close("o", actual, expected)
     _assert_close("ht", actual_final, expected_final)
