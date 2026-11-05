@@ -57,6 +57,19 @@ _BENCHMARK_METRIC_FIELDS = (
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("flagattention", "FlagAttention test reporting")
+
+    group.addoption(
+        "--stage",
+        choices=("all", "prefill", "decode"),
+        default="all",
+        help="Select all test stages, prefill, or decode",
+    )
+    group.addoption(
+        "--dtype",
+        default="all",
+        metavar="PRECISION",
+        help="Select a precision supported by the test, or all (default)",
+    )
     group.addoption(
         "--record",
         action="store",
@@ -170,6 +183,10 @@ class _MarkCollector:
         for item in items:
             marks = _operator_marks(item)
             self.items.append({"nodeid": item.nodeid, "marks": sorted(marks)})
+
+        # Mark discovery must never execute the collected test suite, even if
+        # the caller omits pytest's --collect-only option.
+        items.clear()
 
     def pytest_sessionfinish(
         self, session: pytest.Session, exitstatus: pytest.ExitCode

@@ -36,7 +36,14 @@ from flag_attn.minimax_sparse_attention import (
 from flag_attn.minimax_sparse_attention import minimax_m3_sparse_attn_decode
 
 index_topk_module = importlib.import_module(minimax_m3_index_topk.__module__)
-sparse_attn_module = importlib.import_module(minimax_m3_sparse_attn.__module__)
+# `__module__` is the lazy package, whose __getattr__ only resolves public
+# operator exports. Tests reaching for backend internals (`tle`,
+# `_prefill_qh8_kernel_choice`) need the defining module, or a hasattr guard
+# against the package silently fails.
+sparse_attn_package = importlib.import_module(minimax_m3_sparse_attn.__module__)
+sparse_attn_module = importlib.import_module(
+    f"{sparse_attn_package.__name__}.sparse_attn"
+)
 
 triton.knobs.autotuning.adjust_block_size = False
 BLOCK = SPARSE_BLOCK_SIZE
@@ -50,13 +57,6 @@ BF16_ATOL = 2e-2
 BF16_RTOL = 2e-2
 FP8_ATOL = 6e-2
 FP8_RTOL = 8e-2
-
-
-def _supports_fp8() -> bool:
-    if FP8_DTYPE is None or not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")):
-        return False
-    # NVIDIA FP8 Tensor Core support starts with Ada (8.9) and Hopper (9.0).
-    return not test_backend.is_nvidia() or test_backend.cuda_capability() >= (8, 9)
 
 
 pytestmark = pytest.mark.skipif(
@@ -142,7 +142,7 @@ def make_data(
 ) -> MSAData:
     if mode not in {"bf16", "fp8_index", "fp8_kv", "fp8_full"}:
         raise ValueError(f"unsupported mode: {mode}")
-    if mode != "bf16" and not _supports_fp8():
+    if mode != "bf16" and not test_backend.supports_msa_fp8():
         pytest.skip("FP8 tests require accelerator FP8 support")
     if not seq_lens or any(length <= 0 for length in seq_lens):
         raise ValueError("seq_lens must contain positive lengths")
@@ -685,7 +685,7 @@ def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
 
 
 @pytest.mark.skipif(
-    not index_topk_module._HAS_TLE_RADIX,
+    not getattr(index_topk_module, "_HAS_TLE_RADIX", False),
     reason="requires a backend with TLE radix top-k support",
 )
 @pytest.mark.minimax_m3_sparse_attn
@@ -782,7 +782,6 @@ def test_prefill_bf16(case: tuple) -> None:
 @pytest.mark.parametrize(
     "case", PREFILL_QH8_CASES, ids=("selection", "long_ragged")
 )
-@pytest.mark.minimax_sparse_attention_prefill
 @pytest.mark.minimax_m3_sparse_attn
 def test_prefill_bf16_qh8_kernel_choices(
     case: tuple, choice: str, monkeypatch: pytest.MonkeyPatch
@@ -890,7 +889,7 @@ def test_decode_topk_identity_out_and_score_out_bf16() -> None:
 
 
 @pytest.mark.skipif(
-    not _supports_fp8(),
+    not test_backend.supports_msa_fp8(),
     reason="FP8 tests require accelerator FP8 support",
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
@@ -902,7 +901,7 @@ def test_prefill_fp8(mode: str, case: tuple) -> None:
 
 
 @pytest.mark.skipif(
-    not _supports_fp8(),
+    not test_backend.supports_msa_fp8(),
     reason="FP8 tests require accelerator FP8 support",
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
@@ -911,3 +910,102 @@ def test_prefill_fp8(mode: str, case: tuple) -> None:
 @pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn_decode"), reason=test_backend.skip_reason("minimax_m3_sparse_attn_decode"))
 def test_decode_fp8(mode: str, case: tuple) -> None:
     _run_decode(case, mode)
+
+
+def _non_pow2_prefill_inputs(head_dim: int, group_size: int, num_kv_heads: int):
+    """Minimal packed-KV prefill inputs at an arbitrary head_dim.
+
+    ``make_data`` is pinned to the module-level ``HEAD_DIM``, so this builds the
+    tensors directly to reach head dimensions that are not a power of two.
+    """
+    device = test_backend.device
+    query_lens = (17, 13)
+    context = 4 * BLOCK
+    total_q = sum(query_lens)
+    batch = len(query_lens)
+    pages_per_req = context // BLOCK
+    total_pages = pages_per_req * batch
+    topk = pages_per_req
+
+    generator = torch.Generator(device=device).manual_seed(1234)
+    q = torch.randn(
+        (total_q, num_kv_heads * group_size, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv_cache = (
+        torch.randn(
+            (total_pages, num_kv_heads, BLOCK, 2 * head_dim),
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+        * 0.3
+    ).to(torch.bfloat16)
+    block_table = (
+        torch.randperm(total_pages, generator=generator, device=device)
+        .to(torch.int32)
+        .view(batch, pages_per_req)
+    )
+    cu_q = torch.tensor(
+        [0, query_lens[0], total_q], device=device, dtype=torch.int32
+    )
+    seq_lens = torch.full((batch,), context, device=device, dtype=torch.int32)
+    prefix_lens = seq_lens - torch.tensor(
+        query_lens, device=device, dtype=torch.int32
+    )
+    # Every request selects all of its pages, so the loop, the causal diagonal
+    # and the tail mask are all exercised.
+    topk_idx = (
+        torch.arange(topk, device=device, dtype=torch.int32)
+        .view(1, 1, topk)
+        .expand(num_kv_heads, total_q, topk)
+        .contiguous()
+    )
+    return (
+        q,
+        kv_cache,
+        topk_idx,
+        block_table,
+        cu_q,
+        seq_lens,
+        prefix_lens,
+        max(query_lens),
+        num_kv_heads,
+        head_dim**-0.5,
+    )
+
+
+# head_dim 96 is supported but every other prefill case here runs at 128, which
+# hid a defect: the TMA descriptor box width and V's column origin both have to
+# stay distinct from head_dim once it is not a power of two.
+#
+# 100 is the other half of the contract: V's box would start 200 bytes into the
+# row, which is not 16-byte aligned, so no legal TMA descriptor exists and the
+# dispatcher has to route it to a non-TMA kernel. Left unguarded it builds a
+# descriptor and then faults on the device with an illegal instruction.
+@pytest.mark.parametrize("head_dim", (96, 100, 128))
+@pytest.mark.parametrize("group_size", (8, 16))
+@pytest.mark.minimax_sparse_attention_prefill
+@pytest.mark.minimax_m3_sparse_attn
+@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn"), reason=test_backend.skip_reason("minimax_m3_sparse_attn"))
+def test_prefill_bf16_non_pow2_head_dim(head_dim: int, group_size: int) -> None:
+    args = _non_pow2_prefill_inputs(head_dim, group_size, num_kv_heads=1)
+    actual = torch.empty_like(args[0])
+    minimax_m3_sparse_attn(*args, output=actual)
+    test_backend.device_fn.synchronize()
+
+    # The TLE-less fallback shares no TMA code, so it is an independent
+    # reference for the same inputs.
+    expected = torch.empty_like(args[0])
+    saved = sparse_attn_module.tle
+    sparse_attn_module.tle = None
+    try:
+        minimax_m3_sparse_attn(*args, output=expected)
+        test_backend.device_fn.synchronize()
+    finally:
+        sparse_attn_module.tle = saved
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

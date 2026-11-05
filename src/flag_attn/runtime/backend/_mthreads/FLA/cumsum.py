@@ -12,7 +12,7 @@ import triton.language as tl
 
 from .index import prepare_chunk_indices
 from .utils import check_shared_mem, input_guard
-from flag_attn.gated_linear_attention.compat import libtuner
+from flag_attn.FLA.compat import libtuner
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 

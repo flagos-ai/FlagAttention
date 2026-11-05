@@ -38,8 +38,8 @@ import triton
 import triton.language as tl
 from flag_attn.runtime.backend import _hygon as runtime
 
-from ..index import prepare_chunk_indices, prepare_chunk_offsets
-from flag_attn.gated_delta_rule.compat import has_triton_tle
+from flag_attn.runtime.backend._hygon.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
+from flag_attn.runtime.backend._hygon.utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
     try:

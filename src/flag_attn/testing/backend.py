@@ -53,6 +53,22 @@ def cuda_capability(*args):
     return torch.cuda.get_device_capability(*args) if is_nvidia() else (0, 0)
 
 
+def supports_msa_fp8() -> bool:
+    """Whether the active MSA backend accepts FP8 inputs, for tests and benchmarks."""
+    if runtime.device.vendor_name == "hygon":
+        # Hygon MSA receives dequantized inputs from the framework.
+        return False
+    if getattr(torch, "float8_e4m3fn", None) is None:
+        return False
+    if not (
+        supports_operator("minimax_m3_sparse_attn")
+        or supports_operator("minimax_m3_sparse_attn_decode")
+    ):
+        return False
+    # NVIDIA FP8 Tensor Core support starts with Ada (8.9) and Hopper (9.0).
+    return not is_nvidia() or cuda_capability() >= (8, 9)
+
+
 def get_device_name(*args):
     getter = getattr(device_fn, "get_device_name", None)
     return getter(*args) if getter is not None else runtime.device.vendor_name
