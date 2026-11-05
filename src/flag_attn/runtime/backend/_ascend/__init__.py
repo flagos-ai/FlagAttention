@@ -5,6 +5,7 @@ import importlib
 
 _OPERATOR_EXPORTS = {
     "chunk_gdn2": (".gdn2", "chunk_gdn2"),
+    "chunk_gla": (".FLA.gated_linear_attention", "chunk_gla"),
     "parallel_parallax": (".parallax", "parallel_parallax"),
     "parallax_decode": (".parallax", "parallax_decode"),
     "parallax_attn_with_kvcache": (".parallax", "parallax_attn_with_kvcache"),
