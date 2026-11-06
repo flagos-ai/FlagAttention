@@ -21,12 +21,9 @@ import pytest
 import torch
 import triton
 
+import flag_attn
 from flag_attn import chunk_gated_delta_rule
-from flag_attn.FLA.gated_delta_rule import (
-    chunk_gated_delta_rule_fwd,
-    fused_recurrent_gated_delta_rule_fwd,
-    fused_recurrent_gated_delta_rule_packed_decode,
-)
+from flag_attn.FLA.gated_delta_rule import chunk_gated_delta_rule_fwd
 from flag_attn.testing import backend as test_backend
 from flag_attn.utils import has_triton_tle
 from gdn_utils import check_close, make_case, make_packed_case, reference, reference_packed, unpack_reference_case
@@ -241,8 +238,8 @@ def rms_close(actual, expected):
     assert error / (expected.float().square().mean().sqrt() + 1e-8) < 0.01
 
 
-@pytest.mark.chunk_gated_delta_rule
 class TestChunkGatedDeltaRule:
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="GDN recompute TLE tests require CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("shape", GDN_RECOMPUTE_TEST_SHAPES)
@@ -259,6 +256,7 @@ class TestChunkGatedDeltaRule:
         _assert_close("A", actual[2], baseline[2])
         _assert_close("final_state", actual[3], baseline[3])
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="GDN fused TLE tests require CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("shape", GDN_FUSED_FWD_TEST_SHAPES)
@@ -275,6 +273,7 @@ class TestChunkGatedDeltaRule:
         _assert_close("A", actual[2], baseline[2])
         _assert_close("final_state", actual[3], baseline[3])
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(
         not test_backend.supports_operator("chunk_gated_delta_rule"), reason="requires an available accelerator"
     )
@@ -305,6 +304,7 @@ class TestChunkGatedDeltaRule:
         _assert_close("o", o, baseline[1])
         _assert_close("final_state", final_state, baseline[3])
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="GDN two-kernel tests require CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("shape", GDN_TWO_KERNEL_TEST_SHAPES)
@@ -338,6 +338,7 @@ class TestChunkGatedDeltaRule:
         _assert_close("A", actual[2], baseline[2])
         _assert_close("final_state", actual[3], baseline[3])
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="GDN autotune configurations require CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("config", _two_kernel_configs())
@@ -376,6 +377,7 @@ class TestChunkGatedDeltaRule:
         _assert_close("o", output, baseline[1])
         _assert_close("final_state", final_state, baseline[3])
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="GDN hybrid tests require CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @torch.inference_mode()
@@ -402,6 +404,7 @@ class TestChunkGatedDeltaRule:
         _assert_close("A", actual[2], expected[2])
         _assert_close("final_state", actual[3], expected[3])
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="GDN external comparison requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("shape", GDN_EXTERNAL_TEST_SHAPES)
@@ -416,6 +419,7 @@ class TestChunkGatedDeltaRule:
         _assert_close("o", actual_o, expected_o)
         _assert_close("final_state", actual_final_state, expected_final_state)
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="GDN public two-kernel test requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @torch.inference_mode()
@@ -444,6 +448,7 @@ class TestChunkGatedDeltaRule:
         _assert_close("o", o, baseline[1])
         _assert_close("final_state", final_state, baseline[3])
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not torch.cuda.is_available() or not has_triton_tle(3, 6, 0), reason="requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("shape", [(2, 16384, 16), (4, 2048, 16), (4, 4096, 64), (2, 2048, 16)])
@@ -489,6 +494,7 @@ class TestChunkGatedDeltaRule:
             previous = actual
         assert len(calls) == 5, "regression cases must exercise the fused TLE kernel"
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not torch.cuda.is_available() or not has_triton_tle(3, 6, 0), reason="requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize(
@@ -550,6 +556,7 @@ class TestChunkGatedDeltaRule:
             ratio = (a.float() - b.float()).square().mean().sqrt() / (b.float().square().mean().sqrt() + 1e-8)
             assert ratio < 0.01, ratio.item()
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("fp32_gates", [False, True])
@@ -593,6 +600,7 @@ class TestChunkGatedDeltaRule:
         a = actual[2].view(2, 32, 64, 16, 64).permute(0, 1, 3, 2, 4)
         assert torch.count_nonzero(a.triu(1)) == 0
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
@@ -611,14 +619,15 @@ class TestChunkGatedDeltaRule:
         # Chunk returns [N,HV,K,V]; decode cache ABI is [pool,HV,V,K].
         packed["initial_state"][ids] = final.transpose(-1, -2).to(state_dtype)
         expected = reference_packed(packed)
-        check_close(*fused_recurrent_gated_delta_rule_packed_decode(**packed), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_packed_decode(**packed), *expected)
         spec = make_case(n, 4, h, hv, dtype=dtype, state_dtype=state_dtype, spec=True)
         accepted = spec["num_accepted_tokens"].long() - 1
         read = spec["ssm_state_indices"][torch.arange(n, device="cuda"), accepted].long()
         spec["initial_state"][read] = packed["initial_state"][ids]
         expected = reference(spec)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**spec), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**spec), *expected)
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @torch.inference_mode()
@@ -643,6 +652,7 @@ class TestChunkGatedDeltaRule:
         rms_close(actual[1], expected[0])
         rms_close(actual[3], expected[1])
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
     @torch.inference_mode()
     def test_raw_chunk_materialized_auxiliary_contract(self, monkeypatch):
@@ -677,6 +687,7 @@ class TestChunkGatedDeltaRule:
         rms_close(result[1], expected[0])
         rms_close(result[3], expected[1])
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("case", ["short_gva", "tail", "ragged"])
@@ -747,6 +758,7 @@ class TestChunkGatedDeltaRule:
                 assert all(torch.equal(a, b) for a, b in zip(result[:4], previous))
             previous = [x.clone() for x in result[:4]]
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("length", [7, 64, 71])
@@ -824,6 +836,7 @@ class TestChunkGatedDeltaRule:
         )
         torch.testing.assert_close(gc, expected_gc, rtol=1e-6, atol=1e-6)
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("length", [7, 23, 64, 71])
@@ -878,6 +891,7 @@ class TestChunkGatedDeltaRule:
             )
             assert ratio < 0.01, ratio.item()
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("dims", [(60, 80), (128, 128)])
@@ -942,6 +956,7 @@ class TestChunkGatedDeltaRule:
             )
             assert ratio < 0.01, ratio.item()
 
+    @pytest.mark.chunk_gated_delta_rule
     @pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("heads", [(16, 16, 64), (8, 16, 80)])
@@ -997,9 +1012,9 @@ class TestChunkGatedDeltaRule:
             assert ratio < 0.01, ratio.item()
 
 
-@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
 class TestRecurrentGatedDeltaRule:
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     @pytest.mark.parametrize("h,hv", [(2, 4), (4, 12), (2, 8)])
     @pytest.mark.parametrize("length", [1, 3, 8])
     @pytest.mark.parametrize("strided", [False, True])
@@ -1007,17 +1022,19 @@ class TestRecurrentGatedDeltaRule:
     def test_recurrent_stateful(self, h, hv, length, strided, seed):
         case = make_case(4, length, h, hv, strided=strided, spec=length > 1, seed=seed)
         expected = reference(case)
-        actual = fused_recurrent_gated_delta_rule_fwd(**case)
+        actual = flag_attn.fused_recurrent_gated_delta_rule_fwd(**case)
         check_close(*actual, *expected)
         assert actual[1].data_ptr() == case["initial_state"].data_ptr()
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     @pytest.mark.parametrize("kd,vd", [(1, 1), (60, 80), (64, 128), (128, 64), (256, 128), (128, 256)])
     @pytest.mark.parametrize("vector_beta", [False, True])
     def test_recurrent_tails_and_vector_beta(self, kd, vd, vector_beta):
         case = make_case(3, 3, 2, 6, kdim=kd, vdim=vd, vector_beta=vector_beta, spec=True)
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     @pytest.mark.parametrize(
         "dtype,state_dtype",
         [(torch.float16, torch.float32), (torch.bfloat16, torch.bfloat16), (torch.float32, torch.float32)],
@@ -1025,8 +1042,9 @@ class TestRecurrentGatedDeltaRule:
     def test_recurrent_dtypes(self, dtype, state_dtype):
         case = make_case(3, 4, 2, 6, dtype=dtype, state_dtype=state_dtype, spec=True)
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     @pytest.mark.parametrize("inplace", [False, True])
     def test_recurrent_dense_without_indices(self, inplace):
         n, length = 3, 4
@@ -1036,15 +1054,17 @@ class TestRecurrentGatedDeltaRule:
             case[name] = x.reshape(n, length, *x.shape[2:])
         case.update(cu_seqlens=None, ssm_state_indices=None, inplace_final_state=inplace)
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     @pytest.mark.parametrize("inplace", [False, True])
     def test_recurrent_ragged_and_empty(self, inplace):
         case = make_case(5, 8, 2, 6, lengths=[0, 1, 8, 3, 0], spec=True)
         case["inplace_final_state"] = inplace
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     def test_recurrent_padding_and_index_strides(self):
         case = make_case(4, 4, 2, 6, padding=True, spec=True)
         case["ssm_state_indices"][-2] = -1
@@ -1054,20 +1074,21 @@ class TestRecurrentGatedDeltaRule:
         case["ssm_state_indices"] = wide[:, ::2]
         original = case["initial_state"].clone()
         expected = reference(case)
-        out, st = fused_recurrent_gated_delta_rule_fwd(**case)
+        out, st = flag_attn.fused_recurrent_gated_delta_rule_fwd(**case)
         check_close(out, st, *expected)
         assert torch.equal(st[0], original[0])
         assert torch.count_nonzero(out[:, -4:]) == 0
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     def test_recurrent_continuation_and_repeatability(self):
         case = make_case(3, 8, 2, 6)
         original = case["initial_state"].clone()
         expected = reference(case)
-        full = fused_recurrent_gated_delta_rule_fwd(**case)
+        full = flag_attn.fused_recurrent_gated_delta_rule_fwd(**case)
         check_close(*full, *expected)
         full_o, full_s = full[0].clone(), full[1].clone()
         case["initial_state"].copy_(original)
-        repeated = fused_recurrent_gated_delta_rule_fwd(**case)
+        repeated = flag_attn.fused_recurrent_gated_delta_rule_fwd(**case)
         assert torch.equal(repeated[0], full_o) and torch.equal(repeated[1], full_s)
         # Feed one token from each sequence per call, writing one stable slot per request.
         case["initial_state"].copy_(original)
@@ -1082,19 +1103,21 @@ class TestRecurrentGatedDeltaRule:
             for name in ("q", "k", "v", "g", "beta"):
                 x = case[name].reshape(3, 8, *case[name].shape[2:])
                 step[name] = x[:, t : t + 1]
-            outputs.append(fused_recurrent_gated_delta_rule_fwd(**step)[0])
+            outputs.append(flag_attn.fused_recurrent_gated_delta_rule_fwd(**step)[0])
         stacked = torch.cat(outputs, dim=1).reshape_as(full_o)
         torch.testing.assert_close(stacked, full_o, rtol=1.0e-2, atol=2.0e-3)
         torch.testing.assert_close(pool[stable.long()], full_s[ids[:, -1].long()], rtol=2.0e-4, atol=2.0e-5)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     def test_recurrent_zero_decay_beta_limits(self):
         case = make_case(3, 4, 2, 6)
         case["g"].zero_()
         case["beta"][..., 0] = 0
         case["beta"][..., 1] = 1
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     def test_recurrent_preallocated_kernel_is_exercised(self):
         from flag_attn.FLA.gated_delta_rule.fused_recurrent import _launch
 
@@ -1120,6 +1143,7 @@ class TestRecurrentGatedDeltaRule:
         assert "recurrent_fwd_kernel" in kernel.name
         check_close(out, case["initial_state"], *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     @pytest.mark.parametrize("strided_state", [False, True])
     def test_recurrent_gate_and_state_strides(self, strided_state):
         case = make_case(3, 3, 2, 6, kdim=60, vdim=80)
@@ -1134,20 +1158,21 @@ class TestRecurrentGatedDeltaRule:
             case["initial_state"] = backing.transpose(-1, -2)
             case["initial_state"].copy_(state)
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     def test_recurrent_public_export(self):
-        import flag_attn
-
         case = make_case(2, 1, 2, 4)
         expected = reference(case)
         check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     def test_recurrent_padded_projection_buffer(self):
         case = make_case(3, 4, 2, 6, spec=True, projection_padding=64)
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     def test_recurrent_padding_snapshots_are_initialized(self, monkeypatch):
         case = make_case(4, 4, 2, 6, padding=True, spec=True)
         case["inplace_final_state"] = False
@@ -1162,17 +1187,19 @@ class TestRecurrentGatedDeltaRule:
 
         with monkeypatch.context() as patch:
             patch.setattr(torch, "empty", poisoned_empty)
-            out, final = fused_recurrent_gated_delta_rule_fwd(**case)
+            out, final = flag_attn.fused_recurrent_gated_delta_rule_fwd(**case)
         check_close(out, final, *expected)
         assert torch.count_nonzero(final[-4:]) == 0
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     def test_recurrent_invalid_write_slot_keeps_cache(self):
         case = make_case(3, 4, 2, 6, spec=True)
         case["num_accepted_tokens"].fill_(1)
         case["ssm_state_indices"][0, -1] = 0
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     @pytest.mark.parametrize("values", ["zero", "impulse"])
     def test_recurrent_longer_verification_values(self, values):
         case = make_case(3, 16, 2, 6, kdim=127, vdim=129, spec=True)
@@ -1185,8 +1212,9 @@ class TestRecurrentGatedDeltaRule:
             case["k"][..., 0] = 1
             case["v"][:, 0, :, 0] = 1
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     def test_recurrent_pre_normalized_inputs(self):
         case = make_case(4, 8, 2, 6, spec=True)
         for name in ("q", "k"):
@@ -1194,14 +1222,16 @@ class TestRecurrentGatedDeltaRule:
             case[name] = torch.nn.functional.normalize(x.float(), dim=-1).to(x.dtype)
         case["use_qk_l2norm_in_kernel"] = False
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     @pytest.mark.parametrize("lengths", [[0, 0, 0], [0, 1, 0]])
     def test_recurrent_empty_batch_segments(self, lengths):
         case = make_case(3, 1, 2, 4, lengths=lengths)
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     @pytest.mark.parametrize("varlen", [False, True])
     def test_recurrent_single_read_index_without_inplace_writes(self, varlen):
         case = make_case(2, 4, 2, 4)
@@ -1214,9 +1244,10 @@ class TestRecurrentGatedDeltaRule:
             case["cu_seqlens"] = None
         initial = case["initial_state"].clone()
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
         torch.testing.assert_close(case["initial_state"], initial, rtol=0, atol=0)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     @pytest.mark.parametrize("invalid", ["v_rank", "g_dtype", "beta_dtype", "empty_indices", "short_indices"])
     def test_recurrent_invalid_metadata(self, invalid):
         case = make_case(2, 4, 2, 4)
@@ -1235,8 +1266,9 @@ class TestRecurrentGatedDeltaRule:
             case["cu_seqlens"] = None
             case["ssm_state_indices"] = case["ssm_state_indices"][:, :2]
         with pytest.raises(ValueError):
-            fused_recurrent_gated_delta_rule_fwd(**case)
+            flag_attn.fused_recurrent_gated_delta_rule_fwd(**case)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize("vector_beta", [False, True])
     @pytest.mark.parametrize("normalize", [False, True])
@@ -1253,13 +1285,13 @@ class TestRecurrentGatedDeltaRule:
                 case[name] = torch.nn.functional.normalize(case[name].float(), dim=-1).to(case[name].dtype)
             case["use_qk_l2norm_in_kernel"] = False
         expected = reference(case)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**case), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**case), *expected)
         assert len(calls) == 1 and calls[0]["LAYOUT"] is not None
 
 
-@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 @pytest.mark.skipif(not _cuda_tle_available(), reason="requires CUDA/TLE")
 class TestPackedGatedDeltaRule:
+    @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
     @pytest.mark.parametrize("dims", [(1, 2, 128, 128), (2, 6, 60, 80), (2, 8, 127, 129), (1, 1, 256, 64)])
     @pytest.mark.parametrize("seed", [0, 17])
@@ -1283,7 +1315,7 @@ class TestPackedGatedDeltaRule:
         for _ in range(3):
             c["initial_state"].copy_(state0)
             c["out"].fill_(float("nan"))
-            result = fused_recurrent_gated_delta_rule_packed_decode(**c)
+            result = flag_attn.fused_recurrent_gated_delta_rule_packed_decode(**c)
             assert result[0] is c["out"] and result[1] is c["initial_state"]
             check_close(*result, *expected)
             if previous is not None:
@@ -1291,6 +1323,7 @@ class TestPackedGatedDeltaRule:
             previous = [x.clone() for x in result]
         assert len(calls) == 3
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
     @torch.inference_mode()
     def test_packed_beta_rounding_in_fp32_cache(self, dtype):
@@ -1301,13 +1334,14 @@ class TestPackedGatedDeltaRule:
         c["scale"] = 1.0
         c["use_qk_l2norm_in_kernel"] = False
         expected = c["b"].float().sigmoid().to(dtype).float()
-        _, state = fused_recurrent_gated_delta_rule_packed_decode(**c)
+        _, state = flag_attn.fused_recurrent_gated_delta_rule_packed_decode(**c)
         slot = c["ssm_state_indices"].long()
         torch.testing.assert_close(state[slot, 0, 0, 0], expected[:, 0], rtol=2e-4, atol=2e-5)
         untouched = state.clone()
         untouched[slot] = 0
         assert torch.count_nonzero(untouched) == 0
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @pytest.mark.parametrize(
         "case",
         [
@@ -1366,21 +1400,21 @@ class TestPackedGatedDeltaRule:
             for name in ("mixed_qkv", "a", "b", "out", "ssm_state_indices"):
                 c[name] = c[name][:0]
         expected = reference_packed(c)
-        check_close(*fused_recurrent_gated_delta_rule_packed_decode(**c), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_packed_decode(**c), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @torch.inference_mode()
     def test_packed_continuation_matches_recurrent(self):
-        from flag_attn import fused_recurrent_gated_delta_rule_fwd
-
         c = make_packed_case()
         separate = c["initial_state"].clone()
         for seed in range(4):
             torch.manual_seed(seed)
             c["mixed_qkv"].normal_()
             expected_case = unpack_reference_case({**c, "initial_state": separate})
-            expected = fused_recurrent_gated_delta_rule_fwd(**expected_case)
-            check_close(*fused_recurrent_gated_delta_rule_packed_decode(**c), *expected)
+            expected = flag_attn.fused_recurrent_gated_delta_rule_fwd(**expected_case)
+            check_close(*flag_attn.fused_recurrent_gated_delta_rule_packed_decode(**c), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @torch.inference_mode()
     def test_packed_split_grid(self):
         n, hv = 21846, 3
@@ -1395,12 +1429,12 @@ class TestPackedGatedDeltaRule:
             out=torch.full((n, 1, hv, 1), float("nan"), device="cuda", dtype=torch.bfloat16),
             ssm_state_indices=torch.arange(1, n + 1, device="cuda", dtype=torch.int64),
         )
-        out, state = fused_recurrent_gated_delta_rule_packed_decode(**c)
+        out, state = flag_attn.fused_recurrent_gated_delta_rule_packed_decode(**c)
         assert torch.count_nonzero(out) == 0 and torch.count_nonzero(state) == 0
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @torch.inference_mode()
     def test_public_exports_and_untouched_padding(self):
-        import flag_attn
         from flag_attn.FLA.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
 
         assert flag_attn.chunk_gated_delta_rule_fwd is chunk_gated_delta_rule_fwd
@@ -1415,6 +1449,7 @@ class TestPackedGatedDeltaRule:
         untouched[c["ssm_state_indices"][1].long()] = False
         assert torch.equal(c["initial_state"][untouched], original[untouched])
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @pytest.mark.parametrize("axis", ["projection", "state_head", "state_value", "state_key"])
     @torch.inference_mode()
     def test_large_relative_offsets(self, axis):
@@ -1438,15 +1473,15 @@ class TestPackedGatedDeltaRule:
             view.copy_(state)
             c["initial_state"] = view
         expected = reference_packed(c)
-        check_close(*fused_recurrent_gated_delta_rule_packed_decode(**c), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_packed_decode(**c), *expected)
         assert torch.count_nonzero(c["out"]) > 0
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("dims", [(128, 128), (256, 64), (64, 256)])
     @torch.inference_mode()
     def test_low_precision_cache_large_parallelism(self, state_dtype, dims):
         from flag_attn.FLA.gated_delta_rule.packed_decode import _launch_packed
-        from flag_attn import fused_recurrent_gated_delta_rule_fwd
         from gdn_utils import make_case, reference
 
         c = make_packed_case(n=64, h=4, hv=8, kdim=dims[0], vdim=dims[1], state_dtype=state_dtype)
@@ -1456,8 +1491,9 @@ class TestPackedGatedDeltaRule:
         check_close(c["out"], c["initial_state"], *expected)
         recurrent = make_case(64, 3, 4, 8, dims[0], dims[1], state_dtype=state_dtype, spec=True)
         expected = reference(recurrent)
-        check_close(*fused_recurrent_gated_delta_rule_fwd(**recurrent), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_fwd(**recurrent), *expected)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @pytest.mark.parametrize("case", ["width", "out", "indices", "gate", "parameter", "grad"])
     def test_packed_invalid(self, case):
         c = make_packed_case()
@@ -1474,8 +1510,9 @@ class TestPackedGatedDeltaRule:
         if case == "grad":
             c["mixed_qkv"].requires_grad_(True)
         with pytest.raises((ValueError, RuntimeError)):
-            fused_recurrent_gated_delta_rule_packed_decode(**c)
+            flag_attn.fused_recurrent_gated_delta_rule_packed_decode(**c)
 
+    @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
     @torch.inference_mode()
     def test_packed_large_cache_reuses_read_slot(self, state_dtype, monkeypatch):
@@ -1488,5 +1525,5 @@ class TestPackedGatedDeltaRule:
         c["ssm_state_indices"][0] = 0
         c["ssm_state_indices"][-1] = -1
         expected = reference_packed(c)
-        check_close(*fused_recurrent_gated_delta_rule_packed_decode(**c), *expected)
+        check_close(*flag_attn.fused_recurrent_gated_delta_rule_packed_decode(**c), *expected)
         assert len(calls) == 1 and calls[0]["REUSE_PACKED_STATE"]
