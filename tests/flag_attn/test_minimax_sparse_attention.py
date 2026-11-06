@@ -769,28 +769,22 @@ def test_decode_topk_identity_out_and_score_out_bf16() -> None:
             assert torch.all(torch.isfinite(score_out[:, query_id, :valid_blocks]))
 
 
-@pytest.mark.skipif(
-    not test_backend.supports_msa_fp8(),
-    reason="FP8 tests require accelerator FP8 support",
-)
-@pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
-@pytest.mark.parametrize("case", PREFILL_CASES[:2], ids=("boundary", "selection"))
-@pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn"), reason=test_backend.skip_reason("minimax_m3_sparse_attn"))
-def test_prefill_fp8(mode: str, case: tuple) -> None:
-    _run_prefill(case, mode)
+if test_backend.supports_msa_fp8():
+    @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
+    @pytest.mark.parametrize("case", PREFILL_CASES[:2], ids=("boundary", "selection"))
+    @pytest.mark.minimax_m3_sparse_attn
+    @pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn"), reason=test_backend.skip_reason("minimax_m3_sparse_attn"))
+    def test_prefill_fp8(mode: str, case: tuple) -> None:
+        _run_prefill(case, mode)
 
 
-@pytest.mark.skipif(
-    not test_backend.supports_msa_fp8(),
-    reason="FP8 tests require accelerator FP8 support",
-)
-@pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
-@pytest.mark.parametrize("case", DECODE_CASES[:2], ids=("boundary", "selection"))
-@pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn_decode"), reason=test_backend.skip_reason("minimax_m3_sparse_attn_decode"))
-def test_decode_fp8(mode: str, case: tuple) -> None:
-    _run_decode(case, mode)
+    @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
+    @pytest.mark.parametrize("case", DECODE_CASES[:2], ids=("boundary", "selection"))
+    @pytest.mark.minimax_m3_sparse_attn
+    @pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn_decode"), reason=test_backend.skip_reason("minimax_m3_sparse_attn_decode"))
+    def test_decode_fp8(mode: str, case: tuple) -> None:
+        _run_decode(case, mode)
+
 
 
 def _non_pow2_prefill_inputs(head_dim: int, group_size: int, num_kv_heads: int):

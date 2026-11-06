@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from flag_attn import runtime
 from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gdn2
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
@@ -165,9 +164,9 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
 @pytest.mark.chunk_gdn2
 @pytest.mark.parametrize(
     "impl",
-    [pytest.param("backend", id="backend")]
-    if runtime.device.vendor_name == "mthreads"
-    else [pytest.param("tle", id="tle"), pytest.param("native", id="native")],
+    [pytest.param("tle", id="tle"), pytest.param("native", id="native")]
+    if importlib.import_module("flag_attn.gdn2.chunk").HAS_TLE_GDN2
+    else [pytest.param("backend", id="backend")],
 )
 @pytest.mark.parametrize(
     "shape,dtype",
@@ -175,10 +174,6 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
 )
 @torch.inference_mode()
 def test_chunk_gdn2_matches_native_triton(impl, dtype, shape):
-    module = importlib.import_module("flag_attn.gdn2.chunk")
-    if impl == "tle" and not module.HAS_TLE_GDN2:
-        pytest.skip("TLE GDN2 path is unavailable in this environment")
-
     torch.manual_seed(42)
     B, T, H, K, V = shape
     args, kwargs = _make_inputs(
@@ -194,8 +189,8 @@ def test_chunk_gdn2_matches_native_triton(impl, dtype, shape):
     expected, expected_final = _native_gdn2_reference(*args, **kwargs)
 
     actual_kwargs = dict(kwargs)
-    if impl != "native":
-        # The fused inference path uses 16-token chunks; the reference uses 64.
+    if impl == "tle":
+        # The fused TLE inference path uses 16-token chunks; the native path uses 64.
         actual_kwargs["chunk_size"] = 16
 
     if impl == "backend":
@@ -211,17 +206,15 @@ def test_chunk_gdn2_matches_native_triton(impl, dtype, shape):
     _assert_close("ht", actual_final, expected_final)
 
 
-@pytest.mark.chunk_gdn2
-def test_k1_tle_resource_controls_are_enabled():
-    module = importlib.import_module("flag_attn.gdn2.chunk")
-    if not module.HAS_TLE_GDN2:
-        pytest.skip("TLE GDN2 path is unavailable in this environment")
-
-    assert module.K1_TLE_MAXNREG_CANDIDATES == (64, 72, 96)
-    assert module.K1_TLE_SMEM_REUSE_MIN_K == 256
-    source = Path(module.__file__).read_text(encoding="utf-8")
-    assert "tle.gpu.alloc" in source
-    assert "tle.gpu.local_ptr" in source
+if importlib.import_module("flag_attn.gdn2.chunk").HAS_TLE_GDN2:
+    @pytest.mark.chunk_gdn2
+    def test_k1_tle_resource_controls_are_enabled():
+        module = importlib.import_module("flag_attn.gdn2.chunk")
+        assert module.K1_TLE_MAXNREG_CANDIDATES == (64, 72, 96)
+        assert module.K1_TLE_SMEM_REUSE_MIN_K == 256
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert "tle.gpu.alloc" in source
+        assert "tle.gpu.local_ptr" in source
 
 
 @pytest.fixture(scope="module", params=[torch.float16, torch.bfloat16])

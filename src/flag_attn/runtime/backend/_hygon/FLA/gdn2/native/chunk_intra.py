@@ -32,7 +32,7 @@ from .chunk_intra_token_parallel import chunk_gdn2_fwd_intra_token_parallel
 from .wy_fast import recompute_w_u_fwd_gdn2
 
 IS_TF32_SUPPORTED = (
-    device.vendor_name == "nvidia" and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+    device.vendor_name == "nvidia" and torch.cuda.is_available() and torch.version.cuda is not None and torch.cuda.get_device_capability()[0] >= 8
 )
 
 IS_GATHER_SUPPORTED = hasattr(tl, "gather")
@@ -43,8 +43,6 @@ else:
 
     @triton.jit
     def gather(src, index, axis, _builder=None):
-        # 仅用于让 Triton 解析 inactive branch；
-        # 实际运行时 USE_GATHER=False，不会执行这里。
         return None
 
 

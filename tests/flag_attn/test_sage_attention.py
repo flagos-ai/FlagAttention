@@ -119,17 +119,18 @@ def test_forward_rejects_non_positive_maxnreg():
 
 @pytest.mark.sage_attention
 @pytest.mark.parametrize("mask_kind", ["bool", "additive"])
-def test_forward_supports_masks_and_partial_blocks(mask_kind):
+@pytest.mark.parametrize("kv_len", [70, 257])
+def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len):
     torch.manual_seed(7)
     q = torch.randn((1, 1, 129, 128), device=test_backend.device, dtype=torch.float16)
-    k = torch.randn((1, 1, 70, 128), device=test_backend.device, dtype=torch.float16)
+    k = torch.randn((1, 1, kv_len, 128), device=test_backend.device, dtype=torch.float16)
     v = torch.randn_like(k)
 
     if mask_kind == "bool":
-        attn_mask = torch.ones((1, 1, 129, 70), device=test_backend.device, dtype=torch.bool)
+        attn_mask = torch.ones((1, 1, 129, kv_len), device=test_backend.device, dtype=torch.bool)
         attn_mask[..., ::3] = False
     else:
-        attn_mask = torch.zeros((1, 1, 129, 70), device=test_backend.device, dtype=torch.float32)
+        attn_mask = torch.zeros((1, 1, 129, kv_len), device=test_backend.device, dtype=torch.float32)
         attn_mask[..., ::3] = -2.0
 
     q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
