@@ -802,7 +802,7 @@ def _non_pow2_prefill_inputs(head_dim: int, group_size: int, num_kv_heads: int):
     total_pages = pages_per_req * batch
     topk = pages_per_req
 
-    generator = torch.Generator(device=device).manual_seed(1234)
+    generator = torch.Generator(device="cpu" if device == "gcu" else device).manual_seed(1234)
     q = torch.randn(
         (total_q, num_kv_heads * group_size, head_dim),
         generator=generator,

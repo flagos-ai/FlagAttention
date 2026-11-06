@@ -134,7 +134,7 @@ def _decode_reference(q, r, k, v, scale, window_size_left=-1):
 
 
 def _make_inputs(B, L, HQ, H, D, dtype, seed):
-    generator = torch.Generator(device=test_backend.device).manual_seed(seed)
+    generator = torch.Generator(device="cpu" if test_backend.device == "gcu" else test_backend.device).manual_seed(seed)
     q = torch.randn(B, 1, HQ, D, device=test_backend.device, dtype=dtype, generator=generator)
     r = torch.randn(B, 1, HQ, D, device=test_backend.device, dtype=dtype, generator=generator) * 0.5
     k = torch.randn(B, L, H, D, device=test_backend.device, dtype=dtype, generator=generator)

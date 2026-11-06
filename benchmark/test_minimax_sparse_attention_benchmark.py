@@ -858,7 +858,7 @@ def _run_dtype(
                 "cannot exceed seq_len"
             )
 
-        generator = torch.Generator(device=device)
+        generator = torch.Generator(device="cpu" if device.type == "gcu" else device)
         generator.manual_seed(args.seed + shape_index + (100_000 if args.decode else 0))
         data = make_data(
             batch,

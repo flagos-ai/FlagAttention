@@ -55,9 +55,9 @@ def cuda_capability(*args):
 
 def supports_msa_fp8() -> bool:
     """Whether the active MSA backend accepts FP8 inputs, for tests and benchmarks."""
-    if runtime.device.vendor_name in {"hygon", "metax"}:
-        # Hygon receives dequantized inputs; MetaX Triton cannot lower the
-        # FP8 index and attention kernels in this backend.
+    if runtime.device.vendor_name in {"enflame", "hygon", "metax"}:
+    # Enflame lacks the tested FP8 conversion/prefill path; Hygon receives
+    # dequantized inputs; MetaX cannot lower the FP8 index/attention kernels.
         return False
     if getattr(torch, "float8_e4m3fn", None) is None:
         return False

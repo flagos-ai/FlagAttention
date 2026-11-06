@@ -92,7 +92,7 @@ def _decode_reference(q, r, k, v, scale, window_size_left=-1):
 
 
 def _inputs(B, L, HQ, H, D, dtype, seed=0):
-    generator = torch.Generator(device=test_backend.device).manual_seed(seed)
+    generator = torch.Generator(device="cpu" if test_backend.device == "gcu" else test_backend.device).manual_seed(seed)
     q = torch.randn(B, 1, HQ, D, device=test_backend.device, dtype=dtype, generator=generator)
     r = torch.randn(B, 1, HQ, D, device=test_backend.device, dtype=dtype, generator=generator) * 0.5
     k = torch.randn(B, L, H, D, device=test_backend.device, dtype=dtype, generator=generator)
@@ -193,7 +193,7 @@ def test_tle_noncontiguous_decode_inputs():
     """Decode commonly receives q[:, -1:], which need not be contiguous."""
     _require_tle()
     B, L, H, D = 2, 1024, 8, 128
-    generator = torch.Generator(device=test_backend.device).manual_seed(7)
+    generator = torch.Generator(device="cpu" if test_backend.device == "gcu" else test_backend.device).manual_seed(7)
     q_full = torch.randn(B, 3, H, D, device=test_backend.device, dtype=torch.bfloat16, generator=generator)
     r_full = torch.randn(B, 3, H, D, device=test_backend.device, dtype=torch.bfloat16, generator=generator)
     k = torch.randn(B, L, H, D, device=test_backend.device, dtype=torch.bfloat16, generator=generator)
