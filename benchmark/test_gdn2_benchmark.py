@@ -4,10 +4,10 @@ from __future__ import annotations
 
 
 import argparse
+import importlib
 import math
 from collections.abc import Callable
 
-import pytest
 import torch
 import triton
 
@@ -18,7 +18,6 @@ except ModuleNotFoundError:  # Direct script execution.
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gdn2
-from flag_attn.gdn2.chunk import HAS_TLE_GDN2
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
 
 
@@ -36,13 +35,6 @@ ALL_SHAPES = [
     (8, 1024, 8, 64, 64),
     (8, 2048, 32, 256, 256),
 ]
-
-DEFAULT_SHAPES = [
-    (2, 512, 8, 64, 64),
-    (1, 2048, 8, 64, 64),
-    (2, 2048, 16, 256, 512),
-]
-
 
 def _parse_shape(value: str) -> tuple[int, int, int, int, int]:
     try:
@@ -118,8 +110,10 @@ def run_benchmark(
     compare_native = test_backend.device == "cuda"
 
     dtype = getattr(torch, args.dtype)
-    shapes = args.shape or (ALL_SHAPES if args.full else DEFAULT_SHAPES)
+    shapes = args.shape or ALL_SHAPES
     print(f"GPU: {test_backend.get_device_name()} | dtype: {args.dtype}")
+    implementation = importlib.import_module(chunk_gdn2.__module__)
+    print(f"Public implementation: {chunk_gdn2.__module__} | TLE: {getattr(implementation, 'HAS_TLE_GDN2', False)}")
     print("B,T,H,K,V                     native_ms   public_ms     speedup")
     print("-" * 66)
     recorder = BenchmarkRecorder(
@@ -150,9 +144,3 @@ def run_benchmark(
         del inputs
         test_backend.device_fn.empty_cache()
     recorder.record()
-
-
-@pytest.mark.chunk_gdn2
-@pytest.mark.skipif(not test_backend.supports_operator("chunk_gdn2"), reason=test_backend.skip_reason("chunk_gdn2"))
-def test_chunk_gdn2_benchmark(record_property) -> None:
-    run_benchmark([], record_property)

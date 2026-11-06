@@ -554,3 +554,367 @@ gated_activation:
       - 8
     block_n:
       - 1024
+
+# Measured H100 SM90 BF16 winners selected by complete native WORKLOAD keys.
+_chunk_gdn2_fwd_intra_infer_kernel:
+- WORKLOAD:
+  - 64
+  - 128
+  - 128
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  META:
+    BK: 64
+    BV: 64
+  num_warps: 1
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 96
+  - 128
+  - 128
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  META:
+    BK: 64
+    BV: 64
+  num_warps: 1
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 32
+  - 256
+  - 256
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  META:
+    BK: 32
+    BV: 64
+  num_warps: 2
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 16
+  - 256
+  - 512
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  META:
+    BK: 32
+    BV: 64
+  num_warps: 4
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 8
+  - 256
+  - 512
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  META:
+    BK: 64
+    BV: 64
+  num_warps: 4
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 16
+  - 64
+  - 64
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  META:
+    BK: 64
+    BV: 64
+  num_warps: 1
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 16
+  - 128
+  - 128
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  META:
+    BK: 64
+    BV: 64
+  num_warps: 1
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 8
+  - 64
+  - 64
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  META:
+    BK: 64
+    BV: 64
+  num_warps: 2
+  num_stages: 2
+  num_ctas: 1
+  maxnreg: null
+_chunk_gdn2_fwd_h_o_infer_kernel:
+- WORKLOAD:
+  - 64
+  - 128
+  - 128
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.float32
+  META:
+    BV: 64
+  num_warps: 4
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 16
+  - 256
+  - 512
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.float32
+  META:
+    BV: 64
+  num_warps: 4
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 96
+  - 128
+  - 128
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.float32
+  META:
+    BV: 64
+  num_warps: 4
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 16
+  - 128
+  - 128
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.float32
+  META:
+    BV: 32
+  num_warps: 4
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 8
+  - 256
+  - 512
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.float32
+  META:
+    BV: 64
+  num_warps: 4
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 16
+  - 64
+  - 64
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.float32
+  META:
+    BV: 32
+  num_warps: 4
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 8
+  - 64
+  - 64
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.float32
+  META:
+    BV: 32
+  num_warps: 4
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null
+- WORKLOAD:
+  - 32
+  - 256
+  - 256
+  - 16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.bfloat16
+  - torch.float32
+  - torch.float32
+  META:
+    BV: 64
+  num_warps: 4
+  num_stages: 3
+  num_ctas: 1
+  maxnreg: null

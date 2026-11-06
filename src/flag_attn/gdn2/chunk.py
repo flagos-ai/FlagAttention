@@ -17,7 +17,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# 此仓库的pre index的入口参数没有BT，不支持varlen
 from flag_attn.utils import has_triton_tle
 from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 
@@ -38,6 +37,10 @@ if has_triton_tle(3, 6, 0):
 else:
     tle = None
     HAS_TLE_GDN2 = False
+
+
+if HAS_TLE_GDN2:
+    from ._workload_tuning import get_gdn2_workload_kernel
 
 
 __all__ = ["chunk_gdn2"]
@@ -99,7 +102,6 @@ def softplus_nv(x):
 
 softplus = softplus_nv
 
-# triton实现
 
 # 3. TLE kernels for GDN-2 prefill, BT=16, inference path.
 if HAS_TLE_GDN2:
@@ -531,7 +533,7 @@ if HAS_TLE_GDN2:
         Aqk = torch.empty(B, T_len, H, BT, device=q.device, dtype=q.dtype)
         Akk = torch.empty(B, T_len, H, BT, device=q.device, dtype=q.dtype)
 
-        _chunk_gdn2_fwd_intra_infer_kernel[grid](
+        launch_arguments = dict(
             q=q,
             k=k,
             v=v,
@@ -560,6 +562,12 @@ if HAS_TLE_GDN2:
             V=V,
             BT=BT,
         )
+        kernel = get_gdn2_workload_kernel(
+            "_chunk_gdn2_fwd_intra_infer_kernel",
+            _chunk_gdn2_fwd_intra_infer_kernel,
+            launch_arguments,
+        )
+        kernel[grid](**launch_arguments)
         return w_wy, u_wy, qg, kg, Aqk, Akk, g_out
 
     # =============================================================================
@@ -1322,7 +1330,7 @@ if HAS_TLE_GDN2:
         def grid(meta):
             return (triton.cdiv(V, meta["BV"]), N * H)
 
-        _chunk_gdn2_fwd_h_o_infer_kernel[grid](
+        launch_arguments = dict(
             kg=kg,
             w_wy=w_wy,
             u_wy=u_wy,
@@ -1343,6 +1351,12 @@ if HAS_TLE_GDN2:
             BT=BT,
             STATE_V_FIRST=state_v_first,
         )
+        kernel = get_gdn2_workload_kernel(
+            "_chunk_gdn2_fwd_h_o_infer_kernel",
+            _chunk_gdn2_fwd_h_o_infer_kernel,
+            launch_arguments,
+        )
+        kernel[grid](**launch_arguments)
 
         if return_intermediate_states:
             return o, final_state, h
@@ -1471,7 +1485,7 @@ if HAS_TLE_GDN2:
         )
 
 
-# 4. 唯一公开入口
+# 4. Public entry point
 def chunk_gdn2(
     q,
     k,
