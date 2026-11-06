@@ -12,7 +12,7 @@ except ModuleNotFoundError:  # Direct script execution.
     from recording import BenchmarkRecorder
 
 from flag_attn.testing import backend as test_backend
-from flag_attn import chunk_gdn2
+from flag_attn import chunk_gdn2, runtime
 from flag_attn.gdn2.chunk import HAS_TLE_GDN2
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
 
@@ -92,7 +92,11 @@ def _public_forward(inputs):
         scale=q.shape[-1] ** -0.5,
         initial_state=initial_state,
         output_final_state=True,
-        chunk_size=16 if HAS_TLE_GDN2 else 64,
+        chunk_size=(
+            16
+            if HAS_TLE_GDN2 or runtime.device.vendor_name in {"mthreads", "metax"}
+            else 64
+        ),
     )
 
 

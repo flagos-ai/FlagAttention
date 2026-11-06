@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from flag_attn.testing import backend as test_backend
-from flag_attn import chunk_gdn2
+from flag_attn import chunk_gdn2, runtime
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
 from flag_attn.gdn2.native.output import chunk_gla_fwd_kernel_o
 
@@ -189,8 +189,10 @@ def test_chunk_gdn2_matches_native_triton(impl, dtype, shape):
     expected, expected_final = _native_gdn2_reference(*args, **kwargs)
 
     actual_kwargs = dict(kwargs)
-    if impl == "tle":
-        # The fused TLE inference path uses 16-token chunks; the native path uses 64.
+    if impl == "tle" or (
+        impl == "backend" and runtime.device.vendor_name in {"mthreads", "metax"}
+    ):
+        # These fused inference backends require 16-token chunks.
         actual_kwargs["chunk_size"] = 16
 
     if impl == "backend":
