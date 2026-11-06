@@ -1,0 +1,440 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Chunked GLA forward for the Ascend backend (experimental, correctness first).
+
+This module only adds a chunked forward; the public ``chunk_gla`` entry point
+in ``api.py`` pairs it with the backward in ``chunk_bwd.py`` for fixed-length
+inputs, and keeps dispatching variable-length inputs to the recurrent
+implementation in ``recurrent.py``.
+
+The formulation follows ``fla/ops/gla/chunk.py``.  With per-chunk gates
+cumsummed in base 2 (``g_cum``, float32) and ``BT`` tokens per chunk:
+
+    k_e   = k * exp2(g_last - g_cum)
+    h_i   = exp2(g_last) * h_{i-1} + k_e^T v_i          (sequential over chunks)
+    A     = scale * q @ k^T * exp2(g_i - g_j), j <= i    (intra chunk, causal)
+    o     = scale * (q * exp2(g_cum)) @ h_{i-1} + A @ v
+
+Numerical notes:
+* every ``tl.dot`` runs in float32 (exact on this target and, at these tile
+  sizes, faster than casting the operands down), and the inter-chunk state is
+  kept in float32.  Both match what the FLA Ascend backend does to keep the
+  recurrence stable;
+* ``A`` is built in ``BC``-wide column panels: the panel midpoint is the
+  exponent reference for the ``exp2(g_i - g_j)`` factorisation, and the rows
+  above the panel are dropped from the load.  That bounds each exponential to
+  half the decay of a panel instead of the whole chunk, which matters because a
+  64-token reference overflows float32 for strongly decaying gates: the tests
+  reach ``logsigmoid / 0.1``, i.e. ~10 log2 units per token, where a plain
+  16-token panel already overflows to inf.
+
+Not implemented here: variable-length inputs (``cu_seqlens``); the backward
+lives in ``chunk_bwd.py``.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+__all__ = ["chunk_gla_fwd_chunked"]
+
+RCP_LN2 = tl.constexpr(1.4426950216)
+# Chunk size for the inter-chunk state scan, and column-panel width of the
+# intra-chunk attention matrix.  ``BC`` bounds the exponent span of A: splitting
+# exp2(g_i - g_j) as exp2(g_i - ref) * exp2(ref - g_j) around a reference inside
+# the panel lets each factor reach exp2((BC // 2) * |g| * log2 e), which is
+# capped by ``PANEL_LOG_MAX`` below.  The tests go up to
+# ``logsigmoid(rand) / 0.1``, i.e. ~10 log2 units per token: 8 tokens of span
+# stays near 2^80, 16 are already past the float32 range.
+BT = 64
+BC = 16
+# Cap on the panel exponent, in log2 units.  It keeps rows above the panel
+# finite (their dA / q values are zero) without touching the in-panel factors.
+PANEL_LOG_MAX = tl.constexpr(100.0)
+# Launch tiles.  The state scan and the output projection use much wider tiles
+# than the intra-chunk matrix: both amortise redundant k/v (resp. h) loads.
+BK = 64
+BV = 256
+STATE_BK = 128
+STATE_BV = 128
+MAX_HEAD_DIM = 512
+
+
+@triton.jit
+def exp2(x):
+    """Base-2 exponential in float32 (gates are pre-scaled by log2(e))."""
+    return tl.exp2(x.to(tl.float32))
+
+
+def _state_tiles(K: int, V: int) -> tuple[int, int]:
+    """Tile sizes of the sequential state scan, clamped to the head dims."""
+    return min(STATE_BK, triton.next_power_of_2(K)), min(STATE_BV, triton.next_power_of_2(V))
+
+
+@triton.jit(do_not_specialize=["T"])
+def chunk_gla_fwd_cumsum_kernel(
+    g,
+    g_cum,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Per-chunk inclusive cumsum of the gate, in base-2 log units."""
+    i_t = tl.program_id(0)
+    i_k = tl.program_id(1)
+    i_bh = tl.program_id(2).to(tl.int64)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_k = i_k * BK + tl.arange(0, BK)
+    m = (o_t[:, None] < T) & (o_k[None, :] < K)
+
+    off = i_b * T * H * K + i_h * K
+    b_g = tl.load(g + off + o_t[:, None] * (H * K) + o_k[None, :], mask=m, other=0.0)
+    b_g = tl.cumsum(b_g.to(tl.float32) * RCP_LN2, axis=0)
+    tl.store(g_cum + off + o_t[:, None] * (H * K) + o_k[None, :], b_g, mask=m)
+
+
+@triton.jit(do_not_specialize=["T", "NT"])
+def chunk_gla_fwd_h_kernel(
+    k,
+    v,
+    g_cum,
+    h,
+    h0,
+    ht,
+    T,
+    NT,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
+):
+    """Sequential inter-chunk state scan; stores the state entering each chunk."""
+    i_k = tl.program_id(0)
+    i_v = tl.program_id(1)
+    i_bh = tl.program_id(2).to(tl.int64)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_k = o_k < K
+    m_v = o_v < V
+    m_h = m_k[:, None] & m_v[None, :]
+
+    b_h = tl.zeros([BK, BV], dtype=tl.float32)
+    if USE_INITIAL_STATE:
+        p_h0 = h0 + i_bh * K * V
+        if STATE_V_FIRST:
+            b_h = tl.trans(
+                tl.load(p_h0 + o_v[:, None].to(tl.int64) * K + o_k[None, :], mask=m_v[:, None] & m_k[None, :],
+                        other=0.0))
+        else:
+            b_h = tl.load(p_h0 + o_k[:, None].to(tl.int64) * V + o_v[None, :], mask=m_h, other=0.0)
+        b_h = b_h.to(tl.float32)
+
+    base_k = i_b * T * H * K + i_h * K
+    base_v = i_b * T * H * V + i_h * V
+    for i_t in range(NT):
+        o_t = i_t * BT + tl.arange(0, BT)
+        m_t = o_t < T
+        m_kt = m_k[:, None] & m_t[None, :]
+        m_tv = m_t[:, None] & m_v[None, :]
+
+        o_h = ((i_b * NT + i_t) * H + i_h) * K * V
+        if STATE_V_FIRST:
+            p_h = h + o_h + o_v[:, None].to(tl.int64) * K + o_k[None, :]
+            tl.store(p_h, tl.trans(b_h), mask=m_v[:, None] & m_k[None, :])
+        else:
+            p_h = h + o_h + o_k[:, None].to(tl.int64) * V + o_v[None, :]
+            tl.store(p_h, b_h, mask=m_h)
+
+        last_idx = i_t * BT + BT - 1
+        last_idx = tl.where(last_idx < T, last_idx, T - 1)
+        b_gl = tl.load(g_cum + base_k + last_idx * (H * K) + o_k, mask=m_k, other=0.0)
+        b_k = tl.load(k + base_k + o_t[None, :] * (H * K) + o_k[:, None], mask=m_kt, other=0.0)
+        b_g = tl.load(g_cum + base_k + o_t[None, :] * (H * K) + o_k[:, None], mask=m_kt, other=0.0)
+        b_v = tl.load(v + base_v + o_t[:, None] * (H * V) + o_v[None, :], mask=m_tv, other=0.0)
+
+        b_h = b_h * exp2(b_gl)[:, None]
+        b_ke = b_k.to(tl.float32) * exp2(b_gl[:, None] - b_g)
+        b_h = tl.dot(b_ke, b_v.to(tl.float32), b_h)
+
+    if STORE_FINAL_STATE:
+        p_ht = ht + i_bh * K * V
+        if STATE_V_FIRST:
+            tl.store(p_ht + o_v[:, None].to(tl.int64) * K + o_k[None, :], tl.trans(b_h),
+                     mask=m_v[:, None] & m_k[None, :])
+        else:
+            tl.store(p_ht + o_k[:, None].to(tl.int64) * V + o_v[None, :], b_h, mask=m_h)
+
+
+@triton.jit(do_not_specialize=["T"])
+def chunk_gla_fwd_A_kernel(
+    q,
+    k,
+    g_cum,
+    A,
+    scale,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Intra-chunk causal matrix: A[i, j] = scale * q_i.k_j * exp2(g_i - g_j).
+
+    A is built in ``BC``-wide column panels.  The panel *midpoint* is the
+    exponent reference, so the key and the query factor each span at most
+    ``BC // 2`` tokens and the row factor is capped at ``PANEL_LOG_MAX``.  A
+    single 64-token reference, or even a 16-token one anchored at the panel
+    start, lets those exponentials run past the float32 range for strongly
+    decaying gates.
+    """
+    i_t = tl.program_id(0)
+    i_bh = tl.program_id(1).to(tl.int64)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    o_j = tl.arange(0, BT)
+    o_t = i_t * BT + o_j
+    o_r = tl.arange(0, BC)
+    m_t = o_t < T
+    base_k = i_b * T * H * K + i_h * K
+
+    for i_p in tl.static_range(BT // BC):
+        c0 = i_t * BT + i_p * BC
+        if c0 < T:
+            o_c = c0 + o_r
+            m_c = o_c < T
+            c_mid = tl.minimum(c0 + BC // 2, T - 1)
+            # Rows above the panel are never needed for these columns; dropping
+            # them from the load also keeps their exponent inside float32.
+            m_q = m_t & (o_t >= c0)
+            b_A = tl.zeros([BT, BC], dtype=tl.float32)
+            for i_k in range(tl.cdiv(K, BK)):
+                o_k = i_k * BK + tl.arange(0, BK)
+                m_k = o_k < K
+                b_ref = tl.load(g_cum + base_k + c_mid * (H * K) + o_k, mask=m_k, other=0.0)
+                b_q = tl.load(q + base_k + o_t[:, None] * (H * K) + o_k[None, :],
+                              mask=m_q[:, None] & m_k[None, :], other=0.0)
+                b_g = tl.load(g_cum + base_k + o_t[:, None] * (H * K) + o_k[None, :],
+                              mask=m_q[:, None] & m_k[None, :], other=0.0)
+                b_qg = b_q.to(tl.float32) * exp2(tl.minimum(b_g - b_ref[None, :], PANEL_LOG_MAX))
+                b_kt = tl.load(k + base_k + o_c[None, :] * (H * K) + o_k[:, None],
+                               mask=m_k[:, None] & m_c[None, :], other=0.0)
+                b_gt = tl.load(g_cum + base_k + o_c[None, :] * (H * K) + o_k[:, None],
+                               mask=m_k[:, None] & m_c[None, :], other=0.0)
+                b_kg = b_kt.to(tl.float32) * exp2(b_ref[:, None] - b_gt)
+                b_A = tl.dot(b_qg, b_kg, b_A)
+            b_A = tl.where(o_t[:, None] >= o_c[None, :], b_A * scale, 0.0)
+            p_A = A + (i_b * T + o_t)[:, None] * (H * BT) + i_h * BT + (o_c - i_t * BT)[None, :]
+            tl.store(p_A, b_A, mask=m_t[:, None])
+
+
+@triton.jit(do_not_specialize=["T", "NT"])
+def chunk_gla_fwd_o_kernel(
+    q,
+    v,
+    g_cum,
+    h,
+    A,
+    o,
+    scale,
+    T,
+    NT,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
+):
+    """o = scale * (q * exp2(g_cum)) @ h_prev + A @ v."""
+    i_v = tl.program_id(0)
+    i_t = tl.program_id(1)
+    i_bh = tl.program_id(2).to(tl.int64)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_t = o_t < T
+    m_v = o_v < V
+    m_tv = m_t[:, None] & m_v[None, :]
+
+    base_q = i_b * T * H * K + i_h * K
+    base_v = i_b * T * H * V + i_h * V
+    o_h = ((i_b * NT + i_t) * H + i_h) * K * V
+
+    b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    for i_k in range(tl.cdiv(K, BK)):
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+        m_tk = m_t[:, None] & m_k[None, :]
+        b_q = tl.load(q + base_q + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0)
+        b_g = tl.load(g_cum + base_q + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0)
+        # Fold the scale into the operand: the accumulator stays untouched.
+        b_qg = b_q * exp2(b_g) * scale
+        if STATE_V_FIRST:
+            b_h = tl.load(h + o_h + o_v[:, None].to(tl.int64) * K + o_k[None, :],
+                          mask=m_v[:, None] & m_k[None, :], other=0.0)
+            b_o = tl.dot(b_qg, tl.trans(b_h), b_o)
+        else:
+            b_h = tl.load(h + o_h + o_k[:, None].to(tl.int64) * V + o_v[None, :],
+                          mask=m_k[:, None] & m_v[None, :], other=0.0)
+            b_o = tl.dot(b_qg, b_h, b_o)
+
+    m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
+    b_A = tl.load(A + (i_b * T + o_t)[:, None] * (H * BT) + i_h * BT + tl.arange(0, BT)[None, :],
+                  mask=m_t[:, None] & m_s, other=0.0)
+    b_v = tl.load(v + base_v + o_t[:, None] * (H * V) + o_v[None, :], mask=m_tv, other=0.0)
+    # float32 dots here are both the accurate and (on this target) the fast path.
+    b_o = tl.dot(tl.where(m_s, b_A, 0.0), b_v.to(tl.float32), b_o)
+    tl.store(o + base_v + o_t[:, None] * (H * V) + o_v[None, :], b_o.to(o.dtype.element_ty), mask=m_tv)
+
+
+def chunk_gla_fwd_chunked(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    state_v_first: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    chunk_size: int | None = None,
+    return_intermediates: bool = False,
+):
+    """Chunked GLA forward.
+
+    Shapes: ``q/k/g`` are ``[B, T, H, K]``, ``v`` and ``o`` are
+    ``[B, T, H, V]``.  ``g`` holds the per-key log gate in natural log units.
+    ``initial_state`` is float32 ``[N, H, K, V]`` (``[N, H, V, K]`` when
+    ``state_v_first``).  Returns ``(o, ht)`` where ``ht`` is the float32 final
+    state (``None`` unless ``output_final_state``).  With
+    ``return_intermediates=True`` a third element ``dict`` carries ``g_cum``,
+    ``h`` and ``A``.
+
+    Variable-length inputs are not supported yet: ``cu_seqlens`` (and the
+    ``cu_seqlens_cpu`` twin kept for API compatibility) must be ``None``.
+    """
+    if cu_seqlens is not None or cu_seqlens_cpu is not None:
+        raise NotImplementedError("chunk_gla_fwd_chunked does not support variable-length inputs yet.")
+    assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
+    assert v.shape[:3] == q.shape[:3], "v must share batch, sequence and head dimensions."
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    if K > MAX_HEAD_DIM or V > MAX_HEAD_DIM:
+        raise ValueError(f"chunked GLA supports K,V <= {MAX_HEAD_DIM}, got K={K}, V={V}.")
+    if initial_state is not None:
+        assert initial_state.dtype == torch.float32, "initial_state must be in float32."
+    if scale is None:
+        scale = K ** -0.5
+    # Chunk size is a multiple of the panel width, at most BT, and never below
+    # it so that short sequences still use one full panel.
+    bt = chunk_size if chunk_size is not None else min(BT, max(BC, triton.next_power_of_2(T)))
+    bt = (bt + BC - 1) // BC * BC
+    assert chunk_size is None or bt == chunk_size, f"chunk_size must be a multiple of {BC}, got {chunk_size}."
+    assert BC <= bt <= BT, f"chunk_size must be in [{BC}, {BT}], got {bt}."
+    nt = triton.cdiv(T, bt)
+
+    bkc = min(BK, triton.next_power_of_2(K))
+    state_shape = (V, K) if state_v_first else (K, V)
+    h = torch.empty((B, nt, H, *state_shape), device=q.device, dtype=torch.float32)
+    g_cum = torch.empty((B, T, H, K), device=q.device, dtype=torch.float32)
+    A = torch.empty((B, T, H, bt), device=q.device, dtype=torch.float32)
+    o = torch.empty_like(v)
+    ht = None
+    if output_final_state:
+        ht = torch.empty((B, H, *state_shape), device=q.device, dtype=torch.float32)
+
+    chunk_gla_fwd_cumsum_kernel[(nt, triton.cdiv(K, bkc), B * H)](
+        g=g,
+        g_cum=g_cum,
+        T=T,
+        H=H,
+        K=K,
+        BT=bt,
+        BK=bkc,
+    )
+
+    bk, bv = _state_tiles(K, V)
+    chunk_gla_fwd_h_kernel[(triton.cdiv(K, bk), triton.cdiv(V, bv), B * H)](
+        k=k,
+        v=v,
+        g_cum=g_cum,
+        h=h,
+        h0=initial_state,
+        ht=ht,
+        T=T,
+        NT=nt,
+        H=H,
+        K=K,
+        V=V,
+        BT=bt,
+        BK=bk,
+        BV=bv,
+        USE_INITIAL_STATE=initial_state is not None,
+        STORE_FINAL_STATE=ht is not None,
+        STATE_V_FIRST=state_v_first,
+    )
+
+    chunk_gla_fwd_A_kernel[(nt, B * H)](
+        q=q,
+        k=k,
+        g_cum=g_cum,
+        A=A,
+        scale=scale,
+        T=T,
+        H=H,
+        K=K,
+        BT=bt,
+        BC=BC,
+        BK=bkc,
+    )
+
+    bov = min(BV, triton.next_power_of_2(V))
+    chunk_gla_fwd_o_kernel[(triton.cdiv(V, bov), nt, B * H)](
+        q=q,
+        v=v,
+        g_cum=g_cum,
+        h=h,
+        A=A,
+        o=o,
+        scale=scale,
+        T=T,
+        NT=nt,
+        H=H,
+        K=K,
+        V=V,
+        BT=bt,
+        BK=bkc,
+        BV=bov,
+        STATE_V_FIRST=state_v_first,
+    )
+
+    if return_intermediates:
+        return o, ht, {"g_cum": g_cum, "h": h, "A": A}
+    return o, ht
