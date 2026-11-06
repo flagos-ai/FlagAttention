@@ -189,10 +189,12 @@ def test_chunk_gdn2_matches_native_triton(impl, dtype, shape):
     expected, expected_final = _native_gdn2_reference(*args, **kwargs)
 
     actual_kwargs = dict(kwargs)
-    if impl == "tle" or (
-        impl == "backend" and runtime.device.vendor_name in {"mthreads", "metax"}
+    if (
+        impl == "tle"
+        or runtime.device.vendor_name == "metax"
+        or (impl == "backend" and runtime.device.vendor_name == "mthreads")
     ):
-        # These fused inference backends require 16-token chunks.
+        # Fused inference requires 16-token chunks on these paths.
         actual_kwargs["chunk_size"] = 16
 
     if impl == "backend":

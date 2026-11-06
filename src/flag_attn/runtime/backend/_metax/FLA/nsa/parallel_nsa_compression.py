@@ -10,14 +10,14 @@ import triton
 import triton.language as tl
 
 from .bwd_preprocess import parallel_attn_bwd_preprocess
-from flag_attn.gated_linear_attention.index import (
+from flag_attn.FLA.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_token_indices,
 )
 from ..compat import autotune_cache_kwargs
 from ..triton_ops_helper import exp, log
-from flag_attn.gated_linear_attention.utils import check_shared_mem, input_guard
+from flag_attn.utils import check_shared_mem, input_guard
 
 # ===========================================================================
 # Forward kernel
