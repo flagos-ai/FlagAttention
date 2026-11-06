@@ -157,3 +157,1664 @@ gdn2_native_output_tle:
   num_stages: 4
   num_ctas: 1
   maxnreg: null
+
+parallel_parallax_fwd_kernel:
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+parallel_parallax_bwd_kernel_preprocess:
+- META:
+    BP: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BP: 32
+  num_warps: 4
+  num_stages: 4
+- META:
+    BP: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BP: 32
+  num_warps: 8
+  num_stages: 4
+- META:
+    BP: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BP: 64
+  num_warps: 4
+  num_stages: 4
+- META:
+    BP: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BP: 64
+  num_warps: 8
+  num_stages: 4
+- META:
+    BP: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BP: 128
+  num_warps: 4
+  num_stages: 4
+- META:
+    BP: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BP: 128
+  num_warps: 8
+  num_stages: 4
+- META:
+    BP: 256
+  num_warps: 4
+  num_stages: 2
+- META:
+    BP: 256
+  num_warps: 4
+  num_stages: 4
+- META:
+    BP: 256
+  num_warps: 8
+  num_stages: 2
+- META:
+    BP: 256
+  num_warps: 8
+  num_stages: 4
+parallel_parallax_bwd_kernel_dqr_fused:
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 16
+  num_warps: 2
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 16
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 16
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+parallel_parallax_bwd_kernel_dqr:
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 16
+  num_warps: 2
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 16
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 16
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+parallel_parallax_bwd_kernel_dkv:
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 16
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 16
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 16
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 3
+parallel_parallax_bwd_kernel_dkv_grouped:
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 16
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 32
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 16
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 16
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 16
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 128
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 16
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 32
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 64
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BK: 256
+    BS: 128
+  num_warps: 8
+  num_stages: 2
+- META:
+    BK: 128
+    BS: 64
+  num_warps: 8
+  num_stages: 3
