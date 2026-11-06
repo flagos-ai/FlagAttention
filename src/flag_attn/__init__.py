@@ -46,6 +46,7 @@ _OPERATOR_EXPORTS = {
     "hy3_attention": ("flag_attn.hpc_ops_attention", "hy3_attention"),
     "parallel_parallax": ("flag_attn.FLA.parallax", "parallel_parallax"),
     "fused_attnres": ("flag_attn.FLA.attnres", "fused_attnres"),
+    "rotary_embedding": ("flag_attn.rotary", "rotary_embedding"),
     "inkling_fa4_rel_attention": (
         "flag_attn.inkling_fa4",
         "inkling_fa4_rel_attention",
@@ -144,6 +145,7 @@ __all__ = [
     "flash_attention_split_kv",
     "paged_attention",
     "chunk_log_linear_attn",
+    "rotary_embedding",
     "chunk_gated_delta_rule",
     "chunk_gla",
     "chunk_gdn2",
