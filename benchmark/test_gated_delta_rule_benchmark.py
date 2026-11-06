@@ -32,10 +32,6 @@ from benchmark.recording import BenchmarkRecorder, benchmark_metric, record_benc
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gated_delta_rule
-from flag_attn.FLA.gated_delta_rule import (
-    fused_recurrent_gated_delta_rule_fwd,
-    fused_recurrent_gated_delta_rule_packed_decode,
-)
 from flag_attn.utils import has_triton_tle
 from gdn_utils import check_close, make_case, make_packed_case, reference, reference_packed
 
@@ -224,6 +220,18 @@ def _record_result(
     record_property(f"{prefix}.speedup_vs_vllm", _speedup(vllm_ms, flag_attn_ms))
 
 
+@pytest.mark.chunk_gated_delta_rule
+@pytest.mark.skipif(
+    not test_backend.supports_operator("chunk_gated_delta_rule"), reason="requires an available accelerator"
+)
+def test_chunk_gated_delta_rule_benchmark(
+    record_property: Callable[[str, object], None],
+) -> None:
+    if _cuda_tle_available() and torch.cuda.get_device_capability()[0] == 9:
+        pytest.skip("Hopper coverage is parametrized in test_chunk_gdn_forward_benchmark")
+    run_benchmark(record_property)
+
+
 def run_benchmark(
     record_property: Callable[[str, object], None] | None = None,
 ) -> None:
@@ -383,18 +391,6 @@ def _record(record_property, op_name, shape, state_dtype, module, latency, measu
 
 
 @pytest.mark.chunk_gated_delta_rule
-@pytest.mark.skipif(
-    not test_backend.supports_operator("chunk_gated_delta_rule"), reason="requires an available accelerator"
-)
-def test_chunk_gated_delta_rule_benchmark(
-    record_property: Callable[[str, object], None],
-) -> None:
-    if _cuda_tle_available() and torch.cuda.get_device_capability()[0] == 9:
-        pytest.skip("Hopper coverage is parametrized in test_chunk_gdn_forward_benchmark")
-    run_benchmark(record_property)
-
-
-@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.parametrize("shape", PREFILL_SHAPES, ids=lambda s: "B{}_T{}_H{}_HV{}_K{}_V{}".format(*s))
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("cache", ["cold", "warm"])
@@ -473,6 +469,8 @@ def test_chunk_gdn_forward_benchmark(shape, dtype, cache, baseline, record_prope
 @pytest.mark.parametrize("cache", ["cold", "warm"])
 @torch.inference_mode()
 def test_fused_recurrent_gdn_benchmark(shape, state_dtype, cache, vllm_gdn, record_property):
+    from flag_attn import fused_recurrent_gated_delta_rule_fwd
+
     n, length, h, hv = shape
     case = make_case(n, length, h, hv, state_dtype=state_dtype, spec=length > 1, pool_min=1024, seed=2026)
     original = case["initial_state"].clone()
@@ -499,6 +497,8 @@ def test_fused_recurrent_gdn_benchmark(shape, state_dtype, cache, vllm_gdn, reco
 @pytest.mark.parametrize("cache", ["cold", "warm"])
 @torch.inference_mode()
 def test_packed_gdn_benchmark(shape, state_dtype, cache, vllm_gdn, record_property):
+    from flag_attn import fused_recurrent_gated_delta_rule_packed_decode
+
     n, _, h, hv = shape
     case = make_packed_case(n, h, hv, state_dtype=state_dtype, pool_min=1024, seed=2026)
     original = case["initial_state"].clone()
