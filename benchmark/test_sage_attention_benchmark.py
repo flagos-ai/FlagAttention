@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SageAttention speedup benchmark against PyTorch SDPA."""
+"""SageAttention Q/K quantization + attention benchmark against PyTorch SDPA."""
 
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ import argparse
 from dataclasses import dataclass
 from typing import Callable
 
-import pytest
 import torch
 import torch.nn.functional as F
 import triton
@@ -37,21 +36,11 @@ from flag_attn.sage_attention import per_block_int8
 
 
 SDPA_BASELINE_NAME = "torch_sdpa"
-BENCHMARK_SCOPE = "attention_kernel_only"
+BENCHMARK_SCOPE = "quantization_and_attention"
 DEFAULT_WARMUP = 25
 DEFAULT_REPETITIONS = 100
 MAX_ACCURACY_ELEMENTS = 1_048_576
 DEFAULT_OUTPUT_DTYPE = torch.bfloat16
-
-# Reuse the first three workloads from the original benchmark defaults while
-# keeping pytest runtime bounded. The longer defaults remain available through
-# the command-line entry point.
-PYTEST_CASES = (
-    (4, 32, 1024, 128),
-    (4, 32, 2048, 128),
-    (4, 32, 4096, 128),
-)
-
 
 @dataclass(frozen=True)
 class BenchmarkResult:
@@ -90,6 +79,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--rep", type=int, default=DEFAULT_REPETITIONS)
     parser.add_argument("--maxnreg", type=int)
+    parser.add_argument("--is-causal", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args(argv)
 
 
@@ -98,30 +88,29 @@ def _make_inputs(shape: tuple[int, int, int, int]):
     q = torch.randn(shape, device=test_backend.device, dtype=torch.float16)
     k = torch.randn(shape, device=test_backend.device, dtype=torch.float16)
     v = torch.randn(shape, device=test_backend.device, dtype=torch.float16)
-    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
-    return q, k, v, q_int8, q_scale, k_int8, k_scale
+    return q, k, v
 
 
-def _run_baseline(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def _run_baseline(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, is_causal: bool = True) -> torch.Tensor:
     return F.scaled_dot_product_attention(
         q,
         k,
         v,
         dropout_p=0.0,
-        is_causal=False,
+        is_causal=is_causal,
     )
 
 
 def _run_flagattention(
-    q_int8: torch.Tensor,
-    k_int8: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
     v: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
     *,
     output_dtype: torch.dtype,
     maxnreg: int | None,
+    is_causal: bool = True,
 ) -> torch.Tensor:
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
     output, _ = sage_attention(
         q_int8,
         k_int8,
@@ -130,6 +119,7 @@ def _run_flagattention(
         k_scale,
         output_dtype=output_dtype,
         maxnreg=maxnreg,
+        is_causal=is_causal,
     )
     return output
 
@@ -158,18 +148,18 @@ def _benchmark_case(
     warmup: int = DEFAULT_WARMUP,
     rep: int = DEFAULT_REPETITIONS,
     maxnreg: int | None = None,
+    is_causal: bool = True,
 ) -> BenchmarkResult:
-    q, k, v, q_int8, q_scale, k_int8, k_scale = _make_inputs(shape)
+    q, k, v = _make_inputs(shape)
 
-    baseline_output = _run_baseline(q, k, v).to(output_dtype)
+    baseline_output = _run_baseline(q, k, v, is_causal=is_causal).to(output_dtype)
     flagattention_output = _run_flagattention(
-        q_int8,
-        k_int8,
+        q,
+        k,
         v,
-        q_scale,
-        k_scale,
         output_dtype=output_dtype,
         maxnreg=maxnreg,
+        is_causal=is_causal,
     )
     cosine, relative_l2 = _accuracy_metrics(flagattention_output, baseline_output)
     assert cosine >= 0.99, f"SageAttention cosine similarity is too low: {cosine:.6f}"
@@ -179,20 +169,19 @@ def _benchmark_case(
     del baseline_output, flagattention_output
 
     baseline_ms = test_backend.do_bench(
-        lambda: _run_baseline(q, k, v).to(output_dtype),
+        lambda: _run_baseline(q, k, v, is_causal=is_causal).to(output_dtype),
         warmup=warmup,
         rep=rep,
         return_mode="median",
     )
     flagattention_ms = test_backend.do_bench(
         lambda: _run_flagattention(
-            q_int8,
-            k_int8,
+            q,
+            k,
             v,
-            q_scale,
-            k_scale,
             output_dtype=output_dtype,
             maxnreg=maxnreg,
+            is_causal=is_causal,
         ),
         warmup=warmup,
         rep=rep,
@@ -225,16 +214,18 @@ def _print_header(
     output_dtype: torch.dtype,
     warmup: int,
     rep: int,
+    is_causal: bool = True,
 ) -> None:
     print(f"\n{'=' * 104}")
     print("  sage_attention benchmark — FWD ONLY")
     print(f"  provider: {_baseline_name(output_dtype)} vs flag_attn_sage_attention")
-    print("  timing: Q/K quantization excluded from both providers")
+    print("  timing: SageAttention includes Q/K quantization + attention; SDPA includes its output cast")
+    print(f"  is_causal={is_causal}; both providers start from the same FP16 Q/K/V inputs")
     print(f"  warmup={warmup}ms  rep={rep}ms")
     print(f"{'=' * 104}")
     print(
         f"{'B':>3} {'T':>6} {'H':>4} {'D':>4} {'dtype':>8} "
-        f"{'sdpa(ms)':>10} {'flag_attn(ms)':>14} {'sdpa/flag_attn':>14} "
+        f"{'sdpa(ms)':>10} {'sage_attn(ms)':>14} {'sdpa/sage_attn':>14} "
         f"{'cosine':>10} {'rel_l2':>10}"
     )
 
@@ -282,22 +273,26 @@ def _run_benchmark_cases(
     warmup: int,
     rep: int,
     maxnreg: int | None,
+    is_causal: bool = True,
     record_property: Callable[[str, object], None] | None = None,
 ) -> None:
     if record_property is not None:
         record_property("scope", BENCHMARK_SCOPE)
         record_property("baseline", _baseline_name(output_dtype))
         record_property("output_dtype", str(output_dtype))
+        record_property("is_causal", is_causal)
 
-    _print_header(output_dtype, warmup, rep)
+    _print_header(output_dtype, warmup, rep, is_causal)
     print("\ndtype:", output_dtype)
     recorder = BenchmarkRecorder(
         record_property,
         op_name="sage_attention",
         dtype=str(output_dtype),
+        mode="api",
         baseline=_baseline_name(output_dtype),
         phase="forward",
         scope=BENCHMARK_SCOPE,
+        is_causal=is_causal,
     )
     for shape in shapes:
         result = _benchmark_case(
@@ -306,6 +301,7 @@ def _run_benchmark_cases(
             warmup=warmup,
             rep=rep,
             maxnreg=maxnreg,
+            is_causal=is_causal,
         )
         _print_row(shape, output_dtype, result)
         recorder.add(
@@ -322,24 +318,10 @@ def _run_benchmark_cases(
     _print_footer()
 
 
-@pytest.mark.sage_attention
-@pytest.mark.skipif(
-    not test_backend.supports_operator("sage_attention"), reason=test_backend.skip_reason("sage_attention")
-)
-def test_sage_attention_benchmark(
-    record_property: Callable[[str, object], None],
+def benchmark(
+    args: argparse.Namespace,
+    record_property: Callable[[str, object], None] | None = None,
 ) -> None:
-    _run_benchmark_cases(
-        PYTEST_CASES,
-        output_dtype=DEFAULT_OUTPUT_DTYPE,
-        warmup=DEFAULT_WARMUP,
-        rep=DEFAULT_REPETITIONS,
-        maxnreg=None,
-        record_property=record_property,
-    )
-
-
-def benchmark(args: argparse.Namespace) -> None:
     if not test_backend.supports_operator("sage_attention"):
         raise RuntimeError("SageAttention benchmark requires an available accelerator")
 
@@ -354,4 +336,6 @@ def benchmark(args: argparse.Namespace) -> None:
         warmup=args.warmup,
         rep=args.rep,
         maxnreg=args.maxnreg,
+        is_causal=args.is_causal,
+        record_property=record_property,
     )
