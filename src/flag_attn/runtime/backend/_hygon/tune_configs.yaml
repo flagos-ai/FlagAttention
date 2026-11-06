@@ -73,9 +73,9 @@ chunk_gla_bwd_kernel_inter:
 - {META: {BK: 32, BV: 32}, num_warps: 4, num_stages: 3}
 - {META: {BK: 32, BV: 32}, num_warps: 8, num_stages: 4}
 
-# Native GDN2 state update. Small BV tiles fit the 64 KiB shared-memory limit.
-chunk_gated_delta_rule_fwd_kernel_h_blockdim64:
-- {META: {BV: 16}, num_warps: 2, num_stages: 1}
-- {META: {BV: 16}, num_warps: 2, num_stages: 2}
-- {META: {BV: 16}, num_warps: 4, num_stages: 1}
-- {META: {BV: 16}, num_warps: 4, num_stages: 2}
+# Curated launch settings for AttnRes. The first entry is selected directly
+# by the Hygon wrapper; this kernel does not run runtime autotuning.
+_fused_attnres_fwd_kernel:
+  - META: {}
+    num_warps: 4
+    num_stages: 2

@@ -4,6 +4,16 @@
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "chunk_gated_delta_rule": (".FLA.gated_delta_rule.api", "chunk_gated_delta_rule"),
+    "chunk_gated_delta_rule_fwd": (".FLA.gated_delta_rule.chunk", "chunk_gated_delta_rule_fwd"),
+    "fused_recurrent_gated_delta_rule_fwd": (
+        ".FLA.gated_delta_rule.fused_recurrent",
+        "fused_recurrent_gated_delta_rule_fwd",
+    ),
+    "fused_recurrent_gated_delta_rule_packed_decode": (
+        ".FLA.gated_delta_rule.fused_recurrent",
+        "fused_recurrent_gated_delta_rule_packed_decode",
+    ),
     "chunk_gdn2": (".gdn2", "chunk_gdn2"),
     "parallel_parallax": (".parallax", "parallel_parallax"),
     "parallax_decode": (".parallax", "parallax_decode"),
