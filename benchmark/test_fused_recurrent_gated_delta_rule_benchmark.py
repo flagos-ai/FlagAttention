@@ -182,7 +182,7 @@ try:
 except ModuleNotFoundError:
     from recording import BenchmarkRecorder
 
-pytestmark = [pytest.mark.benchmark, pytest.mark.chunk_gated_delta_rule]
+pytestmark = pytest.mark.benchmark
 SOURCE = "fused-recurrent-gdn-decode-and-mtp"
 WARMUP_CALLS, SAMPLE_COUNT = 5, 25
 GRAPH_CALLS = 64
@@ -363,6 +363,7 @@ def benchmark_table(request):
         manager.unregister(quiet)
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.parametrize("case", PERF_CASES, ids=[case[0] for case in PERF_CASES])
 @pytest.mark.parametrize("dtype", DTYPES, ids=("fp16", "bf16"))
 @torch.inference_mode()

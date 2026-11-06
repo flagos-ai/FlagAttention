@@ -1,10 +1,11 @@
+# Copyright 2026 FlagOS Contributors
+
 # This file contains code copied from the flash-linear-attention project.
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
-import json
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any
 import torch
 import triton
 import triton.language as tl
+import yaml
 
 from flag_attn.FLA.compat import libentry, libtuner
 from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
@@ -26,7 +28,7 @@ _CONFIG_PATH = Path(__file__).resolve().parents[2] / "tune_configs.yaml"
 def _load_tuned_config() -> dict[str, list[dict[str, Any]]]:
     if not _CONFIG_PATH.is_file():
         return {}
-    data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+    data = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"Autotune config must be a mapping: {_CONFIG_PATH}")
     return data

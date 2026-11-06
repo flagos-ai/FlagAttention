@@ -1,3 +1,6 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
 # V-blocked fused tail for the official K=V=BT=64 chunk_gated_delta_rule path.
 
 import torch

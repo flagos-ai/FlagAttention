@@ -1,7 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# Resolve the enclosing checkout so this copy runs from any working directory.
 import sys
 from pathlib import Path
 
@@ -29,7 +28,6 @@ try:
 except ModuleNotFoundError:
     from recording import BenchmarkRecorder
 
-pytestmark = pytest.mark.chunk_gated_delta_rule
 
 # Batch sizes covered by this benchmark.
 BATCHES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
@@ -248,6 +246,7 @@ def benchmark_table(request):
         manager.unregister(plugin)
 
 
+@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.benchmark
 @pytest.mark.parametrize(
     "shape",

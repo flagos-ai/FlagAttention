@@ -1,3 +1,6 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
 # This file contains a guarded direct forward path for small chunk_gated_delta_rule
 # shapes. It follows the recurrent definition directly and falls back to the
 # chunk decomposition for unsupported cases.

@@ -1,3 +1,5 @@
+# Copyright 2026 FlagOS Contributors
+
 # Copyright (c) 2025 FlagGems. All rights reserved.
 # Fused cumsum + KKT + solve_tril for chunk_gated_delta_rule. Returns g_out, A_inv; w_u is separate.
 # License: Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0)

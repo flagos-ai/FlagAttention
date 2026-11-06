@@ -1,3 +1,6 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
 {
   "chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel": [
     {"META": {"BK": 64}, "num_warps": 8, "num_stages": 4},
