@@ -76,6 +76,38 @@ MASK_SKIP_RATIO = 0.75
 SEED = 10086
 DEFAULT_GRAPH_WARMUP = 5
 DEFAULT_GRAPH_ITERS = 50
+FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
+
+
+def _copy_fp8_bytes_to_npu(
+    cpu_fp8: torch.Tensor,
+    device: torch.device,
+    stride: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    cpu_bytes = cpu_fp8.view(torch.uint8)
+    result = torch.empty_strided(
+        cpu_fp8.shape,
+        cpu_fp8.stride() if stride is None else stride,
+        dtype=torch.uint8,
+        device=device,
+    )
+    result.copy_(cpu_bytes)
+    return result
+
+
+def _fp8_cast_for_backend(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "npu":
+        return tensor.to(FP8_DTYPE)
+    return _copy_fp8_bytes_to_npu(
+        tensor.to("cpu").to(FP8_DTYPE), tensor.device, tensor.stride()
+    )
+
+
+def _fp8_reinterpret_for_backend(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "npu":
+        return tensor.view(FP8_DTYPE)
+    cpu_fp8 = tensor.to("cpu").view(FP8_DTYPE)
+    return _copy_fp8_bytes_to_npu(cpu_fp8, tensor.device)
 
 
 @dataclass(frozen=True)
@@ -219,13 +251,10 @@ def _make_inputs(q_len, kv_len, quant_type, masked, kv_layout):
     torch.manual_seed(SEED)
     torch.manual_seed(SEED)
     device = torch.device(test_backend.device)
-    fp8 = torch.float8_e4m3fn
     requested_pages = math.ceil(kv_len / PAGE_SIZE)
     physical_pages = max(requested_pages * 2, requested_pages + 8)
-    q = (
-        torch.randn(q_len, Q_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
-        / math.sqrt(HEAD_DIM)
-    ).to(fp8)
+    q = torch.randn(q_len, Q_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    q = _fp8_cast_for_backend(q / math.sqrt(HEAD_DIM))
     raw_cache = torch.randn(
         physical_pages,
         2,
@@ -235,8 +264,8 @@ def _make_inputs(q_len, kv_len, quant_type, masked, kv_layout):
         device=device,
         dtype=torch.bfloat16,
     )
-    k = (raw_cache[:, 0] / math.sqrt(HEAD_DIM)).to(fp8)
-    v = raw_cache[:, 1].to(fp8)
+    k = _fp8_cast_for_backend(raw_cache[:, 0] / math.sqrt(HEAD_DIM))
+    v = _fp8_cast_for_backend(raw_cache[:, 1])
     if kv_layout == "hnd":
         k = k.transpose(1, 2).contiguous().transpose(1, 2)
         v = v.transpose(1, 2).contiguous().transpose(1, 2)
@@ -249,19 +278,15 @@ def _make_inputs(q_len, kv_len, quant_type, masked, kv_layout):
     )
     q_scale[:, :, :q_len] = torch.randn(1, Q_HEADS, q_len, device=device).abs() / 10.0
     if quant_type == 0:
-        k_scale = (
-            torch.randn(
-                physical_pages,
-                PAGE_SIZE // 32,
-                KV_HEADS,
-                HEAD_DIM // 4,
-                device=device,
-                dtype=torch.float32,
-            )
-            .abs()
-            .clamp_min_(1e-6)
-            .view(fp8)
-        )
+        k_scale_fp32 = torch.randn(
+            physical_pages,
+            PAGE_SIZE // 32,
+            KV_HEADS,
+            HEAD_DIM // 4,
+            device=device,
+            dtype=torch.float32,
+        ).abs().clamp_min_(1e-6)
+        k_scale = _fp8_reinterpret_for_backend(k_scale_fp32)
         v_scale = torch.randn(KV_HEADS, device=device).abs().clamp_min_(1e-6)
     else:
         k_scale = torch.rand(1, device=device, dtype=torch.float32) + 0.5

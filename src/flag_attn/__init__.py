@@ -44,6 +44,7 @@ _OPERATOR_EXPORTS = {
     "log_linear_attn": ("flag_attn.FLA.log_linear_attn.chunk_tle", "log_linear_attn"),
     "diffkv_attention": ("flag_attn.diffkv_attention.api", "diffkv_attention"),
     "hy3_attention": ("flag_attn.hpc_ops_attention", "hy3_attention"),
+    "hy3_attention_prepare": ("flag_attn.hpc_ops_attention", "hy3_attention_prepare"),
     "parallel_parallax": ("flag_attn.FLA.parallax", "parallel_parallax"),
     "fused_attnres": ("flag_attn.FLA.attnres", "fused_attnres"),
     "inkling_fa4_rel_attention": (
@@ -105,7 +106,7 @@ for _package_name in ("sage_attention", "parallel_nsa", "diffkv_attention"):
     globals().pop(_package_name, None)
 
 
-_STAGE_FACADES = {"minimax_m3_sparse_attn", "infllmv2_attention", "parallel_parallax", "hy3_attention", "parallel_nsa"}
+_STAGE_FACADES = {"minimax_m3_sparse_attn", "infllmv2_attention", "parallel_parallax", "hy3_attention", "hy3_attention_prepare", "parallel_nsa"}
 
 
 def __getattr__(name: str):
@@ -132,6 +133,7 @@ __all__ = [
     "log_linear_attn",
     "diffkv_attention",
     "hy3_attention",
+    "hy3_attention_prepare",
     "parallel_parallax",
     "fused_attnres",
     "inkling_fa4_rel_attention",

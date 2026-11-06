@@ -25,6 +25,46 @@ BLOCK = 128
 HEAD_DIM = 128
 Q_HEADS = 8
 KV_HEADS = 2
+FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
+
+
+def _copy_fp8_bytes_to_npu(
+    cpu_fp8: torch.Tensor,
+    device: torch.device,
+    stride: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    cpu_bytes = cpu_fp8.view(torch.uint8)
+    result = torch.empty_strided(
+        cpu_fp8.shape,
+        cpu_fp8.stride() if stride is None else stride,
+        dtype=torch.uint8,
+        device=device,
+    )
+    result.copy_(cpu_bytes)
+    return result
+
+
+def _fp8_cast_for_backend(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "npu":
+        return tensor.to(FP8_DTYPE)
+    return _copy_fp8_bytes_to_npu(
+        tensor.to("cpu").to(FP8_DTYPE), tensor.device, tensor.stride()
+    )
+
+
+def _fp8_reinterpret_for_backend(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "npu":
+        return tensor.view(FP8_DTYPE)
+    cpu_fp8 = tensor.to("cpu").view(FP8_DTYPE)
+    return _copy_fp8_bytes_to_npu(cpu_fp8, tensor.device)
+
+
+def _fp8_for_reference(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type == "npu":
+        tensor = tensor.cpu()
+        if tensor.dtype == torch.uint8:
+            tensor = tensor.view(FP8_DTYPE)
+    return tensor
 
 
 @pytest.mark.hy3_attention
@@ -33,7 +73,12 @@ def test_attention_blocksparse_prefill_fp8_rejects_cpu():
     cache = torch.empty(1, 32, 1, HEAD_DIM)
     scale = torch.empty(1)
     metadata = torch.empty(1, dtype=torch.int32)
-    with pytest.raises(ValueError, match="must be a CUDA tensor"):
+    expected_message = (
+        "requires NPU tensors"
+        if test_backend.device == "npu"
+        else "must be a CUDA tensor"
+    )
+    with pytest.raises(ValueError, match=expected_message):
         hy3_attention(
             q,
             cache,
@@ -63,25 +108,20 @@ def _make_mask(q_len, kv_len, masked, device):
 
 def _make_inputs(quant_type, kv_layout, masked, page_size):
     device = torch.device(test_backend.device)
-    fp8 = torch.float8_e4m3fn
     q_len, kv_len = 129, 257
     pages = math.ceil(kv_len / page_size)
 
-    q = (
-        torch.randn(q_len, Q_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
-        / math.sqrt(HEAD_DIM)
-    ).to(fp8)
-    k = (
-        torch.randn(
-            pages,
-            page_size,
-            KV_HEADS,
-            HEAD_DIM,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        / math.sqrt(HEAD_DIM)
-    ).to(fp8)
+    q = torch.randn(q_len, Q_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    q = _fp8_cast_for_backend(q / math.sqrt(HEAD_DIM))
+    k = torch.randn(
+        pages,
+        page_size,
+        KV_HEADS,
+        HEAD_DIM,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k = _fp8_cast_for_backend(k / math.sqrt(HEAD_DIM))
     v = torch.randn(
         pages,
         page_size,
@@ -89,7 +129,8 @@ def _make_inputs(quant_type, kv_layout, masked, page_size):
         HEAD_DIM,
         device=device,
         dtype=torch.bfloat16,
-    ).to(fp8)
+    )
+    v = _fp8_cast_for_backend(v)
     if kv_layout == "hnd":
         k = k.transpose(1, 2).contiguous().transpose(1, 2)
         v = v.transpose(1, 2).contiguous().transpose(1, 2)
@@ -100,18 +141,15 @@ def _make_inputs(quant_type, kv_layout, masked, page_size):
         k_scale = torch.rand(1, device=device, dtype=torch.float32) + 0.5
         v_scale = torch.rand(1, device=device, dtype=torch.float32) + 0.5
     else:
-        k_scale = (
-            torch.rand(
-                pages,
-                page_size // 32,
-                KV_HEADS,
-                HEAD_DIM // 4,
-                device=device,
-                dtype=torch.float32,
-            )
-            .clamp_min_(1e-6)
-            .view(fp8)
-        )
+        k_scale_fp32 = torch.rand(
+            pages,
+            page_size // 32,
+            KV_HEADS,
+            HEAD_DIM // 4,
+            device=device,
+            dtype=torch.float32,
+        ).clamp_min_(1e-6)
+        k_scale = _fp8_reinterpret_for_backend(k_scale_fp32)
         v_scale = torch.rand(KV_HEADS, device=device, dtype=torch.float32) + 0.5
 
     cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
@@ -150,6 +188,17 @@ def _reference(args):
         quant_type,
         block_mask,
     ) = args
+    output_device = q.device
+    if q.device.type == "npu":
+        q, k_cache, v_cache = (
+            _fp8_for_reference(tensor) for tensor in (q, k_cache, v_cache)
+        )
+        q_scale, k_scale, v_scale = (
+            tensor.cpu() for tensor in (q_scale, k_scale, v_scale)
+        )
+        block_ids, kv_lens = block_ids.cpu(), kv_lens.cpu()
+        if block_mask is not None:
+            block_mask = block_mask.cpu()
     kv_len = int(kv_lens[0].item())
     page_ids = block_ids[0]
     paged_k = k_cache[page_ids].reshape(-1, KV_HEADS, HEAD_DIM)[:kv_len]
@@ -209,7 +258,7 @@ def _reference(args):
         )
         result = result * (value_scale / 256.0) / denominator
         output[:, head_start:head_end] = result.permute(1, 0, 2)
-    return output
+    return output.to(output_device)
 
 
 @pytest.mark.hy3_attention

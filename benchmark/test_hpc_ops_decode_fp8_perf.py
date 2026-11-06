@@ -43,7 +43,7 @@ from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_static as fp8_qk_static,
     fp8_qpertoken_perhead_kvpertensor_static as fp8_kv_static,
 )
-from flag_attn import hy3_attention
+from flag_attn import hy3_attention, hy3_attention_prepare
 
 
 BLOCK_SIZE = 64
@@ -78,6 +78,38 @@ BENCH_MIN_PROCESS_LEN = 512
 BENCH_GRAPH = True
 BENCH_CHECK = False
 PERF_RESULTS = []
+FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
+
+
+def _copy_fp8_bytes_to_npu(
+    cpu_fp8: torch.Tensor,
+    device: torch.device,
+    stride: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    cpu_bytes = cpu_fp8.view(torch.uint8)
+    result = torch.empty_strided(
+        cpu_fp8.shape,
+        cpu_fp8.stride() if stride is None else stride,
+        dtype=torch.uint8,
+        device=device,
+    )
+    result.copy_(cpu_bytes)
+    return result
+
+
+def _fp8_cast_for_backend(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "npu":
+        return tensor.to(FP8_DTYPE)
+    return _copy_fp8_bytes_to_npu(
+        tensor.to("cpu").to(FP8_DTYPE), tensor.device, tensor.stride()
+    )
+
+
+def _fp8_reinterpret_for_backend(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "npu":
+        return tensor.view(FP8_DTYPE)
+    cpu_fp8 = tensor.to("cpu").view(FP8_DTYPE)
+    return _copy_fp8_bytes_to_npu(cpu_fp8, tensor.device)
 
 
 def _implementation(schedule: str, quant_type: str):
@@ -139,12 +171,20 @@ def _quantize_k_per_token(storage: torch.Tensor) -> torch.Tensor:
         storage[:, :BLOCK_SIZE].float().abs().amax(-1).clamp_min(1e-6)
         / 448.0
     )
-    result = torch.empty_like(storage, dtype=torch.float8_e4m3fn)
-    result[:, :BLOCK_SIZE] = (
+    if storage.device.type == "npu":
+        result = torch.empty_strided(
+            storage.shape,
+            storage.stride(),
+            dtype=torch.uint8,
+            device=storage.device,
+        )
+    else:
+        result = torch.empty_like(storage, dtype=FP8_DTYPE)
+    result[:, :BLOCK_SIZE] = _fp8_cast_for_backend(
         storage[:, :BLOCK_SIZE] / scale[..., None]
-    ).to(torch.float8_e4m3fn)
+    )
     packed = (
-        scale.permute(0, 2, 1).contiguous().view(torch.float8_e4m3fn)
+        _fp8_reinterpret_for_backend(scale.permute(0, 2, 1).contiguous())
         .reshape(blocks, heads, -1, dim).permute(0, 2, 1, 3).contiguous()
     )
     result[:, BLOCK_SIZE:] = packed
@@ -159,9 +199,9 @@ def _quantize_v_per_head(
         storage[:, :BLOCK_SIZE].float().abs().permute(2, 0, 1, 3)
         .reshape(heads, -1).amax(-1).clamp_min(1e-6) / 448.0
     )
-    quantized = (
+    quantized = _fp8_cast_for_backend(
         storage.float() / scale[None, None, :, None]
-    ).to(torch.float8_e4m3fn)
+    )
     return quantized, scale
 
 
@@ -182,7 +222,7 @@ def make_inputs(
         dtype=torch.bfloat16, device=test_backend.device,
     ) / math.sqrt(HEAD_DIM)
     q_scale = q_bf16.float().abs().amax(-1).clamp_min(1e-6)
-    q = (q_bf16 / q_scale[..., None]).to(torch.float8_e4m3fn)
+    q = _fp8_cast_for_backend(q_bf16 / q_scale[..., None])
 
     if QUANT_TYPES[quant_type] == 0:
         raw_k = torch.randn(
@@ -199,16 +239,16 @@ def make_inputs(
         v_cache = v_storage[:, :BLOCK_SIZE]
         k_scale = k_storage[:, BLOCK_SIZE:]
     else:
-        k_cache = (
-            torch.randn(
-                (capacity, BLOCK_SIZE, hkv, HEAD_DIM),
-                dtype=torch.bfloat16, device=test_backend.device,
-            ) / math.sqrt(HEAD_DIM)
-        ).to(torch.float8_e4m3fn)
+        k_cache = torch.randn(
+            (capacity, BLOCK_SIZE, hkv, HEAD_DIM),
+            dtype=torch.bfloat16, device=test_backend.device,
+        ) / math.sqrt(HEAD_DIM)
+        k_cache = _fp8_cast_for_backend(k_cache)
         v_cache = torch.randn(
             (capacity, BLOCK_SIZE, hkv, HEAD_DIM),
             dtype=torch.bfloat16, device=test_backend.device,
-        ).to(torch.float8_e4m3fn)
+        )
+        v_cache = _fp8_cast_for_backend(v_cache)
         if layout == "HND":
             k_cache = _as_hnd_view(k_cache)
             v_cache = _as_hnd_view(v_cache)
@@ -423,7 +463,7 @@ def test_attention_decode_fp8_perf(
     )
     inputs = _inputs(panel)
     implementation = _implementation(schedule, quant_type)
-    workspace = implementation.prepare_decode_workspace(inputs)
+    workspace = hy3_attention_prepare(inputs, variant=variant)
     cuda_output = (
         torch.empty_like(panel.q, dtype=torch.bfloat16) if hpc is not None else None
     )
@@ -445,7 +485,8 @@ def test_attention_decode_fp8_perf(
     if BENCH_CHECK:
         actual = tle_call().detach().clone()
         test_backend.device_fn.synchronize()
-        reset = implementation.workspace_is_reset(workspace)
+        reset = (workspace.is_reset() if hasattr(workspace, "is_reset")
+                 else implementation.workspace_is_reset(workspace))
         assert torch.isfinite(actual).all()
         assert reset, "decode workspace was not reset"
         if cuda_call is not None:
