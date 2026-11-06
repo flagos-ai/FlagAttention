@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from flag_attn.testing import backend as test_backend
-from flag_attn import chunk_gdn2
+from flag_attn import chunk_gdn2, runtime
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
 from flag_attn.gdn2.native.output import chunk_gla_fwd_kernel_o
 
@@ -33,12 +33,12 @@ GDN2_TEST_CASES = [
 ]
 
 
-def _cuda_available() -> bool:
+def _gdn2_available() -> bool:
     return test_backend.supports_operator("chunk_gdn2")
 
 
 pytestmark = [
-    pytest.mark.skipif(not _cuda_available(), reason="chunk_gdn2 tests require CUDA"),
+    pytest.mark.skipif(not _gdn2_available(), reason="chunk_gdn2 is unavailable on the active backend"),
 ]
 
 
@@ -164,7 +164,9 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
 @pytest.mark.chunk_gdn2
 @pytest.mark.parametrize(
     "impl",
-    [pytest.param("tle", id="tle"), pytest.param("native", id="native")],
+    [pytest.param("tle", id="tle"), pytest.param("native", id="native")]
+    if importlib.import_module("flag_attn.gdn2.chunk").HAS_TLE_GDN2
+    else [pytest.param("backend", id="backend")],
 )
 @pytest.mark.parametrize(
     "shape,dtype",
@@ -172,10 +174,6 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
 )
 @torch.inference_mode()
 def test_chunk_gdn2_matches_native_triton(impl, dtype, shape):
-    module = importlib.import_module("flag_attn.gdn2.chunk")
-    if impl == "tle" and not module.HAS_TLE_GDN2:
-        pytest.skip("TLE GDN2 path is unavailable in this environment")
-
     torch.manual_seed(42)
     B, T, H, K, V = shape
     args, kwargs = _make_inputs(
@@ -190,34 +188,37 @@ def test_chunk_gdn2_matches_native_triton(impl, dtype, shape):
 
     expected, expected_final = _native_gdn2_reference(*args, **kwargs)
 
-    force_native = impl == "native"
     actual_kwargs = dict(kwargs)
-    if impl == "tle":
-        # Public TLE inference currently requires BT=16. The baseline remains
-        # the original native Triton path with BT=64.
+    if (
+        impl == "tle"
+        or runtime.device.vendor_name == "metax"
+        or (impl == "backend" and runtime.device.vendor_name == "mthreads")
+    ):
+        # Fused inference requires 16-token chunks on these paths.
         actual_kwargs["chunk_size"] = 16
 
-    module, old = _set_public_gdn2_native_for_call(force_native)
-    try:
+    if impl == "backend":
         actual, actual_final = chunk_gdn2(*args, **actual_kwargs)
-    finally:
-        module.HAS_TLE_GDN2 = old
+    else:
+        module, old = _set_public_gdn2_native_for_call(impl == "native")
+        try:
+            actual, actual_final = chunk_gdn2(*args, **actual_kwargs)
+        finally:
+            module.HAS_TLE_GDN2 = old
 
     _assert_close("o", actual, expected)
     _assert_close("ht", actual_final, expected_final)
 
 
-@pytest.mark.chunk_gdn2
-def test_k1_tle_resource_controls_are_enabled():
-    module = importlib.import_module("flag_attn.gdn2.chunk")
-    if not module.HAS_TLE_GDN2:
-        pytest.skip("TLE GDN2 path is unavailable in this environment")
-
-    assert module.K1_TLE_MAXNREG_CANDIDATES == (64, 72, 96)
-    assert module.K1_TLE_SMEM_REUSE_MIN_K == 256
-    source = Path(module.__file__).read_text(encoding="utf-8")
-    assert "tle.gpu.alloc" in source
-    assert "tle.gpu.local_ptr" in source
+if importlib.import_module("flag_attn.gdn2.chunk").HAS_TLE_GDN2:
+    @pytest.mark.chunk_gdn2
+    def test_k1_tle_resource_controls_are_enabled():
+        module = importlib.import_module("flag_attn.gdn2.chunk")
+        assert module.K1_TLE_MAXNREG_CANDIDATES == (64, 72, 96)
+        assert module.K1_TLE_SMEM_REUSE_MIN_K == 256
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert "tle.gpu.alloc" in source
+        assert "tle.gpu.local_ptr" in source
 
 
 @pytest.fixture(scope="module", params=[torch.float16, torch.bfloat16])

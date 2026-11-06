@@ -4,7 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
-import os
 
 import torch
 import triton
@@ -13,6 +12,7 @@ import triton.language as tl
 from ..chunk_h import chunk_bwd_dh, chunk_fwd_h, chunk_fwd_h_fused_cumsum
 from ..cumsum_gla import chunk_local_cumsum
 from ..index import prepare_chunk_indices
+from flag_attn.runtime import autotune_cache_kwargs, get_tuned_config
 from ..utils import check_shared_mem, input_guard
 
 RCP_LN2 = 1.4426950216
@@ -401,7 +401,7 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_merge(
     }
 )
 @triton.autotune(
-    configs=[
+    configs=get_tuned_config("chunk_gla_fwd_kernel_o") or [
         triton.Config(
             {"BK": BK, "BV": BV},
             num_warps=num_warps,

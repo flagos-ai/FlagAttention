@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_attn.runtime.backend._enflame.utils import current_platform as current_platform
 from flag_attn.minimax_sparse_attention.index_topk import _index_block_score_kernel
 
 # The standalone prefill scorer uses the portable Triton implementation;

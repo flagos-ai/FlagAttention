@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from .index import prepare_chunk_offsets
+from flag_attn.runtime import autotune_cache_kwargs, get_tuned_config
 from .utils import check_shared_mem
 
 BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
@@ -28,7 +29,7 @@ def exp2(x):
     }
 )
 @triton.autotune(
-    configs=[
+    configs=get_tuned_config("chunk_fwd_kernel_h") or [
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for BK in BKV_LIST
         for BV in BKV_LIST
@@ -36,6 +37,7 @@ def exp2(x):
         for num_stages in [2, 3, 4]
     ],
     key=["BT", "USE_G", "USE_GK", "USE_GV", "STATE_V_FIRST"],
+    **autotune_cache_kwargs(),
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_h(
@@ -227,7 +229,7 @@ def chunk_fwd_kernel_h(
     }
 )
 @triton.autotune(
-    configs=[
+    configs=get_tuned_config("chunk_bwd_kernel_dh") or [
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for BK in BKV_LIST
         for BV in BKV_LIST
@@ -235,6 +237,7 @@ def chunk_fwd_kernel_h(
         for num_stages in [2, 3, 4]
     ],
     key=["BT", "USE_G", "USE_GK", "USE_GV", "STATE_V_FIRST"],
+    **autotune_cache_kwargs(),
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_bwd_kernel_dh(
