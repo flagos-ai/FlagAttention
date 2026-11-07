@@ -179,6 +179,28 @@ def _call_fla_reference(args):
     )
 
 
+def _cpu_reference(args):
+    """fp32 per-token recurrence on CPU for devices without a native baseline."""
+    q, k, v, g, beta, scale, state, _, _ = args
+    qf, kf, vf, gf, bf = (x.float().cpu() for x in (q, k, v, g, beta))
+    B, T, Hg, K = qf.shape
+    H, V = vf.shape[2], vf.shape[3]
+    rep = H // Hg
+    kr, qr = (x.repeat_interleave(rep, dim=2) for x in (kf, qf))
+    s = (
+        state.float().cpu()
+        if state is not None
+        else torch.zeros(B, H, K, V, dtype=torch.float32)
+    )
+    out = torch.zeros(B, T, H, V, dtype=torch.float32)
+    for t in range(T):
+        s = s * gf[:, t].exp()[:, :, None, None]
+        v_new = bf[:, t][:, :, None] * (vf[:, t] - (s * kr[:, t][..., None]).sum(2))
+        s = s + kr[:, t][..., None] * v_new[..., None, :]
+        out[:, t] = scale * (s * qr[:, t][..., None]).sum(2)
+    return None, out.to(q.device), None, s.to(q.device)
+
+
 def _err_ratio(expected: torch.Tensor, actual: torch.Tensor) -> float:
     err = (expected.float() - actual.float()).flatten().square().mean().sqrt().item()
     base = expected.float().flatten().square().mean().sqrt().item()
@@ -243,7 +265,11 @@ def test_chunk_gated_delta_rule_fwd_full_tle_matches_native(dtype, shape):
 def test_chunk_gated_delta_rule_public_api_matches_native(dtype):
     torch.manual_seed(42)
     args = _make_inputs(1, 256, 2, 128, 128, dtype, use_initial_state=False)
-    baseline = _call_fwd(args, full_tle=False, recompute_tle=False)
+    baseline = (
+        _call_fwd(args, full_tle=False, recompute_tle=False)
+        if test_backend.is_nvidia()
+        else _cpu_reference(args)
+    )
     q, k, v, g, beta, scale, _, _, _ = args
 
     with _set_gdn_tle(
