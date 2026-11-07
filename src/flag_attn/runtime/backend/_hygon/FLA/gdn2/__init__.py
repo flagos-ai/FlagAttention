@@ -12,4 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__all__ = []
+"""Public entry point for the Hygon GDN-2 implementation."""
+
+from flag_attn.runtime.backend._hygon.FLA.gdn2.chunk import chunk_gdn2
+
+__all__ = ["chunk_gdn2"]

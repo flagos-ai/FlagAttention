@@ -12,4 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__all__ = []
+"""Shared Triton math and autotuning helpers for Hygon GDN-2."""
+
+from flag_attn.runtime.backend._hygon.FLA.triton_ops_helper import (
+    autotune_cache_kwargs,
+    exp,
+    exp2,
+)
+
+__all__ = ["autotune_cache_kwargs", "exp", "exp2"]

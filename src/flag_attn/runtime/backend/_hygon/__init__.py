@@ -36,6 +36,7 @@ _OPERATOR_EXPORTS = {
     "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),
     "sage_attention_forward": (".sage_attention.attn_qk_int8_per_block", "forward"),
     "SPARSE_BLOCK_SIZE": (".msa.index_topk", "SPARSE_BLOCK_SIZE"),
+    "chunk_gdn2": (".FLA.gdn2", "chunk_gdn2"),
     "chunk_kda_fwd_infer": (".FLA.kda.chunk_kda", "chunk_kda_fwd_infer"),
     "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
     "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
