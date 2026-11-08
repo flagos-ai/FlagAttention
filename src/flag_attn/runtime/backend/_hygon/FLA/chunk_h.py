@@ -41,13 +41,7 @@ def exp2(x):
     }
 )
 @triton.autotune(
-    configs=get_tuned_config("chunk_fwd_kernel_h") or [
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=get_tuned_config("chunk_fwd_kernel_h"),
     key=["BT", "USE_G", "USE_GK", "USE_GV", "STATE_V_FIRST"],
     **autotune_cache_kwargs(),
 )
@@ -443,13 +437,7 @@ def chunk_fwd_kernel_h_v2_cumsum(
     }
 )
 @triton.autotune(
-    configs=get_tuned_config("chunk_bwd_kernel_dh") or [
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=get_tuned_config("chunk_bwd_kernel_dh") ,
     key=["BT", "USE_G", "USE_GK", "USE_GV", "STATE_V_FIRST"],
     **autotune_cache_kwargs(),
 )

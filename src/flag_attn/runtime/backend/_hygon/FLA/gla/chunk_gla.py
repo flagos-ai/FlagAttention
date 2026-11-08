@@ -42,12 +42,9 @@ def exp2(x):
     }
 )
 @triton.autotune(
-    # Hygon gfx936: winners observed across all supported forward shape families.
-    configs=[
-        triton.Config({"BK": 64}, num_warps=1, num_stages=2),
-        triton.Config({"BK": 64}, num_warps=2, num_stages=2),
-    ],
-    key=["BC", "K"],
+    configs=get_tuned_config("chunk_gla_fwd_A_kernel_intra_sub_inter"),
+    key=["BC"],
+    **autotune_cache_kwargs(),
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_A_kernel_intra_sub_inter(
@@ -401,18 +398,9 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_merge(
     }
 )
 @triton.autotune(
-    configs=get_tuned_config("chunk_gla_fwd_kernel_o") or [
-        triton.Config(
-            {"BK": BK, "BV": BV},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["BT", "H", "K", "HV", "STATE_V_FIRST", "V"],
+    configs=get_tuned_config("chunk_gla_fwd_kernel_o"),
+    key=["BT", "HV", "STATE_V_FIRST", "V"],
+    **autotune_cache_kwargs(),
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -1099,12 +1087,9 @@ def chunk_gla_bwd_kernel_dv(
     }
 )
 @triton.autotune(
-    # Hygon gfx936: alternate K/V state tiles cover long and small D families.
-    configs=[
-        triton.Config({"BK": 16, "BV": 32}, num_warps=4, num_stages=4),
-        triton.Config({"BK": 32, "BV": 16}, num_warps=4, num_stages=3),
-    ],
-    key=["BT", "H", "K", "V", "STATE_V_FIRST"],
+    configs=get_tuned_config("chunk_gla_bwd_kernel_inter"),
+    key=["BT", "K", "V", "STATE_V_FIRST"],
+    **autotune_cache_kwargs(),
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_bwd_kernel_inter(

@@ -42,16 +42,7 @@ def exp2(x):
     }
 )
 @triton.autotune(
-    configs=get_tuned_config("chunk_gla_fwd_A_kernel_intra_sub_inter") or [
-        triton.Config(
-            {"BK": BK},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=get_tuned_config("chunk_gla_fwd_A_kernel_intra_sub_inter"),
     key=["BC"],
     **autotune_cache_kwargs(),
 )
@@ -369,17 +360,7 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_merge(
     }
 )
 @triton.autotune(
-    configs=get_tuned_config("chunk_gla_fwd_kernel_o") or [
-        triton.Config(
-            {"BK": BK, "BV": BV},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=get_tuned_config("chunk_gla_fwd_kernel_o"),
     key=["BT", "HV", "STATE_V_FIRST", "V"],
     **autotune_cache_kwargs(),
 )
@@ -1028,17 +1009,7 @@ def chunk_gla_bwd_kernel_dv(
     }
 )
 @triton.autotune(
-    configs=get_tuned_config("chunk_gla_bwd_kernel_inter") or [
-        triton.Config(
-            {"BK": BK, "BV": BV},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for BK in BK_LIST
-        for BV in BV_LIST
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=get_tuned_config("chunk_gla_bwd_kernel_inter"),
     key=["BT", "K", "V", "STATE_V_FIRST"],
     **autotune_cache_kwargs(),
 )

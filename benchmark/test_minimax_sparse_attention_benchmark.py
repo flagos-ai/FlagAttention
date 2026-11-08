@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark MiniMax M3 paged MSA on supported accelerator backends.
-
-When compatible vLLM kernels are installed, compare both implementations on
-matching inputs. Otherwise benchmark FlagAttention only. FP8 uses FP8 index
-queries, index keys and main KV cache.
-"""
 
 from __future__ import annotations
 
@@ -35,8 +29,6 @@ import pytest
 import torch
 import triton
 import triton.knobs
-import triton.testing as triton_testing
-from triton.runtime.errors import OutOfResources
 
 try:
     from benchmark.recording import BenchmarkRecorder
@@ -943,8 +935,8 @@ def _run_dtype(
             try:
                 vllm_run()
                 test_backend.device_fn.synchronize()
-            except OutOfResources as error:
-                print(f"[baseline] vLLM exceeds device resources: {error}; reporting FlagAttn only")
+            except Exception as error:
+                print(f"[baseline] vLLM skipped: {error}")
                 run_vllm = can_compare = False
         if can_compare:
             assert vllm_output is not None and vllm_layout is not None

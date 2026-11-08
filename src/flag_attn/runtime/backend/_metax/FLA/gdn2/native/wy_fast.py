@@ -41,11 +41,7 @@ from ...compat import autotune_cache_kwargs, exp2
     }
 )
 @triton.autotune(
-    configs=get_tuned_config("recompute_w_u_fwd_gdn2_kernel") or [
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=get_tuned_config("recompute_w_u_fwd_gdn2_kernel"),
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )

@@ -31,9 +31,6 @@ from flag_attn.runtime.backend._hygon import device
 from .chunk_intra_token_parallel import chunk_gdn2_fwd_intra_token_parallel
 from .wy_fast import recompute_w_u_fwd_gdn2
 
-IS_TF32_SUPPORTED = (
-    device.vendor_name == "nvidia" and torch.cuda.is_available() and torch.version.cuda is not None and torch.cuda.get_device_capability()[0] >= 8
-)
 
 IS_GATHER_SUPPORTED = hasattr(tl, "gather")
 
@@ -46,10 +43,7 @@ else:
         return None
 
 
-if IS_TF32_SUPPORTED:
-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
-else:
-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
+SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
 
 
 @triton.heuristics(

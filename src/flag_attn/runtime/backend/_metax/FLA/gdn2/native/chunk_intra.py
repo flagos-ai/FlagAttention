@@ -181,11 +181,7 @@ def chunk_gdn2_fwd_kernel_intra_sub_chunk(
     }
 )
 @triton.autotune(
-    configs=get_tuned_config("chunk_gdn2_fwd_kernel_inter_solve_fused") or [
-        triton.Config({"BK": BK}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
-    ],
+    configs=get_tuned_config("chunk_gdn2_fwd_kernel_inter_solve_fused"),
     key=["H", "K", "BC"],
     **autotune_cache_kwargs,
 )

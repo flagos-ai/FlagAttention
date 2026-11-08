@@ -29,7 +29,6 @@ from flag_attn import chunk_gla as flag_attn_chunk_gla
 DEFAULT_WARMUP = 10
 DEFAULT_REP = 20
 
-# The external FLA CUDA implementation is an optional NVIDIA baseline.
 _fla_chunk_gla = None
 if test_backend.is_nvidia():
     try:
