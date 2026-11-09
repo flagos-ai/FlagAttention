@@ -9,9 +9,9 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.gated_linear_attention.index import prepare_chunk_indices
+from flag_attn.FLA.index import prepare_chunk_indices
 from ..compat import autotune_cache_kwargs
-from flag_attn.gated_linear_attention.utils import input_guard
+from flag_attn.utils import input_guard
 
 
 @triton.heuristics(

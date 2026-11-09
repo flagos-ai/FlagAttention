@@ -178,7 +178,7 @@ def _build_inputs(
         raise ValueError("HQ must be divisible by H")
 
     device = test_backend.device
-    generator = torch.Generator(device=device)
+    generator = torch.Generator(device="cpu" if device == "gcu" else device)
     generator.manual_seed(_case_seed(case, dtype))
 
     query_shape = (

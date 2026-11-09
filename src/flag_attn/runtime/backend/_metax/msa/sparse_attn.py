@@ -62,7 +62,6 @@ def _has_tle_builder_apis(*names: str) -> bool:
         return False
     return all(hasattr(libtriton.ir.builder, name) for name in names)
 
-_HAS_TLE_SYNC = _has_tle_gpu_apis("alloc", "local_ptr")
 _HAS_TLE_ASYNC_MMA = (
     _has_tle_gpu_apis(
         "alloc_barriers",
@@ -85,8 +84,6 @@ SPARSE_BLOCK_SIZE = 128
 # the smallest benchmark GQA tile. Larger tiles reuse one full-page KV stage.
 _PREFILL_HALF_KV_MAX_BLOCK_SIZE_QH = 8
 
-_PREFILL_SYNC_BLOCK_SIZE_K = 32
-_PREFILL_SYNC_NUM_WARPS = 4
 
 _FP8_DTYPES = tuple(
     dtype
@@ -341,159 +338,6 @@ def _gqa_sparse_fwd_direct(
             order=(2, 1, 0),
         )
         tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
-
-
-@triton_jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
-def _gqa_sparse_fwd_tle_sync(
-    q_ptr,
-    kv_cache_ptr,
-    t_ptr,
-    o_ptr,
-    block_table_ptr,
-    cu_seqlens_q,
-    cu_seqblocks_q,
-    seq_lens,
-    prefix_lens,
-    num_kv_heads,
-    gqa_group_size,
-    head_dim,
-    max_topk,
-    sm_scale,
-    stride_qn,
-    stride_qh,
-    stride_qd,
-    stride_kv_blk,
-    stride_kv_h,
-    stride_kv_pos,
-    stride_kv_d,
-    stride_th,
-    stride_tn,
-    stride_tk,
-    stride_on,
-    stride_oh,
-    stride_od,
-    stride_bt_b,
-    BLOCK_SIZE_Q: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    BLOCK_SIZE_D: tl.constexpr,
-    BLOCK_SIZE_H: tl.constexpr,
-    BLOCK_SIZE_QH: tl.constexpr,
-):
-    """Synchronous MetaX TLE path using TLE shared buffers and ``tl.dot``."""
-    tl.static_assert(PAGE_SIZE % BLOCK_SIZE_K == 0)
-    sm_scale_log2e = sm_scale * 1.4426950409
-    pid_q = tl.program_id(0)
-    pid_kh = tl.program_id(1)
-    pid_b = tl.program_id(2)
-    pid_h = pid_kh * gqa_group_size
-
-    q_start = tl.load(cu_seqlens_q + pid_b)
-    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
-    q_block_start = tl.load(cu_seqblocks_q + pid_b)
-    q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
-    seq_len = tl.load(seq_lens + pid_b)
-    prefix_len = tl.load(prefix_lens + pid_b)
-
-    q_tile_start = pid_q * BLOCK_SIZE_Q
-    if q_tile_start >= q_block_len:
-        return
-
-    off_q = tl.arange(0, BLOCK_SIZE_Q)
-    off_n = tl.arange(0, BLOCK_SIZE_K)
-    off_d = tl.arange(0, BLOCK_SIZE_D)
-    q_abs = prefix_len + q_tile_start + off_q
-    real_topk = tl.minimum(max_topk, (q_abs + PAGE_SIZE) // PAGE_SIZE)
-    loop_blocks = tl.max(real_topk, axis=0)
-
-    bt_row = block_table_ptr + pid_b * stride_bt_b
-    topk_ptr = (
-        t_ptr
-        + pid_kh * stride_th
-        + (q_block_start + q_tile_start) * stride_tn
-    )
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
-        shape=(q_len, gqa_group_size, head_dim),
-        strides=(stride_qn, stride_qh, stride_qd),
-        offsets=(q_tile_start, 0, 0),
-        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(2, 1, 0),
-    )
-    q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
-    q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
-
-    # MCTLE provides alloc/copy/local_ptr but not Hopper barriers or WGMMA.
-    # Keep its shared-memory abstraction and execute each stage synchronously.
-    kv_smem = tle.gpu.alloc(
-        [BLOCK_SIZE_K, BLOCK_SIZE_D],
-        dtype=kv_cache_ptr.dtype.element_ty,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    kv_local_ptrs = tle.gpu.local_ptr(kv_smem)
-
-    causal_offsets = q_abs[:, None] - off_n[None, :]
-    m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_SIZE_QH,), dtype=tl.float32)
-    acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
-
-    for block_iter in tl.range(loop_blocks, disable_licm=True, num_stages=1):
-        blk = tl.load(topk_ptr + block_iter * stride_tk).to(tl.int32)
-        page = tl.load(bt_row + blk).to(tl.int64)
-        kv_base = kv_cache_ptr + page * stride_kv_blk + pid_kh * stride_kv_h
-        for page_offset in tl.static_range(0, PAGE_SIZE, BLOCK_SIZE_K):
-            c = blk * PAGE_SIZE + page_offset
-            pos = c + off_n
-            pos_mask = pos < seq_len
-            k_ptrs = (
-                kv_base
-                + (page_offset + off_n[:, None]) * stride_kv_pos
-                + off_d[None, :] * stride_kv_d
-            )
-            tl.store(kv_local_ptrs, tl.load(k_ptrs))
-            tl.debug_barrier()
-            k = tl.load(kv_local_ptrs)
-            qk = tl.dot(q, tl.trans(k)) * sm_scale_log2e
-            qk = tl.reshape(qk, (BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K))
-
-            if (c + BLOCK_SIZE_K) > (prefix_len + q_tile_start):
-                qk += tl.where(causal_offsets[:, None, :] >= c, 0, float("-inf"))
-            qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
-            if (c + BLOCK_SIZE_K) > seq_len:
-                qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            p = tl.exp2(qk - m_ij[:, None])
-            alpha = tl.exp2(m_i - m_ij)
-            l_ij = tl.sum(p, axis=1)
-            acc_o *= alpha[:, None]
-
-            # Finish consuming K before reusing the same TLE buffer for V.
-            tl.debug_barrier()
-            v_ptrs = k_ptrs + head_dim * stride_kv_d
-            tl.store(kv_local_ptrs, tl.load(v_ptrs))
-            tl.debug_barrier()
-            v = tl.load(kv_local_ptrs)
-            p_dot = p.to(v.dtype)
-            acc_o += tl.dot(p_dot, v)
-
-            l_i = tl.math.fma(l_i, alpha, l_ij)
-            m_i = m_ij
-
-    inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0)
-    acc_o *= inv_l[:, None]
-    acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
-    o_ptrs = tl.make_block_ptr(
-        base=o_ptr + q_start * stride_on + pid_h * stride_oh,
-        shape=(q_len, gqa_group_size, head_dim),
-        strides=(stride_on, stride_oh, stride_od),
-        offsets=(q_tile_start, 0, 0),
-        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(2, 1, 0),
-    )
-    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
 
 
 @triton.heuristics(
@@ -1275,18 +1119,11 @@ def minimax_m3_sparse_attn(
     grid = (max_query_len, num_kv_heads, batch)
     block_size_h = triton.next_power_of_2(gqa_group_size)
 
-    # FP8 KV has a dtype mismatch with BF16 Q, and a GQA tile below eight heads
-    # cannot form a legal WGMMA result. Keep those cases on the direct kernel.
-    # Otherwise prefer the complete asynchronous TLE path, then MetaX's
-    # synchronous TLE shared-memory subset, and use direct Triton only when
-    # neither TLE capability set is available.
+    # FP8 KV and small GQA groups use the direct kernel. The MetaX compiler
+    # rejects mixing MCTLE ops with tl.dot, so only select the complete
+    # asynchronous TLE/WGMMA path when all of its APIs are available.
     use_tle_async = not use_fp8 and block_size_h >= 8 and _HAS_TLE_ASYNC_MMA
-    use_tle_sync = (
-        not use_fp8
-        and not use_tle_async
-        and _HAS_TLE_SYNC
-    )
-    use_direct = not use_tle_async and not use_tle_sync
+    use_direct = not use_tle_async
     if use_direct:
         direct_block_size_h = (
             max(16, block_size_h) if current_platform.is_metax() else block_size_h
@@ -1340,55 +1177,6 @@ def minimax_m3_sparse_attn(
             BLOCK_SIZE_QH=direct_block_size_h,
             USE_FP8=use_fp8,
             KV_SCALE_MODE=kv_scale_mode,
-            **launch_kwargs,
-        )
-        return
-
-    if use_tle_sync:
-        sync_block_size_h = max(16, block_size_h)
-        launch_kwargs = {"num_warps": _PREFILL_SYNC_NUM_WARPS, "num_stages": 1}
-        launch_kwargs.update(
-            current_platform.attention_launch_kwargs(
-                num_warps=_PREFILL_SYNC_NUM_WARPS,
-                num_stages=1,
-                scenario="flashattn-fwd;unprefetch",
-            )
-        )
-        _gqa_sparse_fwd_tle_sync[grid](
-            q,
-            kv_cache,
-            topk_idx,
-            output,
-            block_table,
-            cu_seqlens_q,
-            cu_seqlens_q,
-            seq_lens,
-            prefix_lens,
-            num_kv_heads,
-            gqa_group_size,
-            head_dim,
-            topk,
-            sm_scale,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            kv_cache.stride(3),
-            topk_idx.stride(0),
-            topk_idx.stride(1),
-            topk_idx.stride(2),
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            block_table.stride(0),
-            BLOCK_SIZE_Q=1,
-            BLOCK_SIZE_K=_PREFILL_SYNC_BLOCK_SIZE_K,
-            PAGE_SIZE=SPARSE_BLOCK_SIZE,
-            BLOCK_SIZE_D=triton.next_power_of_2(head_dim),
-            BLOCK_SIZE_H=sync_block_size_h,
-            BLOCK_SIZE_QH=sync_block_size_h,
             **launch_kwargs,
         )
         return

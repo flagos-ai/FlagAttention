@@ -23,9 +23,9 @@ from triton.runtime.autotuner import Autotuner
 from triton.runtime.jit import JITFunction
 
 from ...compat import autotune_cache_kwargs
-from ..tuning import get_tuned_config
+from flag_attn.runtime import get_tuned_config
 
-_shared = importlib.import_module("flag_attn.gated_linear_attention.chunk_gla")
+_shared = importlib.import_module("flag_attn.runtime.backend._metax.FLA.gla.chunk_gla")
 HAS_TLE = _shared.HAS_TLE
 prepare_chunk_indices = _shared.prepare_chunk_indices
 chunk_gla_fwd_kernel_o = _shared.chunk_gla_fwd_kernel_o
@@ -72,9 +72,9 @@ if HAS_TLE:
         _shared.chunk_gla_fwd_kernel_o_tle
     )
     # Own Config objects and runtime state; only the JIT kernel is shared.
-    _output_configs = get_tuned_config(
-        "gdn2_native_output_tle",
-        fallback=copy.deepcopy(_shared_tuner.configs),
+    _output_configs = (
+        get_tuned_config("gdn2_native_output_tle")
+        or copy.deepcopy(_shared_tuner.configs)
     )
     chunk_gla_fwd_kernel_o_tle = triton.heuristics(
         {"IS_VARLEN": lambda args: args["cu_seqlens"] is not None}
@@ -88,7 +88,7 @@ if HAS_TLE:
 
 
 def _uses_profile(q, v, g, A, h, state_v_first, cu_seqlens, chunk_size):
-    if not HAS_TLE or os.environ.get("FLAG_ATTN_GLA_TLE", "1") == "0":
+    if not HAS_TLE or os.environ.get("FLAG_ATTN_GLA_TLE", "0") == "0":
         return False
     if chunk_size != 64 or state_v_first or cu_seqlens is not None:
         return False
@@ -132,7 +132,7 @@ def chunk_gdn2_fwd_o(
     def grid_tle(meta):
         return (triton.cdiv(V, meta["BV"] * meta.get("B_VCHUNK", 1)), NT, B * HV)
 
-    _use_tle = HAS_TLE and os.environ.get("FLAG_ATTN_GLA_TLE", "1") != "0"
+    _use_tle = HAS_TLE and os.environ.get("FLAG_ATTN_GLA_TLE", "0") != "0"
     if _use_tle:
         kernel = chunk_gla_fwd_kernel_o_tle
         grid_fn = grid_tle

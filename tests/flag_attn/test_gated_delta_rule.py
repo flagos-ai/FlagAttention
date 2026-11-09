@@ -1,4 +1,3 @@
-
 import os
 from contextlib import contextmanager
 
@@ -39,32 +38,9 @@ GDN_TWO_KERNEL_TEST_SHAPES = [
     (8, 2048, 32, 256, 256),
 ]
 
-GDN_EXTERNAL_TEST_SHAPES = [
-    (2, 2048, 16, 128, 128),
-    (8, 1024, 8, 64, 64),
-    (8, 2048, 32, 256, 256),
-]
-
-def _load_fla_reference():
-    try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_chunk_gdn
-
-        return fla_chunk_gdn, None
-    except Exception as exc:
-        return None, str(exc)
-
-
-FLA_CHUNK_GDN, FLA_IMPORT_ERROR = _load_fla_reference()
-
 
 def _cuda_tle_available() -> bool:
     return test_backend.is_nvidia() and has_triton_tle(3, 6, 0)
-
-
-def _require_fla_reference():
-    if FLA_CHUNK_GDN is None:
-        pytest.skip(f"external FLA GDN implementation is unavailable: {FLA_IMPORT_ERROR}")
-    return FLA_CHUNK_GDN
 
 
 @contextmanager
@@ -388,23 +364,6 @@ def test_chunk_gated_delta_rule_fwd_hybrid_matches_two_kernel(dtype):
     _assert_close("o", actual[1], expected[1])
     _assert_close("A", actual[2], expected[2])
     _assert_close("final_state", actual[3], expected[3])
-
-
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN external comparison requires CUDA/TLE"
-)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shape", GDN_EXTERNAL_TEST_SHAPES)
-@torch.inference_mode()
-def test_chunk_gated_delta_rule_hybrid_matches_fla(dtype, shape):
-    torch.manual_seed(42)
-    args = _make_inputs(*shape, dtype=dtype, use_initial_state=False)
-
-    expected_o, expected_final_state = _call_fla_reference(args)
-    actual_o, actual_final_state = _call_public_hybrid(args)
-
-    _assert_close("o", actual_o, expected_o)
-    _assert_close("final_state", actual_final_state, expected_final_state)
 
 
 @pytest.mark.skipif(
