@@ -8,12 +8,12 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_attn import runtime
 from flag_attn.FLA.compat import libentry, libtuner
 from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 from flag_attn.FLA.utils import exp
 from flag_attn.FLA.utils import use_cuda_graph
 
-NUM_WARPS = [2, 4, 8, 16]
 
 
 @libentry()
@@ -28,12 +28,7 @@ NUM_WARPS = [2, 4, 8, 16]
     }
 )
 @libtuner(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
-        for BV in [32, 64]
-    ],
+    configs=runtime.get_tuned_config("chunk_gated_delta_rule_fwd_kernel_h_blockdim64"),
     key=[
         "H",
         "K",

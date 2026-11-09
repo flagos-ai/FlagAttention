@@ -37,6 +37,7 @@ _VENDOR_DEVICES = {
 }
 
 _TRITON_VENDORS = {
+    "gcu": "enflame",
     "maca": "metax",
     "metax": "metax",
     "hygon": "hygon",
