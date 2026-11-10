@@ -26,8 +26,6 @@ from .chunk import MAX_HEAD_DIM, chunk_gla_fwd_chunked
 from .chunk_bwd import chunk_gla_bwd_chunked
 from .recurrent import chunk_gla as _recurrent_chunk_gla
 
-__all__ = ["chunk_gla"]
-
 _CHUNKED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 

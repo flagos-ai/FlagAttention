@@ -48,8 +48,6 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["chunk_gla_fwd_chunked"]
-
 RCP_LN2 = tl.constexpr(1.4426950216)
 # Chunk size for the inter-chunk state scan, and column-panel width of the
 # intra-chunk attention matrix.  ``BC`` bounds the exponent span of A: splitting

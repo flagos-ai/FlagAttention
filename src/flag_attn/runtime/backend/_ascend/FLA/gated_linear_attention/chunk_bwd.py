@@ -49,8 +49,6 @@ import triton.language as tl
 
 from .chunk import BC, BK, PANEL_LOG_MAX, _state_tiles, exp2
 
-__all__ = ["chunk_gla_bwd_chunked"]
-
 # Tile of the V loop in the dv and dq/dk/dg kernels.  Narrower than the forward
 # output tile: the backward stages keep several float32 accumulators live.
 BWD_BV = 128
