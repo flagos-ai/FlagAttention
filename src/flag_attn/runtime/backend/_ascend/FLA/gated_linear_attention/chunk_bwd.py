@@ -39,6 +39,11 @@ The intra-chunk part is split in two kernels.  ``dq`` is a full-chunk dot, but
 ``dk`` of a column panel only covers the rows of that panel, so it is written
 by the intra kernel and extended by the inter-chunk/dg kernel afterwards.
 
+The kernels themselves stay one-chunk-per-program: like the forward they are
+launched once per group of chunks (with an ``I_T_LO`` offset) so that the
+per-program launch scratch of the Ascend Triton runtime stays bounded, see
+``chunk.MAX_PROGRAMS``.
+
 Only the fixed-length, ``[K, V]`` state layout is handled here; variable-length
 inputs and ``state_v_first`` keep using the recurrent implementation.
 """
@@ -47,7 +52,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .chunk import BC, BK, PANEL_LOG_MAX, _state_tiles, exp2
+from .chunk import BC, BK, PANEL_LOG_MAX, _chunks_per_launch, _state_tiles, exp2
 
 # Tile of the V loop in the dv and dq/dk/dg kernels.  Narrower than the forward
 # output tile: the backward stages keep several float32 accumulators live.
@@ -106,7 +111,8 @@ def chunk_gla_bwd_dh_kernel(
         m_tv = m_t[:, None] & m_v[None, :]
 
         o_dh = ((i_b * NT + i_t) * H + i_h) * K * V
-        tl.store(dh + o_dh + o_k[:, None].to(tl.int64) * V + o_v[None, :], b_dh, mask=m_h)
+        tl.store(dh + o_dh + o_k[:, None].to(tl.int64) * V + o_v[None, :],
+                 b_dh.to(dh.dtype.element_ty), mask=m_h)
 
         last_idx = i_t * BT + BT - 1
         last_idx = tl.where(last_idx < T, last_idx, T - 1)
@@ -124,20 +130,21 @@ def chunk_gla_bwd_dh_kernel(
         )
 
 
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "I_T_LO"])
 def chunk_gla_bwd_dA_kernel(
     v,
     do,
     dA,
     scale,
     T,
+    I_T_LO,
     H: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
 ):
     """dA = tril(do @ v^T) * scale, the gradient of the intra-chunk matrix."""
-    i_t = tl.program_id(0)
+    i_t = tl.program_id(0) + I_T_LO
     i_bh = tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
@@ -162,7 +169,7 @@ def chunk_gla_bwd_dA_kernel(
     tl.store(p_dA, b_dA, mask=m_t[:, None])
 
 
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "I_T_LO"])
 def chunk_gla_bwd_dqk_intra_kernel(
     q,
     k,
@@ -171,6 +178,7 @@ def chunk_gla_bwd_dqk_intra_kernel(
     dq,
     dk,
     T,
+    I_T_LO,
     H: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
@@ -186,7 +194,7 @@ def chunk_gla_bwd_dqk_intra_kernel(
     ``dA == 0`` and only pick up the cap.
     """
     i_k = tl.program_id(0)
-    i_t = tl.program_id(1)
+    i_t = tl.program_id(1) + I_T_LO
     i_bh = tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
@@ -223,7 +231,7 @@ def chunk_gla_bwd_dqk_intra_kernel(
     tl.store(dq + base_k + o_t[:, None] * (H * K) + o_k[None, :], b_dq, mask=m_tk)
 
 
-@triton.jit(do_not_specialize=["T", "NT"])
+@triton.jit(do_not_specialize=["T", "NT", "I_T_LO"])
 def chunk_gla_bwd_dqkg_kernel(
     q,
     k,
@@ -238,6 +246,7 @@ def chunk_gla_bwd_dqkg_kernel(
     scale,
     T,
     NT,
+    I_T_LO,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -252,7 +261,7 @@ def chunk_gla_bwd_dqkg_kernel(
     uses the inter-chunk ``dk``.
     """
     i_k = tl.program_id(0)
-    i_t = tl.program_id(1)
+    i_t = tl.program_id(1) + I_T_LO
     i_bh = tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
@@ -276,10 +285,11 @@ def chunk_gla_bwd_dqkg_kernel(
         b_v = tl.load(v + base_v + o_t[:, None] * (H * V) + o_v[None, :], mask=m_tv, other=0.0)
         b_do = tl.load(do + base_v + o_t[:, None] * (H * V) + o_v[None, :], mask=m_tv, other=0.0)
         # State tiles are read transposed ([BV, BK]) so both dots contract on V.
+        # h/dh are stored in the input dtype; upcast for the float32 dots.
         b_h = tl.load(h + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
-                      mask=m_v[:, None] & m_k[None, :], other=0.0)
+                      mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
         b_dh = tl.load(dh + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
-                       mask=m_v[:, None] & m_k[None, :], other=0.0)
+                       mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
         # dL/dg_last from the state decay: h_next = exp2(g_last) * h.
         b_dgk += tl.sum(b_h * b_dh, axis=0)
         b_dq = tl.dot(b_do.to(tl.float32), b_h, b_dq)
@@ -309,7 +319,7 @@ def chunk_gla_bwd_dqkg_kernel(
     tl.store(dg + base_k + o_t[:, None] * (H * K) + o_k[None, :], b_dg, mask=m_tk)
 
 
-@triton.jit(do_not_specialize=["T", "NT"])
+@triton.jit(do_not_specialize=["T", "NT", "I_T_LO"])
 def chunk_gla_bwd_dv_kernel(
     k,
     g_cum,
@@ -319,6 +329,7 @@ def chunk_gla_bwd_dv_kernel(
     dv,
     T,
     NT,
+    I_T_LO,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -328,7 +339,7 @@ def chunk_gla_bwd_dv_kernel(
 ):
     """dv = A^T @ do + k_e @ dh."""
     i_v = tl.program_id(0)
-    i_t = tl.program_id(1)
+    i_t = tl.program_id(1) + I_T_LO
     i_bh = tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
@@ -360,7 +371,7 @@ def chunk_gla_bwd_dv_kernel(
         b_g = tl.load(g_cum + base_k + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0)
         b_k = tl.load(k + base_k + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0)
         b_dh = tl.load(dh + o_state + o_k[:, None].to(tl.int64) * V + o_v[None, :],
-                       mask=m_k[:, None] & m_v[None, :], other=0.0)
+                       mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
         b_dv = tl.dot(b_k.to(tl.float32) * exp2(b_gl[None, :] - b_g), b_dh, b_dv)
 
     tl.store(dv + base_v + o_t[:, None] * (H * V) + o_v[None, :], b_dv, mask=m_tv)
@@ -381,10 +392,11 @@ def chunk_gla_bwd_chunked(
 ):
     """Chunked GLA backward from the forward intermediates.
 
-    ``h`` is the fp32 ``[B, NT, H, K, V]`` state array, ``A`` the fp32
-    ``[B, T, H, BT]`` intra-chunk matrix and ``g_cum`` the fp32 base-2 gate
+    ``h`` is the ``[B, NT, H, K, V]`` state array in the input dtype, ``A`` the
+    fp32 ``[B, T, H, BT]`` intra-chunk matrix and ``g_cum`` the fp32 base-2 gate
     cumsum, all as returned by ``chunk_gla_fwd_chunked``.  Returns
-    ``(dq, dk, dv, dg, dh0)`` in float32; the caller casts to the input dtypes.
+    ``(dq, dk, dv, dg, dh0)``: ``dq``/``dk``/``dh0`` in float32, ``dv``/``dg``
+    in the input dtype (the caller casts them to it anyway).
     """
     B, T, H, K = q.shape
     V = v.shape[-1]
@@ -398,13 +410,15 @@ def chunk_gla_bwd_chunked(
     bv = min(BWD_BV, triton.next_power_of_2(V))
     nk = triton.cdiv(K, bkc)
 
+    # dh mirrors h (input dtype); dv/dg are produced in one pass and are cast to
+    # the input dtype by the caller anyway, so they are allocated in it directly.
     dh = torch.empty_like(h)
     dh0 = torch.empty_like(initial_state) if initial_state is not None else None
     dA = torch.empty((B, T, H, bt), device=q.device, dtype=torch.float32)
     dq = torch.empty((B, T, H, K), device=q.device, dtype=torch.float32)
     dk = torch.empty_like(dq)
-    dv = torch.empty((B, T, H, V), device=q.device, dtype=torch.float32)
-    dg = torch.empty_like(dq)
+    dv = torch.empty((B, T, H, V), device=q.device, dtype=v.dtype)
+    dg = torch.empty((B, T, H, K), device=q.device, dtype=g.dtype)
 
     chunk_gla_bwd_dh_kernel[(triton.cdiv(K, bsk), triton.cdiv(V, bsv), B * H)](
         q=q,
@@ -425,66 +439,80 @@ def chunk_gla_bwd_chunked(
         USE_FINAL_STATE_GRADIENT=dht is not None,
         STORE_INITIAL_STATE_GRADIENT=dh0 is not None,
     )
-    chunk_gla_bwd_dA_kernel[(nt, B * H)](
-        v=v,
-        do=do,
-        dA=dA,
-        scale=scale,
-        T=T,
-        H=H,
-        V=V,
-        BT=bt,
-        BV=bv,
-    )
-    chunk_gla_bwd_dqk_intra_kernel[(nk, nt, B * H)](
-        q=q,
-        k=k,
-        g_cum=g_cum,
-        dA=dA,
-        dq=dq,
-        dk=dk,
-        T=T,
-        H=H,
-        K=K,
-        BT=bt,
-        BC=BC,
-        BK=bkc,
-    )
-    chunk_gla_bwd_dqkg_kernel[(nk, nt, B * H)](
-        q=q,
-        k=k,
-        v=v,
-        g_cum=g_cum,
-        h=h,
-        dh=dh,
-        do=do,
-        dq=dq,
-        dk=dk,
-        dg=dg,
-        scale=scale,
-        T=T,
-        NT=nt,
-        H=H,
-        K=K,
-        V=V,
-        BT=bt,
-        BK=bkc,
-        BV=bv,
-    )
-    chunk_gla_bwd_dv_kernel[(triton.cdiv(V, bv), nt, B * H)](
-        k=k,
-        g_cum=g_cum,
-        A=A,
-        do=do,
-        dh=dh,
-        dv=dv,
-        T=T,
-        NT=nt,
-        H=H,
-        K=K,
-        V=V,
-        BT=bt,
-        BK=bkc,
-        BV=bv,
-    )
+    # Each kernel is launched once per group of chunks: the full grid is just
+    # split, which bounds the per-program launch scratch of each launch.
+    cpb = _chunks_per_launch(nt * B * H, nt)
+    for i_lo in range(0, nt, cpb):
+        chunk_gla_bwd_dA_kernel[(min(cpb, nt - i_lo), B * H)](
+            v=v,
+            do=do,
+            dA=dA,
+            scale=scale,
+            T=T,
+            I_T_LO=i_lo,
+            H=H,
+            V=V,
+            BT=bt,
+            BV=bv,
+        )
+    cpb_k = _chunks_per_launch(nk * nt * B * H, nt)
+    for i_lo in range(0, nt, cpb_k):
+        n = min(cpb_k, nt - i_lo)
+        chunk_gla_bwd_dqk_intra_kernel[(nk, n, B * H)](
+            q=q,
+            k=k,
+            g_cum=g_cum,
+            dA=dA,
+            dq=dq,
+            dk=dk,
+            T=T,
+            I_T_LO=i_lo,
+            H=H,
+            K=K,
+            BT=bt,
+            BC=BC,
+            BK=bkc,
+        )
+        chunk_gla_bwd_dqkg_kernel[(nk, n, B * H)](
+            q=q,
+            k=k,
+            v=v,
+            g_cum=g_cum,
+            h=h,
+            dh=dh,
+            do=do,
+            dq=dq,
+            dk=dk,
+            dg=dg,
+            scale=scale,
+            T=T,
+            NT=nt,
+            I_T_LO=i_lo,
+            H=H,
+            K=K,
+            V=V,
+            BT=bt,
+            BK=bkc,
+            BV=bv,
+        )
+    n_vd = triton.cdiv(V, bv)
+    cpb_v = _chunks_per_launch(n_vd * nt * B * H, nt)
+    for i_lo in range(0, nt, cpb_v):
+        chunk_gla_bwd_dv_kernel[(n_vd, min(cpb_v, nt - i_lo), B * H)](
+            k=k,
+            g_cum=g_cum,
+            A=A,
+            do=do,
+            dh=dh,
+            dv=dv,
+            T=T,
+            NT=nt,
+            I_T_LO=i_lo,
+            H=H,
+            K=K,
+            V=V,
+            BT=bt,
+            BK=bkc,
+            BV=bv,
+        )
     return dq, dk, dv, dg, dh0

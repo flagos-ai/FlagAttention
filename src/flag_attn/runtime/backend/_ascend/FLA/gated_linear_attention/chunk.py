@@ -29,9 +29,13 @@ cumsummed in base 2 (``g_cum``, float32) and ``BT`` tokens per chunk:
 
 Numerical notes:
 * every ``tl.dot`` runs in float32 (exact on this target and, at these tile
-  sizes, faster than casting the operands down), and the inter-chunk state is
-  kept in float32.  Both match what the FLA Ascend backend does to keep the
+  sizes, faster than casting the operands down) and the running state stays in
+  float32 registers.  Both match what the FLA Ascend backend does to keep the
   recurrence stable;
+* the *stored* inter-chunk states ``h`` are the largest intermediate of the
+  chunked path: ``[B, NT, H, K, V]``, O(T * K * V / BT) elements.  They are
+  therefore kept in the input dtype (bf16/fp16) instead of float32 and only
+  upcast when loaded, which halves that array at no measurable cost;
 * ``A`` is built in ``BC``-wide column panels: the panel midpoint is the
   exponent reference for the ``exp2(g_i - g_j)`` factorisation, and the rows
   above the panel are dropped from the load.  That bounds each exponential to
@@ -39,6 +43,16 @@ Numerical notes:
   64-token reference overflows float32 for strongly decaying gates: the tests
   reach ``logsigmoid / 0.1``, i.e. ~10 log2 units per token, where a plain
   16-token panel already overflows to inf.
+
+Memory: besides the dtype of the stored states (see above), the launch
+transient of the Ascend Triton runtime dominates the peak.  The runtime
+allocates one global-scratch slice per *program* of a launch (0.1-0.5 MiB at
+these tile sizes), so a wide launch is far more expensive than its tensors: the
+inter-chunk dq/dk/dg kernel alone reached ~4.3 GiB of scratch at
+B=2,T=2048,H=16,K=V=512.  The chunk-parallel kernels are therefore launched
+once per group of ``_chunks_per_launch`` chunks, carrying the chunk offset
+``I_T_LO``: the grids shrink by that factor while the kernels stay
+one-chunk-per-program, and small problems still run a single full-size launch.
 
 Not implemented here: variable-length inputs (``cu_seqlens``); the backward
 lives in ``chunk_bwd.py``.
@@ -68,6 +82,20 @@ BV = 256
 STATE_BK = 128
 STATE_BV = 128
 MAX_HEAD_DIM = 512
+# Cap on the number of programs of one chunk-parallel launch; see the module
+# docstring.  Small problems stay below it and run a single launch.
+MAX_PROGRAMS = 1024
+
+
+def _chunks_per_launch(programs: int, nt: int) -> int:
+    """Chunks covered by one launch of a kernel whose full grid is ``programs``.
+
+    A full grid at or below ``MAX_PROGRAMS`` runs as a single launch; wider grids
+    are split into ``ceil(programs / MAX_PROGRAMS)`` launches of contiguous
+    chunks.
+    """
+    groups = max(1, triton.cdiv(programs, MAX_PROGRAMS))
+    return triton.cdiv(nt, groups)
 
 
 @triton.jit
@@ -161,10 +189,11 @@ def chunk_gla_fwd_h_kernel(
         o_h = ((i_b * NT + i_t) * H + i_h) * K * V
         if STATE_V_FIRST:
             p_h = h + o_h + o_v[:, None].to(tl.int64) * K + o_k[None, :]
-            tl.store(p_h, tl.trans(b_h), mask=m_v[:, None] & m_k[None, :])
+            tl.store(p_h, tl.trans(b_h).to(h.dtype.element_ty),
+                     mask=m_v[:, None] & m_k[None, :])
         else:
             p_h = h + o_h + o_k[:, None].to(tl.int64) * V + o_v[None, :]
-            tl.store(p_h, b_h, mask=m_h)
+            tl.store(p_h, b_h.to(h.dtype.element_ty), mask=m_h)
 
         last_idx = i_t * BT + BT - 1
         last_idx = tl.where(last_idx < T, last_idx, T - 1)
@@ -186,7 +215,7 @@ def chunk_gla_fwd_h_kernel(
             tl.store(p_ht + o_k[:, None].to(tl.int64) * V + o_v[None, :], b_h, mask=m_h)
 
 
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "I_T_LO"])
 def chunk_gla_fwd_A_kernel(
     q,
     k,
@@ -194,6 +223,7 @@ def chunk_gla_fwd_A_kernel(
     A,
     scale,
     T,
+    I_T_LO,
     H: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
@@ -209,7 +239,7 @@ def chunk_gla_fwd_A_kernel(
     start, lets those exponentials run past the float32 range for strongly
     decaying gates.
     """
-    i_t = tl.program_id(0)
+    i_t = tl.program_id(0) + I_T_LO
     i_bh = tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
@@ -249,7 +279,7 @@ def chunk_gla_fwd_A_kernel(
             tl.store(p_A, b_A, mask=m_t[:, None])
 
 
-@triton.jit(do_not_specialize=["T", "NT"])
+@triton.jit(do_not_specialize=["T", "NT", "I_T_LO"])
 def chunk_gla_fwd_o_kernel(
     q,
     v,
@@ -260,6 +290,7 @@ def chunk_gla_fwd_o_kernel(
     scale,
     T,
     NT,
+    I_T_LO,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -270,7 +301,7 @@ def chunk_gla_fwd_o_kernel(
 ):
     """o = scale * (q * exp2(g_cum)) @ h_prev + A @ v."""
     i_v = tl.program_id(0)
-    i_t = tl.program_id(1)
+    i_t = tl.program_id(1) + I_T_LO
     i_bh = tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
@@ -295,11 +326,11 @@ def chunk_gla_fwd_o_kernel(
         b_qg = b_q * exp2(b_g) * scale
         if STATE_V_FIRST:
             b_h = tl.load(h + o_h + o_v[:, None].to(tl.int64) * K + o_k[None, :],
-                          mask=m_v[:, None] & m_k[None, :], other=0.0)
+                          mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
             b_o = tl.dot(b_qg, tl.trans(b_h), b_o)
         else:
             b_h = tl.load(h + o_h + o_k[:, None].to(tl.int64) * V + o_v[None, :],
-                          mask=m_k[:, None] & m_v[None, :], other=0.0)
+                          mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
             b_o = tl.dot(b_qg, b_h, b_o)
 
     m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
@@ -332,8 +363,8 @@ def chunk_gla_fwd_chunked(
     ``initial_state`` is float32 ``[N, H, K, V]`` (``[N, H, V, K]`` when
     ``state_v_first``).  Returns ``(o, ht)`` where ``ht`` is the float32 final
     state (``None`` unless ``output_final_state``).  With
-    ``return_intermediates=True`` a third element ``dict`` carries ``g_cum``,
-    ``h`` and ``A``.
+    ``return_intermediates=True`` a third element ``dict`` carries ``g_cum``
+    and ``A`` (float32) and ``h`` (input dtype).
 
     Variable-length inputs are not supported yet: ``cu_seqlens`` (and the
     ``cu_seqlens_cpu`` twin kept for API compatibility) must be ``None``.
@@ -360,7 +391,9 @@ def chunk_gla_fwd_chunked(
 
     bkc = min(BK, triton.next_power_of_2(K))
     state_shape = (V, K) if state_v_first else (K, V)
-    h = torch.empty((B, nt, H, *state_shape), device=q.device, dtype=torch.float32)
+    # The per-chunk states are the dominant intermediate, so they are stored in
+    # the input dtype; the kernels upcast them before the float32 dots.
+    h = torch.empty((B, nt, H, *state_shape), device=q.device, dtype=q.dtype)
     g_cum = torch.empty((B, T, H, K), device=q.device, dtype=torch.float32)
     A = torch.empty((B, T, H, bt), device=q.device, dtype=torch.float32)
     o = torch.empty_like(v)
@@ -399,39 +432,46 @@ def chunk_gla_fwd_chunked(
         STATE_V_FIRST=state_v_first,
     )
 
-    chunk_gla_fwd_A_kernel[(nt, B * H)](
-        q=q,
-        k=k,
-        g_cum=g_cum,
-        A=A,
-        scale=scale,
-        T=T,
-        H=H,
-        K=K,
-        BT=bt,
-        BC=BC,
-        BK=bkc,
-    )
+    cpb = _chunks_per_launch(nt * B * H, nt)
+    for i_lo in range(0, nt, cpb):
+        chunk_gla_fwd_A_kernel[(min(cpb, nt - i_lo), B * H)](
+            q=q,
+            k=k,
+            g_cum=g_cum,
+            A=A,
+            scale=scale,
+            T=T,
+            I_T_LO=i_lo,
+            H=H,
+            K=K,
+            BT=bt,
+            BC=BC,
+            BK=bkc,
+        )
 
     bov = min(BV, triton.next_power_of_2(V))
-    chunk_gla_fwd_o_kernel[(triton.cdiv(V, bov), nt, B * H)](
-        q=q,
-        v=v,
-        g_cum=g_cum,
-        h=h,
-        A=A,
-        o=o,
-        scale=scale,
-        T=T,
-        NT=nt,
-        H=H,
-        K=K,
-        V=V,
-        BT=bt,
-        BK=bkc,
-        BV=bov,
-        STATE_V_FIRST=state_v_first,
-    )
+    n_vo = triton.cdiv(V, bov)
+    cpb = _chunks_per_launch(n_vo * nt * B * H, nt)
+    for i_lo in range(0, nt, cpb):
+        chunk_gla_fwd_o_kernel[(n_vo, min(cpb, nt - i_lo), B * H)](
+            q=q,
+            v=v,
+            g_cum=g_cum,
+            h=h,
+            A=A,
+            o=o,
+            scale=scale,
+            T=T,
+            NT=nt,
+            I_T_LO=i_lo,
+            H=H,
+            K=K,
+            V=V,
+            BT=bt,
+            BK=bkc,
+            BV=bov,
+            STATE_V_FIRST=state_v_first,
+        )
 
     if return_intermediates:
         return o, ht, {"g_cum": g_cum, "h": h, "A": A}
