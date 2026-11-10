@@ -78,6 +78,7 @@ PANEL_LOG_MAX = tl.constexpr(100.0)
 # Launch tiles.  The state scan and the output projection use much wider tiles
 # than the intra-chunk matrix: both amortise redundant k/v (resp. h) loads.
 BK = 64
+BK_W = 256
 BV = 256
 STATE_BK = 128
 STATE_BV = 128
@@ -390,6 +391,7 @@ def chunk_gla_fwd_chunked(
     nt = triton.cdiv(T, bt)
 
     bkc = min(BK, triton.next_power_of_2(K))
+    bkw = min(BK_W, triton.next_power_of_2(K))
     state_shape = (V, K) if state_v_first else (K, V)
     # The per-chunk states are the dominant intermediate, so they are stored in
     # the input dtype; the kernels upcast them before the float32 dots.
@@ -401,14 +403,14 @@ def chunk_gla_fwd_chunked(
     if output_final_state:
         ht = torch.empty((B, H, *state_shape), device=q.device, dtype=torch.float32)
 
-    chunk_gla_fwd_cumsum_kernel[(nt, triton.cdiv(K, bkc), B * H)](
+    chunk_gla_fwd_cumsum_kernel[(nt, triton.cdiv(K, bkw), B * H)](
         g=g,
         g_cum=g_cum,
         T=T,
         H=H,
         K=K,
         BT=bt,
-        BK=bkc,
+        BK=bkw,
     )
 
     bk, bv = _state_tiles(K, V)
@@ -446,7 +448,7 @@ def chunk_gla_fwd_chunked(
             K=K,
             BT=bt,
             BC=BC,
-            BK=bkc,
+            BK=bkw,
         )
 
     bov = min(BV, triton.next_power_of_2(V))

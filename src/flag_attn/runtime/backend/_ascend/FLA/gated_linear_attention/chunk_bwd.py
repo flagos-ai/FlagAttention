@@ -57,6 +57,9 @@ from .chunk import BC, BK, PANEL_LOG_MAX, _chunks_per_launch, _state_tiles, exp2
 # Tile of the V loop in the dv and dq/dk/dg kernels.  Narrower than the forward
 # output tile: the backward stages keep several float32 accumulators live.
 BWD_BV = 128
+BWD_BK = 64
+BWD_BK_W = 128
+BWD_BV_W = 256
 
 
 @triton.jit(do_not_specialize=["T", "NT"])
@@ -405,10 +408,13 @@ def chunk_gla_bwd_chunked(
     assert h.shape == (B, nt, H, K, V), "h must be the forward [B, NT, H, K, V] state array."
     assert g_cum.shape == (B, T, H, K), "g_cum must be the forward [B, T, H, K] cumsum."
 
-    bkc = min(BK, triton.next_power_of_2(K))
+    bkc = min(BWD_BK, triton.next_power_of_2(K))
+    bkw = min(BWD_BK_W, triton.next_power_of_2(K))
     bsk, bsv = _state_tiles(K, V)
     bv = min(BWD_BV, triton.next_power_of_2(V))
+    bvw = min(BWD_BV_W, triton.next_power_of_2(V))
     nk = triton.cdiv(K, bkc)
+    nkw = triton.cdiv(K, bkw)
 
     # dh mirrors h (input dtype); dv/dg are produced in one pass and are cast to
     # the input dtype by the caller anyway, so they are allocated in it directly.
@@ -455,10 +461,10 @@ def chunk_gla_bwd_chunked(
             BT=bt,
             BV=bv,
         )
-    cpb_k = _chunks_per_launch(nk * nt * B * H, nt)
-    for i_lo in range(0, nt, cpb_k):
-        n = min(cpb_k, nt - i_lo)
-        chunk_gla_bwd_dqk_intra_kernel[(nk, n, B * H)](
+    cpb_kw = _chunks_per_launch(nkw * nt * B * H, nt)
+    for i_lo in range(0, nt, cpb_kw):
+        n = min(cpb_kw, nt - i_lo)
+        chunk_gla_bwd_dqk_intra_kernel[(nkw, n, B * H)](
             q=q,
             k=k,
             g_cum=g_cum,
@@ -471,8 +477,11 @@ def chunk_gla_bwd_chunked(
             K=K,
             BT=bt,
             BC=BC,
-            BK=bkc,
+            BK=bkw,
         )
+    cpb_k = _chunks_per_launch(nk * nt * B * H, nt)
+    for i_lo in range(0, nt, cpb_k):
+        n = min(cpb_k, nt - i_lo)
         chunk_gla_bwd_dqkg_kernel[(nk, n, B * H)](
             q=q,
             k=k,
@@ -495,7 +504,7 @@ def chunk_gla_bwd_chunked(
             BK=bkc,
             BV=bv,
         )
-    n_vd = triton.cdiv(V, bv)
+    n_vd = triton.cdiv(V, bvw)
     cpb_v = _chunks_per_launch(n_vd * nt * B * H, nt)
     for i_lo in range(0, nt, cpb_v):
         chunk_gla_bwd_dv_kernel[(n_vd, min(cpb_v, nt - i_lo), B * H)](
@@ -512,7 +521,7 @@ def chunk_gla_bwd_chunked(
             K=K,
             V=V,
             BT=bt,
-            BK=bkc,
-            BV=bv,
+            BK=bkw,
+            BV=bvw,
         )
     return dq, dk, dv, dg, dh0
