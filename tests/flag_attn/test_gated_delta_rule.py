@@ -1,3 +1,6 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from contextlib import contextmanager
 
@@ -41,6 +44,37 @@ GDN_TWO_KERNEL_TEST_SHAPES = [
 
 def _cuda_tle_available() -> bool:
     return test_backend.is_nvidia() and has_triton_tle(3, 6, 0)
+
+
+def _selected_chunk_gated_delta_rule_fwd():
+    from flag_attn import runtime
+
+    if runtime.device.vendor_name == "thead":
+        from flag_attn.runtime.backend._thead.FLA.gated_delta_rule.chunk import (
+            chunk_gated_delta_rule_fwd as thead_fwd,
+        )
+
+        return thead_fwd
+    return chunk_gated_delta_rule_fwd
+
+
+def _selected_two_kernel_fwd_kernel():
+    from flag_attn import runtime
+
+    if runtime.device.vendor_name == "thead":
+        pytest.skip("T-Head backend does not expose the legacy two-kernel implementation")
+
+    from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import (
+        _chunk_gdn_two_kernel_fwd_kernel,
+    )
+
+    return _chunk_gdn_two_kernel_fwd_kernel
+
+
+def _require_fla_reference():
+    if FLA_CHUNK_GDN is None:
+        pytest.skip(f"external FLA GDN implementation is unavailable: {FLA_IMPORT_ERROR}")
+    return FLA_CHUNK_GDN
 
 
 @contextmanager
@@ -118,7 +152,7 @@ def _call_fwd(
         two_kernel_tle=two_kernel_tle,
         hybrid_tle=hybrid_tle,
     ):
-        return chunk_gated_delta_rule_fwd(*args)
+        return _selected_chunk_gated_delta_rule_fwd()(*args)
 
 
 def _call_public_hybrid(args):
@@ -295,16 +329,14 @@ def test_chunk_gated_delta_rule_fwd_two_kernel_matches_native(dtype, shape):
 def _two_kernel_configs():
     if not _cuda_tle_available():
         return [None]
-    from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import (
-        _chunk_gdn_two_kernel_fwd_kernel,
-    )
+    kernel = _selected_two_kernel_fwd_kernel()
 
     return [
         pytest.param(
             config,
             id=f"BV{config.kwargs['BV']}-warps{config.num_warps}-stages{config.num_stages}",
         )
-        for config in _chunk_gdn_two_kernel_fwd_kernel.configs
+        for config in kernel.configs
     ]
 
 
@@ -315,9 +347,7 @@ def _two_kernel_configs():
 @pytest.mark.parametrize("config", _two_kernel_configs())
 @torch.inference_mode()
 def test_chunk_gated_delta_rule_two_kernel_configs(dtype, config):
-    from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import (
-        _chunk_gdn_two_kernel_fwd_kernel,
-    )
+    _chunk_gdn_two_kernel_fwd_kernel = _selected_two_kernel_fwd_kernel()
 
     torch.manual_seed(42)
     args = _make_inputs(4, 2048, 16, 128, 128, dtype, use_initial_state=False)
