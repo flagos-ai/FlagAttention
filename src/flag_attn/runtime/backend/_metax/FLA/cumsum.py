@@ -11,8 +11,8 @@ import triton
 import triton.language as tl
 
 from .compat import HAS_TLE, libtuner
-from flag_attn.gated_linear_attention.index import prepare_chunk_indices
-from flag_attn.gated_linear_attention.utils import check_shared_mem, input_guard
+from flag_attn.FLA.index import prepare_chunk_indices
+from flag_attn.utils import check_shared_mem, input_guard
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 

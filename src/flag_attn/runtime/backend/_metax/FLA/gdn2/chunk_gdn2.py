@@ -30,9 +30,9 @@ import torch
 import triton
 import triton.language as tl
 
-from .tuning import get_tuned_config
+from flag_attn.runtime import get_tuned_config
 
-from flag_attn.gated_delta_rule.index import (
+from flag_attn.FLA.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
@@ -139,27 +139,12 @@ if HAS_TLE_GDN2:
             "USE_QK_L2NORM": lambda args: args["use_qk_l2norm"],
             "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
             "HAS_DT_BIAS": lambda args: args["dt_bias"] is not None,
-            "USE_INTRA_SMEM_REUSE": lambda args: args["K"]
-            >= INTRA_TLE_SMEM_REUSE_MIN_K,
+            # The current MetaX TLE compiler rejects tl.dot with shared pointers.
+            "USE_INTRA_SMEM_REUSE": lambda args: False,
         }
     )
     @triton.autotune(
-        configs=get_tuned_config(
-            "_chunk_gdn2_fwd_intra_infer_kernel",
-            fallback=[
-                triton.Config(
-                    {"BK": BK, "BV": BV},
-                    num_warps=num_warps,
-                    num_stages=num_stages,
-                    maxnreg=maxnreg,
-                )
-                for BK in [16, 32, 64]
-                for BV in [16, 32, 64]
-                for num_warps in [1, 2, 4]
-                for num_stages in [1, 2]
-                for maxnreg in [None, *INTRA_TLE_MAXNREG_CANDIDATES]
-            ],
-        ),
+        configs=get_tuned_config("_chunk_gdn2_fwd_intra_infer_kernel"),
         key=["H", "K", "V", "BT"],
         **autotune_cache_kwargs,
     )
@@ -306,18 +291,18 @@ if HAS_TLE_GDN2:
 
                     tl.store(
                         q_sp,
-                        tle.load(
+                        tl.load(
                             p_q,
                             boundary_check=(0, 1),
-                            is_async=True,
+                            padding_option="zero",
                         ),
                     )
                     tl.store(
                         k_sp,
-                        tle.load(
+                        tl.load(
                             p_k,
                             boundary_check=(0, 1),
-                            is_async=True,
+                            padding_option="zero",
                         ),
                     )
 
@@ -385,34 +370,34 @@ if HAS_TLE_GDN2:
 
                 tl.store(
                     q_sp,
-                    tle.load(
+                    tl.load(
                         p_q,
                         boundary_check=(0, 1),
-                        is_async=True,
+                        padding_option="zero",
                     ),
                 )
                 tl.store(
                     k_sp,
-                    tle.load(
+                    tl.load(
                         p_k,
                         boundary_check=(0, 1),
-                        is_async=True,
+                        padding_option="zero",
                     ),
                 )
                 tl.store(
                     g_sp,
-                    tle.load(
+                    tl.load(
                         p_g,
                         boundary_check=(0, 1),
-                        is_async=True,
+                        padding_option="zero",
                     ).to(tl.float32),
                 )
                 tl.store(
                     b_sp,
-                    tle.load(
+                    tl.load(
                         p_b,
                         boundary_check=(0, 1),
-                        is_async=True,
+                        padding_option="zero",
                     ),
                 )
 
@@ -575,26 +560,26 @@ if HAS_TLE_GDN2:
 
                 tl.store(
                     k_sp,
-                    tle.load(
+                    tl.load(
                         p_k,
                         boundary_check=(0, 1),
-                        is_async=True,
+                        padding_option="zero",
                     ),
                 )
                 tl.store(
                     b_sp,
-                    tle.load(
+                    tl.load(
                         p_b,
                         boundary_check=(0, 1),
-                        is_async=True,
+                        padding_option="zero",
                     ),
                 )
                 tl.store(
                     g_sp,
-                    tle.load(
+                    tl.load(
                         p_gk,
                         boundary_check=(0, 1),
-                        is_async=True,
+                        padding_option="zero",
                     ).to(tl.float32),
                 )
 
@@ -609,10 +594,10 @@ if HAS_TLE_GDN2:
                     )
                     tl.store(
                         q_sp,
-                        tle.load(
+                        tl.load(
                             p_q,
                             boundary_check=(0, 1),
-                            is_async=True,
+                            padding_option="zero",
                         ),
                     )
 

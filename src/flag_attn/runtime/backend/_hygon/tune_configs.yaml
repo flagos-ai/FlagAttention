@@ -11,5 +11,71 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+chunk_fwd_kernel_h:
+- {META: {BK: 16, BV: 16}, num_warps: 1, num_stages: 2}
+- {META: {BK: 16, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 16, BV: 32}, num_warps: 1, num_stages: 2}
+- {META: {BK: 16, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 32}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 16}, num_warps: 1, num_stages: 2}
+- {META: {BK: 32, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 32}, num_warps: 1, num_stages: 2}
+- {META: {BK: 32, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 32}, num_warps: 8, num_stages: 4}
+chunk_bwd_kernel_dh:
+- {META: {BK: 16, BV: 16}, num_warps: 1, num_stages: 2}
+- {META: {BK: 16, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 16, BV: 32}, num_warps: 1, num_stages: 2}
+- {META: {BK: 16, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 32}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 16}, num_warps: 1, num_stages: 2}
+- {META: {BK: 32, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 32}, num_warps: 1, num_stages: 2}
+- {META: {BK: 32, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 32}, num_warps: 8, num_stages: 4}
+chunk_gla_fwd_A_kernel_intra_sub_inter:
+- {META: {BK: 32}, num_warps: 1, num_stages: 2}
+- {META: {BK: 32}, num_warps: 2, num_stages: 3}
+- {META: {BK: 32}, num_warps: 4, num_stages: 2}
+- {META: {BK: 32}, num_warps: 8, num_stages: 4}
+- {META: {BK: 64}, num_warps: 1, num_stages: 2}
+- {META: {BK: 64}, num_warps: 2, num_stages: 3}
+- {META: {BK: 64}, num_warps: 4, num_stages: 2}
+- {META: {BK: 64}, num_warps: 8, num_stages: 4}
+chunk_gla_fwd_kernel_o:
+- {META: {BK: 32, BV: 64}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 64}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 64}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 128}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 128}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 128}, num_warps: 8, num_stages: 4}
+- {META: {BK: 64, BV: 64}, num_warps: 2, num_stages: 2}
+- {META: {BK: 64, BV: 64}, num_warps: 4, num_stages: 3}
+- {META: {BK: 64, BV: 64}, num_warps: 8, num_stages: 4}
+- {META: {BK: 64, BV: 128}, num_warps: 2, num_stages: 2}
+- {META: {BK: 64, BV: 128}, num_warps: 4, num_stages: 3}
+- {META: {BK: 64, BV: 128}, num_warps: 8, num_stages: 4}
+chunk_gla_bwd_kernel_inter:
+- {META: {BK: 16, BV: 16}, num_warps: 2, num_stages: 2}
+- {META: {BK: 16, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 16, BV: 32}, num_warps: 2, num_stages: 2}
+- {META: {BK: 16, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 32}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 16}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 32}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 32}, num_warps: 8, num_stages: 4}
 
-{}
+# Curated launch settings for AttnRes. The first entry is selected directly
+# by the Hygon wrapper; this kernel does not run runtime autotuning.
+_fused_attnres_fwd_kernel:
+  - META: {}
+    num_warps: 4
+    num_stages: 2

@@ -34,8 +34,12 @@ import os
 
 import torch
 import triton
-import triton.experimental.tle.language as tle
+try:
+    import triton.experimental.tle.language as tle
+except ImportError:
+    tle = None
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .utils import current_platform
 
@@ -1130,8 +1134,6 @@ def minimax_m3_sparse_attn(
             num_stages=_PREFILL_NUM_STAGES if is_musa else 3,
         )
         return
-
-    from triton.tools.tensor_descriptor import TensorDescriptor
 
     def alloc_fn(size: int, align: int, stream):
         _ = align

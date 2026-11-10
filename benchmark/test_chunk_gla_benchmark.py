@@ -13,8 +13,6 @@
 # limitations under the License.
 
 
-from collections.abc import Callable
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -31,18 +29,12 @@ from flag_attn import chunk_gla as flag_attn_chunk_gla
 DEFAULT_WARMUP = 10
 DEFAULT_REP = 20
 
-# optional FLA reference
-_HAS_FLA_CHUNK = False
 _fla_chunk_gla = None
-
-try:
-    if not test_backend.is_nvidia():
-        raise ImportError("external FLA CUDA comparison unavailable")
-    from fla.ops.gla import chunk_gla as _fla_chunk_gla
-
-    _HAS_FLA_CHUNK = True
-except Exception:
-    _HAS_FLA_CHUNK = False
+if test_backend.is_nvidia():
+    try:
+        from fla.ops.gla import chunk_gla as _fla_chunk_gla
+    except ImportError:
+        _fla_chunk_gla = None
 
 
 def _fla_chunk_wrapper(q, k, v, g, **kwargs):
@@ -152,7 +144,7 @@ def _print_header(title: str, subtitle: str, warmup: int, rep: int) -> None:
     print(f"  warmup={warmup}ms  rep={rep}ms")
     print(f"{'=' * 70}")
 
-    if _HAS_FLA_CHUNK:
+    if _fla_chunk_gla is not None:
         print(
             f"{'B':>3} {'T':>6} {'H':>4} {'D':>4} {'dtype':>8} "
             f"{'fla(ms)':>10} {'flag_attn(ms)':>14} {'fla/flag_attn':>14}"
@@ -166,7 +158,7 @@ def _print_header(title: str, subtitle: str, warmup: int, rep: int) -> None:
 
 def _print_row(B, T, H, D, dtype, ms_fla, ms_flag_attn) -> None:
     dtype_str = str(dtype).split(".")[-1]
-    if _HAS_FLA_CHUNK:
+    if _fla_chunk_gla is not None:
         speedup = ms_fla / ms_flag_attn if ms_flag_attn > 0 else float("inf")
         print(
             f"{B:>3} {T:>6} {H:>4} {D:>4} {dtype_str:>8} "
@@ -181,7 +173,7 @@ def _print_row(B, T, H, D, dtype, ms_fla, ms_flag_attn) -> None:
 def run_benchmark(
     warmup: int = DEFAULT_WARMUP,
     rep: int = DEFAULT_REP,
-    record_property: Callable[[str, object], None] | None = None,
+    record_property=None,
 ) -> None:
     if not test_backend.supports_operator("chunk_gla"):
         raise RuntimeError("chunk_gla benchmark requires an available accelerator")
@@ -191,7 +183,11 @@ def run_benchmark(
     # ============================================================
     _print_header(
         "chunk_gla benchmark — FWD ONLY",
-        "provider: fla_chunk vs flag_attn_chunk",
+        (
+            "provider: FLA vs FlagAttention"
+            if _fla_chunk_gla is not None
+            else "provider: FlagAttention only (FLA unavailable)"
+        ),
         warmup,
         rep,
     )
@@ -201,7 +197,7 @@ def run_benchmark(
             record_property,
             op_name="chunk_gla",
             dtype=str(dtype),
-            baseline="FLA" if _HAS_FLA_CHUNK else None,
+            baseline="FLA" if _fla_chunk_gla is not None else None,
             phase="forward",
         )
         print("\ndtype:", dtype)
@@ -209,7 +205,7 @@ def run_benchmark(
             q, k, v, g, kwargs = _build_inputs(B, T, H, D, dtype)
 
             ms_fla = None
-            if _HAS_FLA_CHUNK:
+            if _fla_chunk_gla is not None:
                 ms_fla = _bench_ms(
                     lambda: _fla_chunk_wrapper(q, k, v, g, **kwargs), warmup, rep
                 )
@@ -229,7 +225,11 @@ def run_benchmark(
     # ============================================================
     _print_header(
         "chunk_gla benchmark — FWD + BWD",
-        "provider: fla_chunk vs flag_attn_chunk  (forward + backward)",
+        (
+            "provider: FLA vs FlagAttention (forward + backward)"
+            if _fla_chunk_gla is not None
+            else "provider: FlagAttention only (forward + backward; FLA unavailable)"
+        ),
         warmup,
         rep,
     )
@@ -239,7 +239,7 @@ def run_benchmark(
             record_property,
             op_name="chunk_gla",
             dtype=str(dtype),
-            baseline="FLA" if _HAS_FLA_CHUNK else None,
+            baseline="FLA" if _fla_chunk_gla is not None else None,
             phase="forward_backward",
         )
         print("\ndtype:", dtype)
@@ -249,7 +249,7 @@ def run_benchmark(
             )
 
             ms_fla = None
-            if _HAS_FLA_CHUNK:
+            if _fla_chunk_gla is not None:
                 ms_fla = _bench_fwd_bwd_ms(
                     _fla_chunk_wrapper,
                     q,
