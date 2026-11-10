@@ -12,24 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MTP split reduction chain shared by the BF16 and the FP8 decode kernels.
-
-Both decode implementations split a long KV into partial outputs plus a
-per-split log-sum-exp and then merge them.  The merge chain is three kernels: one
-reduces a group of splits into one partial, one merges the group partials, and
-one merges everything for a single MTP query and Q head.
-
-They are format-agnostic -- they only read and write the BF16 split buffers --
-so the FP8 path launches them unchanged, and the group width is a ``constexpr``
-argument rather than a module constant: the BF16 path passes
-``SPLITS_PER_REDUCTION`` (16), the FP8 path passes ``FP8_SPLITS_PER_REDUCTION``
-(64) because its own split count is much larger.
-
-The kernels used to live inside the BF16 decode module, which forced
-``decode/fp8.py`` to import three private kernels out of ``decode/__init__.py``.
-They keep their ``_bf16_`` names and their source text so that both their
-provenance and their Triton cache keys stay unchanged.
-"""
+"""Split reduction kernels shared by the Ascend BF16 MTP decode paths."""
 
 from __future__ import annotations
 
@@ -391,10 +374,3 @@ def _bf16_mtp_finalize_groups_kernel(
         + offs_d,
         accumulator / running_sum,
     )
-
-
-__all__ = [
-    "_bf16_mtp_finalize_groups_kernel",
-    "_bf16_mtp_finalize_kernel",
-    "_bf16_mtp_reduce_splits_kernel",
-]

@@ -15,12 +15,11 @@
 """Ascend Triton implementation of the HY3 BF16 decode formats.
 
 The kernels cover both MTP=1 and MTP>=2: the page gather, the QK and PV
-producers, and the finalize/reduce tail.  The part of that tail which the FP8
-implementation reuses lives in ``decode/mtp_reduce.py``.  The host side builds
+producers, and the finalize/reduce tail in ``decode/mtp_reduce.py``. The host side builds
 the task maps, prepares the workspace and launches the phases.
 
-``decode/__init__.py`` re-exports the public entries, and the ``static`` and
-``dynamic`` wrappers import them from the decode package.
+The ``static`` and ``dynamic`` wrappers import these implementations directly.
+Backend entry points are registered only in ``_ascend/__init__.py``.
 """
 
 from __future__ import annotations
@@ -1698,19 +1697,3 @@ def attention_decode_ascend_bf16_mtp4(
     workspace: AscendBF16MTP1Workspace,
 ) -> torch.Tensor:
     return _attention_decode_ascend_bf16_mtp(inputs, workspace, 4, 32)
-
-
-__all__ = [
-    "HAS_TLE",
-    "USE_TLE",
-    "AscendBF16MTP1Workspace",
-    "attention_decode_ascend_bf16_mtp1",
-    "attention_decode_ascend_bf16_mtp2",
-    "attention_decode_ascend_bf16_mtp3",
-    "attention_decode_ascend_bf16_mtp4",
-    "prepare_ascend_bf16_mtp1_workspace",
-    "prepare_ascend_bf16_mtp2_workspace",
-    "prepare_ascend_bf16_mtp3_workspace",
-    "prepare_ascend_bf16_mtp4_workspace",
-    "refresh_ascend_bf16_mtp1_task_map",
-]

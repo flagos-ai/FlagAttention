@@ -33,6 +33,11 @@ SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from flag_attn.testing import backend as test_backend
+from flag_attn import runtime
+
+if runtime.device.vendor_name == "ascend":
+    pytest.skip("HY3 FP8 attention is not supported on Ascend", allow_module_level=True)
+
 from flag_attn.hpc_ops_attention.decode import HAS_TLE  # noqa: E402
 from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
     fp8_qpertoken_perhead_kvpertensor_dynamic as fp8_dynamic,
@@ -45,46 +50,6 @@ from flag_attn import hy3_attention, hy3_attention_prepare
 
 BLOCK_SIZE = fp8_static.BLOCK_SIZE
 HEAD_DIM = fp8_static.HEAD_DIM
-FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
-
-
-def _copy_fp8_bytes_to_npu(
-    cpu_fp8: torch.Tensor,
-    device: torch.device,
-    stride: tuple[int, ...] | None = None,
-) -> torch.Tensor:
-    cpu_bytes = cpu_fp8.view(torch.uint8)
-    result = torch.empty_strided(
-        cpu_fp8.shape,
-        cpu_fp8.stride() if stride is None else stride,
-        dtype=torch.uint8,
-        device=device,
-    )
-    result.copy_(cpu_bytes)
-    return result
-
-
-def _fp8_cast_for_backend(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.device.type != "npu":
-        return tensor.to(FP8_DTYPE)
-    return _copy_fp8_bytes_to_npu(
-        tensor.to("cpu").to(FP8_DTYPE), tensor.device, tensor.stride()
-    )
-
-
-def _fp8_reinterpret_for_backend(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.device.type != "npu":
-        return tensor.view(FP8_DTYPE)
-    cpu_fp8 = tensor.to("cpu").view(FP8_DTYPE)
-    return _copy_fp8_bytes_to_npu(cpu_fp8, tensor.device)
-
-
-def _fp8_for_reference(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.device.type == "npu":
-        tensor = tensor.cpu()
-        if tensor.dtype == torch.uint8:
-            tensor = tensor.view(FP8_DTYPE)
-    return tensor
 
 
 @dataclass
@@ -156,24 +121,14 @@ def _quantize_k_per_token(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     blocks, _, heads, dim = storage.shape
     scale = storage[:, :BLOCK_SIZE].float().abs().amax(-1) / 448.0
-    if storage.device.type == "npu":
-        quantized = torch.empty_strided(
-            storage.shape,
-            storage.stride(),
-            dtype=torch.uint8,
-            device=storage.device,
-        )
-    else:
-        quantized = torch.empty_like(storage, dtype=FP8_DTYPE)
-    quantized[:, :BLOCK_SIZE] = _fp8_cast_for_backend(
+    quantized = torch.empty_like(storage, dtype=torch.float8_e4m3fn)
+    quantized[:, :BLOCK_SIZE] = (
         storage[:, :BLOCK_SIZE] / scale[..., None]
-    )
+    ).to(torch.float8_e4m3fn)
     packed_scale = (
         scale.permute(0, 2, 1)
         .contiguous()
-    )
-    packed_scale = (
-        _fp8_reinterpret_for_backend(packed_scale)
+        .view(torch.float8_e4m3fn)
         .reshape(blocks, heads, -1, dim)
         .permute(0, 2, 1, 3)
         .contiguous()
@@ -195,9 +150,9 @@ def _quantize_v_per_head(
         .amax(-1)
         / 448.0
     )
-    quantized = _fp8_cast_for_backend(
+    quantized = (
         storage.float() / scale[None, None, :, None]
-    )
+    ).to(torch.float8_e4m3fn)
     # This factor is intentional: it exactly matches the official
     # qk-per-token/v-per-head correctness test distribution.
     return quantized, scale * 0.1
@@ -222,7 +177,7 @@ def _official_make_inputs(
         device=test_backend.device,
     ) / math.sqrt(HEAD_DIM)
     q_scale = q_bf16.float().abs().amax(-1) / 10.0
-    q = _fp8_cast_for_backend(q_bf16 / q_scale[..., None])
+    q = (q_bf16 / q_scale[..., None]).to(torch.float8_e4m3fn)
 
     # Match the official correctness tests' seeded RNG order exactly:
     # Q -> new K/V -> scales -> history -> cache -> block IDs.
@@ -237,18 +192,19 @@ def _official_make_inputs(
         # though quant_paged_cache_perhead later supplies the effective scale.
         torch.randn((num_head_kv,), dtype=torch.float32, device=test_backend.device)
     else:
-        new_k = torch.randn(
-            (num_batch, mtp, num_head_kv, HEAD_DIM),
-            dtype=torch.bfloat16,
-            device=test_backend.device,
-        ) / math.sqrt(HEAD_DIM)
-        new_k = _fp8_cast_for_backend(new_k)
+        new_k = (
+            torch.randn(
+                (num_batch, mtp, num_head_kv, HEAD_DIM),
+                dtype=torch.bfloat16,
+                device=test_backend.device,
+            )
+            / math.sqrt(HEAD_DIM)
+        ).to(torch.float8_e4m3fn)
         new_v = torch.randn(
             (num_batch, mtp, num_head_kv, HEAD_DIM),
             dtype=torch.bfloat16,
             device=test_backend.device,
-        )
-        new_v = _fp8_cast_for_backend(new_v)
+        ).to(torch.float8_e4m3fn)
         k_scale = torch.randn((1,), dtype=torch.float32, device=test_backend.device)
         v_scale = torch.randn((1,), dtype=torch.float32, device=test_backend.device)
 
@@ -278,12 +234,14 @@ def _official_make_inputs(
                 .permute(0, 1, 3, 2, 4)
             )
     else:
-        storage = torch.randn(
-            (capacity, 2, BLOCK_SIZE, num_head_kv, HEAD_DIM),
-            dtype=torch.bfloat16,
-            device=test_backend.device,
-        ) / math.sqrt(HEAD_DIM)
-        storage = _fp8_cast_for_backend(storage)
+        storage = (
+            torch.randn(
+                (capacity, 2, BLOCK_SIZE, num_head_kv, HEAD_DIM),
+                dtype=torch.bfloat16,
+                device=test_backend.device,
+            )
+            / math.sqrt(HEAD_DIM)
+        ).to(torch.float8_e4m3fn)
         if layout == "HND":
             storage = (
                 storage.permute(0, 1, 3, 2, 4)
@@ -351,18 +309,6 @@ def _packed_k_scale(panel, batch: int, length: int) -> torch.Tensor:
 
 @torch.no_grad()
 def _pytorch_reference(panel, mtp: int, quant_type: str) -> torch.Tensor:
-    output_device = panel.q.device
-    if output_device.type == "npu":
-        panel = _Panel(
-            q=_fp8_for_reference(panel.q),
-            k_cache=_fp8_for_reference(panel.k_cache),
-            v_cache=_fp8_for_reference(panel.v_cache),
-            block_ids=panel.block_ids.cpu(),
-            kv_lens=panel.kv_lens.cpu(),
-            q_scale=panel.q_scale.cpu(),
-            k_scale=_fp8_for_reference(panel.k_scale),
-            v_scale=panel.v_scale.cpu(),
-        )
     batch = panel.kv_lens.numel()
     num_head_q = panel.q.shape[1]
     num_head_kv = panel.k_cache.shape[2]
@@ -406,11 +352,11 @@ def _pytorch_reference(panel, mtp: int, quant_type: str) -> torch.Tensor:
         causal_mask = torch.cat(
             (
                 torch.ones(
-                    (mtp, history), dtype=torch.bool, device=panel.q.device
+                    (mtp, history), dtype=torch.bool, device=test_backend.device
                 ),
                 torch.tril(
                     torch.ones(
-                        (mtp, mtp), dtype=torch.bool, device=panel.q.device
+                        (mtp, mtp), dtype=torch.bool, device=test_backend.device
                     )
                 ),
             ),
@@ -432,7 +378,7 @@ def _pytorch_reference(panel, mtp: int, quant_type: str) -> torch.Tensor:
 
     return torch.stack(outputs).reshape(
         batch * mtp, num_head_q, HEAD_DIM
-    ).to(output_device)
+    )
 
 
 @pytest.mark.hy3_attention
@@ -509,7 +455,6 @@ def test_attn_fp8_sm90(
         rtol=1e-5,
     )
     assert torch.isfinite(actual).all()
-    assert (workspace.is_reset() if hasattr(workspace, "is_reset")
-            else implementation.workspace_is_reset(workspace))
+    assert implementation.workspace_is_reset(workspace)
     if kvcache_shape == "HND" and num_head_kv > 1:
         assert panel.k_cache.stride(1) != num_head_kv * HEAD_DIM

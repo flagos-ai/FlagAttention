@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .. import (
+from ..bf16 import (
     AscendBF16MTP1Workspace,
     attention_decode_ascend_bf16_mtp1,
     attention_decode_ascend_bf16_mtp2,
@@ -95,14 +95,3 @@ def bf16_static_workspace_is_reset(
 ) -> bool:
     del workspace
     return True
-
-
-__all__ = [
-    "BLOCK_SIZE",
-    "HEAD_DIM",
-    "StaticBF16Inputs",
-    "StaticBF16Workspace",
-    "attention_decode_bf16_tle",
-    "bf16_static_workspace_is_reset",
-    "prepare_static_bf16_workspace",
-]

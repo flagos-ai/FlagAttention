@@ -12,13 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ascend Triton implementation of HY3 FP8 block-sparse prefill.
+"""Ascend HY3 BF16 block-sparse prefill.
 
-This module owns the block-sparse entry kernel, the run-time switches the tests
-flip, and the host API (validation, workspace preparation and the attention
-entry point).  The phase kernels it launches live in ``decode``, ``qk``, ``pv``,
-``softmax`` and ``splits``, their shared tunables in ``constants`` and the E4M3
-rounding helper in ``quant``.
+Q/K/V are BF16 tensors. The staged QK, softmax, PV and split reduction
+kernels consume them directly, without quantization or conversion buffers.
 """
 
 from __future__ import annotations
@@ -26,23 +23,11 @@ from dataclasses import dataclass
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
-from ..e4m3 import (
-    e4m3_exact_masked,
-    e4m3_lut,
-)
 
 from .constants import (
-    _ARITHMETIC_KV_D_BLOCK,
-    _ARITHMETIC_KV_PAGES_PER_PROGRAM,
-    _BLOCK_M_JIT,
     _BLOCK_N,
-    _BLOCK_N_JIT,
-    _FP8_P_SCALE_JIT,
     _HEAD_DIM,
-    _HEAD_DIM_JIT,
     _LOGICAL_BLOCK_M,
-    _LOGICAL_BLOCK_M_JIT,
     _PREFILL_BLOCK_M,
     _PREFILL_HEADS_PER_PROG_MAX,
     _PREFILL_LIST_MIN_KV_TILES,
@@ -55,37 +40,24 @@ from .constants import (
     _SCORES_ROW_PAD,
     _TILE_STEP,
 )
-from .decode import (
-    _fp8_prefill_decode_kv_arithmetic_kernel,
-    _fp8_prefill_decode_kv_kernel,
-    _fp8_prefill_decode_q_arithmetic_kernel,
-    _fp8_prefill_decode_q_kernel,
-)
 from .pv import (
-    _fp8_prefill_pv_accum_kernel,
+    _bf16_prefill_pv_accum_kernel,
 )
 from .qk import (
-    _fp8_prefill_qk_compact_kernel,
-    _fp8_prefill_qk_kernel,
-)
-from .quant import (
-    _e4m3fn_lut,
-    _positive_e4m3_round,
+    _bf16_prefill_qk_compact_kernel,
+    _bf16_prefill_qk_kernel,
 )
 from .softmax import (
-    _fp8_prefill_softmax_splits_kernel,
+    _bf16_prefill_softmax_splits_kernel,
 )
 from .splits import (
-    _fp8_prefill_finalize_kernel,
+    _bf16_prefill_finalize_kernel,
 )
 
 
 # Override switches for host scheduling / same-process A/B; None = policy above.
 # Module globals read at call time; benchmarks set them before capture, so one
 # process/input can capture different schedules without cold-start/environment noise.
-_KV_ARITHMETIC_OVERRIDE = None
-_KV_PAGES_PER_PROGRAM_OVERRIDE = None
-_Q_ARITHMETIC_OVERRIDE = None
 _PREFILL_SOFTMAX_HPP_OVERRIDE = None
 # Benchmark/ablation only: qk block-sparse skip. None = default (real mask with a
 # block mask, never skip without one, keeping the old path). 0 = never skip
@@ -132,21 +104,19 @@ def _skip_counter(device: torch.device, slot: int = 0) -> torch.Tensor:
 
 
 @dataclass
-class AscendFP8PrefillWorkspace:
-    q_bf16: torch.Tensor
-    k_bf16: torch.Tensor
-    v_bf16: torch.Tensor
+class AscendBF16PrefillWorkspace:
+    q_shape: tuple[int, ...]
+    cache_shape: tuple[int, ...]
+    device: torch.device
     scores: torch.Tensor
     probabilities: torch.Tensor
     split_out: torch.Tensor
     split_lse: torch.Tensor
     split_sum: torch.Tensor
-    fp8_lut: torch.Tensor
     max_splits: int
     padded_q: int
     q_tokens: int
     tokens_per_split: int
-    quant_type: int
     # Whether the three small kernels can use fully unmasked load/store (whole
     # split, stage divides splits, and q is also a multiple of q_tokens)
     unmasked: bool
@@ -201,230 +171,14 @@ def _prefill_scores_exact(tokens_per_split: int) -> bool:
     return tokens_per_split == triton.next_power_of_2(tokens_per_split)
 
 
-def _prefill_launch_chunks(
-    flat_q_tiles: int, num_head_kv: int, max_splits: int
-) -> tuple[tuple[int, int], ...]:
-    programs_per_q_tile = num_head_kv * max_splits
-    chunk_size = max(1, 8192 // programs_per_q_tile)
-    return tuple(
-        (offset, min(chunk_size, flat_q_tiles - offset))
-        for offset in range(0, flat_q_tiles, chunk_size)
-    )
-
-
-@triton.jit
-def _fp8_blocksparse_prefill_kernel(
-    Q,
-    K,
-    V,
-    Q_SCALE,
-    K_SCALE,
-    V_SCALE,
-    CU_SEQLENS_Q,
-    BLOCK_IDS,
-    KV_LENS,
-    BLOCK_MASK,
-    FP8_LUT,
-    OUT,
-    Q_STOKEN: tl.constexpr,
-    Q_SHEAD: tl.constexpr,
-    K_SPAGE: tl.constexpr,
-    K_STOKEN: tl.constexpr,
-    K_SHEAD: tl.constexpr,
-    V_SPAGE: tl.constexpr,
-    V_STOKEN: tl.constexpr,
-    V_SHEAD: tl.constexpr,
-    QS_SBATCH: tl.constexpr,
-    QS_SHEAD: tl.constexpr,
-    QS_STOKEN: tl.constexpr,
-    KS_SPAGE: tl.constexpr,
-    KS_SGROUP: tl.constexpr,
-    KS_SHEAD: tl.constexpr,
-    KS_SBYTE: tl.constexpr,
-    BID_SBATCH: tl.constexpr,
-    BID_SPAGE: tl.constexpr,
-    MASK_SBATCH: tl.constexpr,
-    MASK_SHEAD: tl.constexpr,
-    MASK_SQTILE: tl.constexpr,
-    MASK_SKVTILE: tl.constexpr,
-    O_STOKEN: tl.constexpr,
-    O_SHEAD: tl.constexpr,
-    NUM_HEAD_Q: tl.constexpr,
-    NUM_HEAD_KV: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    MAX_KV_TILES: tl.constexpr,
-    NUM_MASK_KV_TILES: tl.constexpr,
-    HAS_BLOCK_MASK: tl.constexpr,
-    K_SCALE_PER_TOKEN: tl.constexpr,
-):
-    """Disabled (no launch site)."""
-    q_half = tl.program_id(0)
-    q_head = tl.program_id(1)
-    batch = tl.program_id(2)
-    q_begin = tl.load(CU_SEQLENS_Q + batch)
-    q_end = tl.load(CU_SEQLENS_Q + batch + 1)
-    q_len = q_end - q_begin
-    kv_len = tl.load(KV_LENS + batch)
-    q_local_start = q_half * _BLOCK_M_JIT
-    if q_local_start >= q_len:
-        return
-
-    group_size: tl.constexpr = NUM_HEAD_Q // NUM_HEAD_KV
-    kv_head = q_head // group_size
-    q_start_in_kv = kv_len - q_len
-    offs_m = q_local_start + tl.arange(0, _BLOCK_M_JIT)
-    offs_d = tl.arange(0, _HEAD_DIM_JIT)
-    q_valid = offs_m < q_len
-    q_ptrs = (
-        Q
-        + (q_begin + offs_m[:, None]) * Q_STOKEN
-        + q_head * Q_SHEAD
-        + offs_d[None, :]
-    )
-    q = e4m3_lut(FP8_LUT, q_ptrs, q_valid[:, None])
-    q_scale = tl.load(
-        Q_SCALE
-        + batch * QS_SBATCH
-        + q_head * QS_SHEAD
-        + offs_m * QS_STOKEN,
-        mask=q_valid,
-        other=0.0,
-    )
-    q = q.to(tl.bfloat16)
-
-    m_i = tl.full((_BLOCK_M_JIT,), -float("inf"), tl.float32)
-    l_i = tl.zeros((_BLOCK_M_JIT,), tl.float32)
-    acc = tl.zeros((_BLOCK_M_JIT, _HEAD_DIM_JIT), tl.float32)
-    q_half_end = tl.minimum(q_local_start + _BLOCK_M_JIT, q_len)
-    causal_kv_end = q_start_in_kv + q_half_end
-    num_causal_kv_tiles = tl.maximum(
-        0, (causal_kv_end + _BLOCK_N_JIT - 1) // _BLOCK_N_JIT
-    )
-    logical_q_tile = q_local_start // _LOGICAL_BLOCK_M_JIT
-    offs_n = tl.arange(0, _BLOCK_N_JIT)
-    score_scale_const: tl.constexpr = 0.127499612793
-
-    for kv_tile in range(MAX_KV_TILES):
-        tile_active = kv_tile < num_causal_kv_tiles
-        if HAS_BLOCK_MASK:
-            mask_in_range = kv_tile < NUM_MASK_KV_TILES
-            selected = tl.load(
-                BLOCK_MASK
-                + batch * MASK_SBATCH
-                + q_head * MASK_SHEAD
-                + logical_q_tile * MASK_SQTILE
-                + kv_tile * MASK_SKVTILE,
-                mask=mask_in_range,
-                other=0,
-            ) != 0
-            selected = selected | (kv_tile == NUM_MASK_KV_TILES)
-            tile_active = tile_active & selected
-        if tile_active:
-            kv_tokens = kv_tile * _BLOCK_N_JIT + offs_n
-            kv_valid = kv_tokens < kv_len
-            logical_pages = kv_tokens // PAGE_SIZE
-            token_in_page = kv_tokens % PAGE_SIZE
-            physical_pages = tl.load(
-                BLOCK_IDS
-                + batch * BID_SBATCH
-                + logical_pages * BID_SPAGE,
-                mask=kv_valid,
-                other=0,
-            ).to(tl.int64)
-            k_ptrs = (
-                K
-                + physical_pages[:, None] * K_SPAGE
-                + token_in_page[:, None] * K_STOKEN
-                + kv_head * K_SHEAD
-                + offs_d[None, :]
-            )
-            k = e4m3_lut(FP8_LUT, k_ptrs, kv_valid[:, None])
-            scores = tl.dot(q, tl.trans(k.to(tl.bfloat16)))
-            if K_SCALE_PER_TOKEN:
-                scale_ptr = (
-                    K_SCALE
-                    + physical_pages * KS_SPAGE
-                    + (token_in_page // 32) * KS_SGROUP
-                    + kv_head * KS_SHEAD
-                    + (token_in_page % 32) * 4 * KS_SBYTE
-                )
-                scale_word = tl.zeros((_BLOCK_N_JIT,), tl.int32)
-                for byte_id in range(4):
-                    byte = tl.load(
-                        scale_ptr + byte_id * KS_SBYTE,
-                        mask=kv_valid,
-                        other=0,
-                    ).to(tl.int32) & 255
-                    scale_word |= byte << (byte_id * 8)
-                k_scale = scale_word.to(tl.uint32).to(
-                    tl.float32, bitcast=True
-                )
-                score_scale = q_scale[:, None] * k_scale[None, :]
-            else:
-                score_scale = q_scale[:, None] * tl.load(K_SCALE)
-            q_positions = q_start_in_kv + offs_m
-            score_valid = (
-                q_valid[:, None]
-                & kv_valid[None, :]
-                & (kv_tokens[None, :] <= q_positions[:, None])
-            )
-            scores = tl.where(
-                score_valid,
-                scores * score_scale * score_scale_const,
-                -float("inf"),
-            )
-            tile_max = tl.max(scores, axis=1)
-            new_max = tl.maximum(m_i, tile_max)
-            safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
-            alpha = tl.where(
-                m_i == -float("inf"), 0.0, tl.exp2(m_i - safe_max)
-            )
-            p = tl.where(
-                score_valid,
-                tl.exp2(scores - safe_max[:, None]),
-                0.0,
-            )
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            acc *= alpha[:, None]
-            p_fp8 = _positive_e4m3_round(p * _FP8_P_SCALE_JIT)
-            v_ptrs = (
-                V
-                + physical_pages[:, None] * V_SPAGE
-                + token_in_page[:, None] * V_STOKEN
-                + kv_head * V_SHEAD
-                + offs_d[None, :]
-            )
-            v = e4m3_lut(FP8_LUT, v_ptrs, kv_valid[:, None])
-            acc += tl.dot(p_fp8, v.to(tl.bfloat16))
-            m_i = new_max
-
-    value_scale = (
-        tl.load(V_SCALE + kv_head)
-        if K_SCALE_PER_TOKEN
-        else tl.load(V_SCALE)
-    )
-    output = acc * (value_scale / _FP8_P_SCALE_JIT) / l_i[:, None]
-    out_ptrs = (
-        OUT
-        + (q_begin + offs_m[:, None]) * O_STOKEN
-        + q_head * O_SHEAD
-        + offs_d[None, :]
-    )
-    tl.store(out_ptrs, output, mask=q_valid[:, None])
-
-
 def _validate(
     q: torch.Tensor,
     kcache: torch.Tensor,
     vcache: torch.Tensor,
-    qscale: torch.Tensor,
-    kscale: torch.Tensor,
-    vscale: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     block_ids: torch.Tensor,
     seqlens_kvcache: torch.Tensor,
     max_seqlens_q: int,
-    quant_type: int,
     block_mask: Optional[torch.Tensor],
     output: Optional[torch.Tensor],
 ) -> None:
@@ -432,67 +186,40 @@ def _validate(
         q,
         kcache,
         vcache,
-        qscale,
-        kscale,
-        vscale,
         cu_seqlens_q,
         block_ids,
         seqlens_kvcache,
     )
     if q.device.type != "npu":
-        raise ValueError("Ascend FP8 prefill requires NPU tensors")
+        raise ValueError("Ascend BF16 prefill requires NPU tensors")
     if any(t.device != q.device for t in tensors[1:]):
         raise ValueError("all inputs must be on the same NPU device")
-    if q.dtype not in (torch.uint8, torch.int8):
-        raise TypeError("q must contain E4M3FN bits in uint8/int8 storage")
+    if q.dtype != torch.bfloat16:
+        raise TypeError("q must use torch.bfloat16")
     if q.ndim != 3 or q.shape[2] != _HEAD_DIM or q.stride(2) != 1:
         raise ValueError("q must have shape [total_q,num_head_q,128]")
     for name, cache in (("kcache", kcache), ("vcache", vcache)):
-        if cache.dtype not in (torch.uint8, torch.int8):
-            raise TypeError(f"{name} must contain E4M3FN bits in uint8/int8 storage")
+        if cache.dtype != torch.bfloat16:
+            raise TypeError(f"{name} must use torch.bfloat16")
         if cache.ndim != 4 or cache.shape[1] not in (32, 64):
             raise ValueError(f"{name} must have shape [pages,32|64,num_head_kv,128]")
         if cache.shape[3] != _HEAD_DIM or cache.stride(3) != 1:
             raise ValueError(f"{name} head dimension must be contiguous 128")
     if kcache.shape != vcache.shape:
         raise ValueError("K and V cache shapes must match")
-    if q.shape[1] % kcache.shape[2]:
+    if q.shape[1] <= 0 or kcache.shape[2] <= 0 or q.shape[1] % kcache.shape[2]:
         raise ValueError("num_head_q must be divisible by num_head_kv")
-    if qscale.dtype != torch.float32 or qscale.ndim != 3:
-        raise TypeError("qscale must be float32 [batch,num_head_q,max_q]")
     batch = int(seqlens_kvcache.numel())
-    if qscale.shape[0] != batch or qscale.shape[1] != q.shape[1]:
-        raise ValueError("qscale batch/head dimensions do not match Q")
-    if qscale.shape[2] < max_seqlens_q:
-        raise ValueError("qscale token capacity is smaller than max_seqlens_q")
+    if batch <= 0 or max_seqlens_q <= 0:
+        raise ValueError("batch and max_seqlens_q must be positive")
+    if block_ids.ndim == 2 and block_ids.shape[1] <= 0:
+        raise ValueError("block_ids must contain at least one logical KV page")
     if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_q.shape != (batch + 1,):
         raise ValueError("cu_seqlens_q must be int32 [batch+1]")
     if block_ids.dtype != torch.int32 or block_ids.ndim != 2 or block_ids.shape[0] != batch:
         raise ValueError("block_ids must be int32 [batch,max_pages]")
     if seqlens_kvcache.dtype != torch.int32 or seqlens_kvcache.ndim != 1:
         raise ValueError("seqlens_kvcache must be int32 [batch]")
-    if quant_type not in (0, 1):
-        raise ValueError("quant_type must be 0 or 1")
-    if vscale.dtype != torch.float32:
-        raise TypeError("vscale must be float32")
-    if quant_type == 1:
-        if kscale.dtype != torch.float32 or kscale.numel() < 1 or vscale.numel() < 1:
-            raise TypeError("per-tensor mode requires scalar FP32 K/V scales")
-    else:
-        if kscale.dtype not in (torch.uint8, torch.int8) or kscale.ndim != 4:
-            raise TypeError("per-token K scale must use packed uint8/int8 FP32 bytes")
-        expected_kscale_shape = (
-            kcache.shape[0],
-            kcache.shape[1] // 32,
-            kcache.shape[2],
-            128,
-        )
-        if tuple(kscale.shape) != expected_kscale_shape or kscale.stride(3) != 1:
-            raise ValueError(
-                "packed K scale must have shape [pages,page_size//32,num_head_kv,128]"
-            )
-        if vscale.numel() != kcache.shape[2]:
-            raise ValueError("per-head vscale must contain num_head_kv values")
     if block_mask is not None:
         if block_mask.device != q.device or block_mask.dtype != torch.uint8:
             raise TypeError("block_mask must be uint8 on the Q device")
@@ -515,32 +242,28 @@ def _validate(
             raise ValueError("output must be BF16 on the Q device with Q shape")
 
 
-def prepare_attention_blocksparse_prefill_fp8_workspace(
+def prepare_attention_blocksparse_prefill_bf16_workspace(
     q: torch.Tensor,
     kcache: torch.Tensor,
     vcache: torch.Tensor,
-    qscale: torch.Tensor,
-    kscale: torch.Tensor,
-    vscale: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     block_ids: torch.Tensor,
     seqlens_kvcache: torch.Tensor,
     max_seqlens_q: int,
-    quant_type=1,
-) -> AscendFP8PrefillWorkspace:
-    quant_type = int(getattr(quant_type, "value", quant_type))
+) -> AscendBF16PrefillWorkspace:
+    """Allocate compute buffers for the given BF16 shapes and sequence metadata.
+
+    Prepare before graph capture and rebuild when the sequence metadata changes.
+    Q/K/V are read from each attention call rather than copied into the workspace.
+    """
     _validate(
         q,
         kcache,
         vcache,
-        qscale,
-        kscale,
-        vscale,
         cu_seqlens_q,
         block_ids,
         seqlens_kvcache,
         max_seqlens_q,
-        quant_type,
         None,
         None,
     )
@@ -580,10 +303,10 @@ def prepare_attention_blocksparse_prefill_fp8_workspace(
         and all(length % q_tokens == 0 for length in q_lengths)
         and _prefill_scores_exact(tokens_per_split)
     )
-    return AscendFP8PrefillWorkspace(
-        q_bf16=torch.empty(q.shape, dtype=torch.bfloat16, device=q.device),
-        k_bf16=torch.empty(kcache.shape, dtype=torch.bfloat16, device=q.device),
-        v_bf16=torch.empty(vcache.shape, dtype=torch.bfloat16, device=q.device),
+    return AscendBF16PrefillWorkspace(
+        q_shape=tuple(q.shape),
+        cache_shape=tuple(kcache.shape),
+        device=q.device,
         # head-major: scores/probabilities use (batch, stage, hq, q, tps).
         # Under q-major a (128,128) tile had q row stride hq*tps (32*4096 = 131072
         # elements), a 64MB address span that Triton-Ascend lowered to element-wise
@@ -622,34 +345,35 @@ def prepare_attention_blocksparse_prefill_fp8_workspace(
             dtype=torch.float32,
             device=q.device,
         ),
-        fp8_lut=_e4m3fn_lut(q.device),
         max_splits=max_splits,
         padded_q=padded_q,
         q_tokens=q_tokens,
         tokens_per_split=tokens_per_split,
-        quant_type=quant_type,
         unmasked=unmasked,
     )
 
 
-def attention_with_kvcache_blocksparse_prefill_fp8(
+def attention_with_kvcache_blocksparse_prefill_bf16(
     q: torch.Tensor,
     kcache: torch.Tensor,
     vcache: torch.Tensor,
-    qscale: torch.Tensor,
-    kscale: torch.Tensor,
-    vscale: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     block_ids: torch.Tensor,
     seqlens_kvcache: torch.Tensor,
     max_seqlens_q: int,
-    quant_type=1,
     block_mask: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     *,
     sparsity_bucket: Optional[int] = None,
-    workspace: Optional[AscendFP8PrefillWorkspace] = None,
+    workspace: Optional[AscendBF16PrefillWorkspace] = None,
 ) -> torch.Tensor:
+    """Run causal paged prefill with BF16 Q/K/V and FP32 accumulation/softmax.
+
+    Q has shape [total_q, Hq, 128]; K/V have logical shape
+    [pages, 32|64, Hkv, 128], supporting NHD and HND strides. Queries align
+    with the final query-length tokens of each KV sequence. An optional uint8
+    block mask selects 128-by-128 tiles; fully masked rows produce zero.
+    """
     # The list path first fills scores with -inf; under a dense mask that fill is
     # pure overhead (dense-causal mask +5~13%), so **only an explicit sparse caller
     # declaration** (sparsity_bucket 2/3, active <= 50%) uses it: the official
@@ -671,19 +395,15 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
             or int(block_mask.shape[3]) >= _PREFILL_LIST_MIN_KV_TILES
         )
     )
-    quant_type = int(getattr(quant_type, "value", quant_type))
+
     _validate(
         q,
         kcache,
         vcache,
-        qscale,
-        kscale,
-        vscale,
         cu_seqlens_q,
         block_ids,
         seqlens_kvcache,
         max_seqlens_q,
-        quant_type,
         block_mask,
         output,
     )
@@ -694,167 +414,32 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
     num_head_kv = int(kcache.shape[2])
     page_size = int(kcache.shape[1])
     if workspace is None:
-        workspace = prepare_attention_blocksparse_prefill_fp8_workspace(
+        workspace = prepare_attention_blocksparse_prefill_bf16_workspace(
             q,
             kcache,
             vcache,
-            qscale,
-            kscale,
-            vscale,
             cu_seqlens_q,
             block_ids,
             seqlens_kvcache,
             max_seqlens_q,
-            quant_type,
         )
     max_tokens = int(block_ids.shape[1]) * page_size
     expected_tokens_per_split = _prefill_tokens_per_split(max_tokens)
     expected_splits = max(1, triton.cdiv(max_tokens, expected_tokens_per_split))
     expected_q_tokens = _prefill_q_tokens(num_head_q, num_head_kv)
     if (
-        workspace.quant_type != quant_type
-        or workspace.max_splits != expected_splits
+        workspace.max_splits != expected_splits
         or workspace.tokens_per_split != expected_tokens_per_split
         or workspace.q_tokens != expected_q_tokens
         or workspace.padded_q < max_seqlens_q
-        or workspace.q_bf16.shape != q.shape
-        or workspace.k_bf16.shape != kcache.shape
+        or workspace.q_shape != tuple(q.shape)
+        or workspace.cache_shape != tuple(kcache.shape)
+        or workspace.device != q.device
+        or workspace.scores.shape[0] != batch
     ):
-        raise ValueError("workspace does not match FP8 prefill inputs")
+        raise ValueError("workspace does not match BF16 prefill inputs")
     mask_arg = q if block_mask is None else block_mask
     mask_strides = (0, 0, 0, 0) if block_mask is None else block_mask.stride()
-    ks_strides = (0, 0, 0, 0) if quant_type == 1 else kscale.stride()
-
-    max_q_tiles = triton.cdiv(max_seqlens_q, workspace.q_tokens)
-    decode_d_block = 32
-    q_arithmetic = (
-        True if _Q_ARITHMETIC_OVERRIDE is None else bool(_Q_ARITHMETIC_OVERRIDE)
-    )
-    q_kernel = (
-        _fp8_prefill_decode_q_arithmetic_kernel
-        if q_arithmetic else _fp8_prefill_decode_q_kernel
-    )
-    q_grid = (max_q_tiles * (_HEAD_DIM // decode_d_block), num_head_q, batch) if q_arithmetic else (max_q_tiles, num_head_q, batch)
-    q_kwargs = dict(
-        D_BLOCK=decode_d_block,
-        D_BLOCKS=_HEAD_DIM // decode_d_block,
-        USE_ARITHMETIC=True,
-    ) if q_arithmetic else {}
-    q_kernel[q_grid](
-        q,
-        qscale,
-        cu_seqlens_q,
-        workspace.fp8_lut,
-        workspace.q_bf16,
-        Q_STOKEN=q.stride(0),
-        Q_SHEAD=q.stride(1),
-        QS_SBATCH=qscale.stride(0),
-        QS_SHEAD=qscale.stride(1),
-        QS_STOKEN=qscale.stride(2),
-        QB_STOKEN=workspace.q_bf16.stride(0),
-        QB_SHEAD=workspace.q_bf16.stride(1),
-        Q_TOKENS=workspace.q_tokens,
-        num_warps=4,
-        num_stages=1,
-        **q_kwargs,
-    )
-    num_kv_pages = int(kcache.shape[0])
-    # See top comments for measured arithmetic-vs-LUT decode gain; overrides bench-only.
-    kv_arithmetic = (
-        True if _KV_ARITHMETIC_OVERRIDE is None else bool(_KV_ARITHMETIC_OVERRIDE)
-    )
-    kv_d_block = _ARITHMETIC_KV_D_BLOCK
-    # On a small grid (not a full wave) halving programs with a 64-wide tile costs
-    # more than the row-width gain, so fall back to 32 (ppp=1 = pre-change default).
-    if (
-        triton.cdiv(num_kv_pages, 1) * (_HEAD_DIM // kv_d_block) * num_head_kv
-        < 32
-    ):
-        kv_d_block = 32
-    if _KV_PAGES_PER_PROGRAM_OVERRIDE is not None:
-        pages_per_program = _KV_PAGES_PER_PROGRAM_OVERRIDE
-    else:
-        # Flattened coreDim cap 65535: programs = ceil(pages/ppp) * D_BLOCKS * hkv.
-        # Start at ppp=1 (measured fastest) and double only when the grid would exceed.
-        pages_per_program = _ARITHMETIC_KV_PAGES_PER_PROGRAM
-        while (
-            triton.cdiv(
-                batch * int(block_ids.shape[1])
-                if batch * int(block_ids.shape[1]) < num_kv_pages
-                else num_kv_pages,
-                pages_per_program,
-            )
-            * (_HEAD_DIM // kv_d_block)
-            * num_head_kv
-            > 65535
-        ):
-            pages_per_program *= 2
-    kv_kernel = (
-        _fp8_prefill_decode_kv_arithmetic_kernel
-        if kv_arithmetic else _fp8_prefill_decode_kv_kernel
-    )
-    # Page table = list of pages read; walking it decodes only referenced pages.
-    # Official inputs allocate 2*requested physical pages and reference half, so the
-    # walk halves the grid too (identity for full inputs; repeated/padded tables larger
-    # than cache fall back to physical pages to avoid polynomial duplicate decoding).
-    table_entries = batch * int(block_ids.shape[1])
-    # Table walk only when smaller than cache (strictly less work); table == cache
-    # (test block_ids=arange) keeps the physical-page walk, other constexpr branch,
-    # **byte-identical** pre-change (else one extra scalar load/program, +2% small).
-    page_from_table = table_entries < num_kv_pages
-    decode_units = table_entries if page_from_table else num_kv_pages
-    kv_grid = (
-        triton.cdiv(decode_units, pages_per_program) * (_HEAD_DIM // kv_d_block),
-        num_head_kv,
-    ) if kv_arithmetic else (
-        triton.cdiv(decode_units, pages_per_program), num_head_kv
-    )
-    table_kwargs = dict(
-        BLOCK_IDS=block_ids,
-        PAGE_FROM_TABLE=page_from_table,
-        TABLE_TOTAL=table_entries,
-        TABLE_MAX_PAGES=int(block_ids.shape[1]),
-        BID_SBATCH=block_ids.stride(0),
-        BID_SPAGE=block_ids.stride(1),
-    )
-    kv_kwargs = dict(
-        NUM_PAGES=num_kv_pages,
-        PAGES_PER_PROGRAM=pages_per_program,
-        D_BLOCK=kv_d_block,
-        D_BLOCKS=_HEAD_DIM // kv_d_block,
-        USE_ARITHMETIC=True,
-        **table_kwargs,
-    ) if kv_arithmetic else dict(NUM_PAGES=num_kv_pages, **table_kwargs)
-    kv_kernel[kv_grid](
-        kcache,
-        vcache,
-        kscale,
-        vscale,
-        workspace.fp8_lut,
-        workspace.k_bf16,
-        workspace.v_bf16,
-        PAGE_SIZE=page_size,
-        K_SPAGE=kcache.stride(0),
-        K_STOKEN=kcache.stride(1),
-        K_SHEAD=kcache.stride(2),
-        V_SPAGE=vcache.stride(0),
-        V_STOKEN=vcache.stride(1),
-        V_SHEAD=vcache.stride(2),
-        KS_SPAGE=ks_strides[0],
-        KS_SGROUP=ks_strides[1],
-        KS_SHEAD=ks_strides[2],
-        KS_SBYTE=ks_strides[3],
-        KB_SPAGE=workspace.k_bf16.stride(0),
-        KB_STOKEN=workspace.k_bf16.stride(1),
-        KB_SHEAD=workspace.k_bf16.stride(2),
-        VB_SPAGE=workspace.v_bf16.stride(0),
-        VB_STOKEN=workspace.v_bf16.stride(1),
-        VB_SHEAD=workspace.v_bf16.stride(2),
-        K_SCALE_PER_TOKEN=quant_type == 0,
-        num_warps=4,
-        num_stages=1,
-        **kv_kwargs,
-    )
     stage_slots = min(int(workspace.scores.shape[1]), workspace.max_splits)
     # Max 65535 programs per screen (flattened coreDim cap). Softmax is per q row,
     # so the limit comes from rows * stage_slots * num_head_q * batch; stage depth
@@ -909,7 +494,7 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
             workspace.scores.device, batch, num_head_q, num_q_tiles,
             workspace.max_splits, tiles_per_split,
         )
-        _fp8_prefill_qk_compact_kernel[
+        _bf16_prefill_qk_compact_kernel[
             (num_q_tiles * workspace.max_splits, num_head_q, batch)
         ](
             mask_arg, act_lists, act_counts,
@@ -937,8 +522,8 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
             num_head_q,
             batch,
         )
-        _fp8_prefill_qk_kernel[stage_grid](
-            workspace.q_bf16, workspace.k_bf16, cu_seqlens_q, block_ids,
+        _bf16_prefill_qk_kernel[stage_grid](
+            q, kcache, cu_seqlens_q, block_ids,
             seqlens_kvcache, mask_arg, workspace.scores,
             # With COUNT=False this pointer is never written, so pass an existing
             # tensor instead of allocating a 4MB counter for the production path.
@@ -950,9 +535,9 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
             act_lists if use_list else workspace.split_sum,
             act_counts if use_list else workspace.split_sum,
             split_base, q_base,
-            QB_STOKEN=workspace.q_bf16.stride(0), QB_SHEAD=workspace.q_bf16.stride(1),
-            KB_SPAGE=workspace.k_bf16.stride(0), KB_STOKEN=workspace.k_bf16.stride(1),
-            KB_SHEAD=workspace.k_bf16.stride(2), BID_SBATCH=block_ids.stride(0),
+            QB_STOKEN=q.stride(0), QB_SHEAD=q.stride(1),
+            KB_SPAGE=kcache.stride(0), KB_STOKEN=kcache.stride(1),
+            KB_SHEAD=kcache.stride(2), BID_SBATCH=block_ids.stride(0),
             BID_SPAGE=block_ids.stride(1), MASK_SBATCH=mask_strides[0],
             MASK_SHEAD=mask_strides[1], MASK_SQTILE=mask_strides[2],
             MASK_SKVTILE=mask_strides[3], S_SBATCH=workspace.scores.stride(0),
@@ -1005,7 +590,7 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
         # The head loop is always a runtime loop: hpp can now equal num_head_q, and
         # full unrolling would bloat the tile body many-fold (see the kernel table).
         hpp_unroll = 1
-        _fp8_prefill_softmax_splits_kernel[vector_grid](
+        _bf16_prefill_softmax_splits_kernel[vector_grid](
             workspace.scores, workspace.probabilities, cu_seqlens_q,
             seqlens_kvcache, workspace.split_lse, workspace.split_sum,
             split_base, q_base,
@@ -1032,14 +617,14 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
             HPP_UNROLL=hpp_unroll,
             num_warps=4, num_stages=1,
         )
-        _fp8_prefill_pv_accum_kernel[pv_grid](
-            workspace.v_bf16, workspace.probabilities, cu_seqlens_q, block_ids,
+        _bf16_prefill_pv_accum_kernel[pv_grid](
+            vcache, workspace.probabilities, cu_seqlens_q, block_ids,
             seqlens_kvcache, workspace.split_sum, workspace.split_out, output,
             act_lists if use_list else workspace.split_sum,
             act_counts if use_list else workspace.split_sum,
             split_base, q_base,
-            VB_SPAGE=workspace.v_bf16.stride(0), VB_STOKEN=workspace.v_bf16.stride(1),
-            VB_SHEAD=workspace.v_bf16.stride(2), BID_SBATCH=block_ids.stride(0),
+            VB_SPAGE=vcache.stride(0), VB_STOKEN=vcache.stride(1),
+            VB_SHEAD=vcache.stride(2), BID_SBATCH=block_ids.stride(0),
             BID_SPAGE=block_ids.stride(1), P_SBATCH=workspace.probabilities.stride(0),
             P_SSPLIT=workspace.probabilities.stride(1),
             P_SQ=workspace.probabilities.stride(3), P_SHEAD=workspace.probabilities.stride(2),
@@ -1077,7 +662,7 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
     # 192KB vs MAX_SPLITS*ROWS*HEAD_DIM*4 bytes, inverse to splits (rule, not table).
     finalize_rows = 1
     for _cand in (32, 16, 8, 4, 2):
-        if workspace.max_splits * _cand * _HEAD_DIM * 4 <= 96 * 1024:
+        if triton.next_power_of_2(workspace.max_splits) * _cand * _HEAD_DIM * 4 <= 96 * 1024:
             finalize_rows = _cand
             break
     # With max_splits == 1 pv already writes the normalized result straight to output
@@ -1086,7 +671,7 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
         0, 0 if workspace.max_splits == 1 else workspace.padded_q, rows_per_chunk
     ):
         chunk_rows = min(rows_per_chunk, workspace.padded_q - q_base)
-        _fp8_prefill_finalize_kernel[
+        _bf16_prefill_finalize_kernel[
             (triton.cdiv(chunk_rows, finalize_rows), num_head_q, batch)
         ](
         workspace.split_out,
@@ -1104,17 +689,10 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
         SL_SQ=workspace.split_lse.stride(2),
         O_STOKEN=output.stride(0),
         O_SHEAD=output.stride(1),
-        MAX_SPLITS=workspace.max_splits,
+        MAX_SPLITS=triton.next_power_of_2(workspace.max_splits),
         TOKENS_PER_SPLIT=workspace.tokens_per_split,
         ROWS=finalize_rows,
         num_warps=4,
         num_stages=1,
     )
     return output
-
-
-__all__ = [
-    "AscendFP8PrefillWorkspace",
-    "attention_with_kvcache_blocksparse_prefill_fp8",
-    "prepare_attention_blocksparse_prefill_fp8_workspace",
-]

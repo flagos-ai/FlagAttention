@@ -18,17 +18,12 @@ import triton
 import triton.language as tl
 
 from .constants import (
-    _FP8_P_SCALE_JIT,
     _PREFILL_VEC_ROWS_JIT,
-)
-
-from .quant import (
-    _positive_e4m3_round,
 )
 
 
 @triton.jit
-def _fp8_prefill_softmax_splits_kernel(
+def _bf16_prefill_softmax_splits_kernel(
     SCORES,
     PROBABILITIES,
     CU_SEQLENS_Q,
@@ -94,7 +89,13 @@ def _fp8_prefill_softmax_splits_kernel(
       # is already runtime, so their product bloats the tile body many-fold.
       # Same-process A/B (bit-identical): 512/32768 masked -1.00% / unmasked -1.39%,
       # 512/4096 -0.40%/-0.84%; <0.3ms shapes are capture noise (+2.7% = 0.09ms).
-      for step in tl.range(0, MAX_SPLITS):
+      # A final stage can contain fewer splits than the scores buffer has slots.
+      # Do not store LSE/sums past the allocated split buffers.
+      num_steps = tl.minimum(
+          MAX_SPLITS,
+          tl.maximum(0, (kv_len + TOKENS_PER_SPLIT - 1) // TOKENS_PER_SPLIT - SPLIT_BASE),
+      )
+      for step in tl.range(0, num_steps):
         split_id = SPLIT_BASE + step
         split_begin = split_id * TOKENS_PER_SPLIT
         if UNMASKED:
@@ -113,7 +114,7 @@ def _fp8_prefill_softmax_splits_kernel(
             tl.store(
                 PROBABILITIES + batch * P_SBATCH + step * P_SSPLIT
                 + q_local[:, None] * P_SQ + q_head * P_SHEAD + offs_n[None, :],
-                _positive_e4m3_round(probabilities * _FP8_P_SCALE_JIT),
+                probabilities.to(tl.bfloat16),
             )
             tl.store(
                 SPLIT_LSE + batch * SL_SBATCH + split_id * SL_SSPLIT
@@ -153,7 +154,7 @@ def _fp8_prefill_softmax_splits_kernel(
             tl.store(
                 PROBABILITIES + batch * P_SBATCH + step * P_SSPLIT
                 + q_local[:, None] * P_SQ + q_head * P_SHEAD + offs_n[None, :],
-                _positive_e4m3_round(probabilities * _FP8_P_SCALE_JIT),
+                probabilities.to(tl.bfloat16),
                 mask=valid_m[:, None] & valid_n[None, :],
             )
             tl.store(

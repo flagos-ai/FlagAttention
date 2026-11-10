@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tunables shared by the Ascend HY3 FP8 block-sparse prefill kernels.
+"""Tunables shared by the Ascend HY3 BF16 block-sparse prefill kernels.
 
 Every value here is a compile-time constant of at least one kernel, so it is
 imported into the module that defines the kernel rather than passed around at
@@ -23,12 +23,8 @@ import triton.language as tl
 
 
 _LOGICAL_BLOCK_M = 128
-_BLOCK_M = 8
 _BLOCK_N = 128
 _HEAD_DIM = 128
-_FP8_P_SCALE = 256.0
-_PREFILL_Q_TOKENS = 4
-_PREFILL_TOKENS_PER_SPLIT = 1024  # legacy: disabled kernel variants only
 _PREFILL_TOKENS_PER_SPLIT_MAX = 8192
 # bf16 scores row stride = tokens_per_split * 2 bytes. A 256B-row store at a
 # 4KB-multiple row stride degrades on this backend (measured 8192B->546 GB/s,
@@ -66,25 +62,8 @@ _PREFILL_VEC_ROWS = 1
 # and opening to num_head_q (cap 32) gained on **all** shapes (long -0.9%,
 # 512/4096 -4.5%, (127,127) -19%, (9,129) -40%); gate and constant deleted.
 _PREFILL_HEADS_PER_PROG_MAX = 32
-_PREFILL_STAGE_SLOTS = 2
-# Decode path: arithmetic E4M3 decode (integer bit ops, no table) beats LUT:
-# q=512/kv=4096 (64 pages) KV 1038us -> 56us (18x), Q 267us -> 23us (11x),
-# output **bit-identical**, 22 FP8 prefill tests green; both default to arithmetic.
-# The override switches below are benchmark/control only (None = default above).
-# Extra pages per program for long KV just cap the grid (ppp=1/4 decode kernels
-# are equally fast, 55.4~58.2us vs 56.4~56.9us); short KV keeps ppp=1.
-_ARITHMETIC_KV_PAGES_MAX = 8
-_ARITHMETIC_KV_PAGES_PER_PROGRAM = 1
-# decode_kv head-dim blocking is decoupled from decode_q: 64 beats 32 by 12~23%
-# (tile becomes 64x64, store row width 128B instead of 64B; d_block=128 overflows
-# UB), and pages_per_program=1 beats 4. The loop below caps the grid at 65535.
-_ARITHMETIC_KV_D_BLOCK = 64
-
-_BLOCK_M_JIT = tl.constexpr(_BLOCK_M)
 _BLOCK_N_JIT = tl.constexpr(_BLOCK_N)
 _HEAD_DIM_JIT = tl.constexpr(_HEAD_DIM)
 _LOGICAL_BLOCK_M_JIT = tl.constexpr(_LOGICAL_BLOCK_M)
-_FP8_P_SCALE_JIT = tl.constexpr(_FP8_P_SCALE)
-_PREFILL_TOKENS_PER_SPLIT_JIT = tl.constexpr(_PREFILL_TOKENS_PER_SPLIT)
 _PREFILL_BLOCK_M_JIT = tl.constexpr(_PREFILL_BLOCK_M)
 _PREFILL_VEC_ROWS_JIT = tl.constexpr(_PREFILL_VEC_ROWS)

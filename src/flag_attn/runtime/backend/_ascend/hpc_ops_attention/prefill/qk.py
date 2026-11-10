@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""QK kernels of the Ascend HY3 FP8 block-sparse prefill."""
+"""QK kernels of the Ascend HY3 BF16 block-sparse prefill."""
 
 import triton
 import triton.language as tl
@@ -24,7 +24,7 @@ from .constants import (
 
 
 @triton.jit
-def _fp8_prefill_qk_compact_kernel(
+def _bf16_prefill_qk_compact_kernel(
     BLOCK_MASK,
     ACTIVE,
     COUNTS,
@@ -43,7 +43,7 @@ def _fp8_prefill_qk_compact_kernel(
     One program per (q tile, split, head, batch).  ``ACTIVE`` holds, for each
     (batch, head, q tile, split), the within-split indices of the 128-token
     blocks that are *not* fully masked out (``COUNTS`` the segment length).
-    ``_fp8_prefill_qk_kernel`` then walks only those, so the masked blocks are
+    ``_bf16_prefill_qk_kernel`` then walks only those, so the masked blocks are
     never stored -- their -inf comes from the host ``fill_`` -- and its store
     stays unconditional (a data-dependent store predicate costs +38..117% on
     this backend, see the note in the qk kernel).
@@ -86,7 +86,7 @@ def _fp8_prefill_qk_compact_kernel(
 
 
 @triton.jit
-def _fp8_prefill_qk_kernel(
+def _bf16_prefill_qk_kernel(
     Q_BF16,
     K_BF16,
     CU_SEQLENS_Q,
