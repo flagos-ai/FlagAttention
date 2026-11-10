@@ -21,10 +21,15 @@ from statistics import median
 import pytest
 import torch
 
+from flag_attn.testing import backend as test_backend
+from flag_attn import runtime
+
+if runtime.device.vendor_name == "ascend":
+    pytest.skip("HY3 FP8 attention is not supported on Ascend", allow_module_level=True)
+
 bsa_ops = import_module(
     "flag_attn.hpc_ops_attention.prefill.attention_blocksparse_prefill_fp8"
 )
-from flag_attn.testing import backend as test_backend
 from flag_attn import hy3_attention
 
 try:
