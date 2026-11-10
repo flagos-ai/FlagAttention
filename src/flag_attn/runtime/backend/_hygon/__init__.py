@@ -38,6 +38,7 @@ _OPERATOR_EXPORTS = {
     "SPARSE_BLOCK_SIZE": (".msa.index_topk", "SPARSE_BLOCK_SIZE"),
     "chunk_kda_fwd_infer": (".FLA.kda.chunk_kda", "chunk_kda_fwd_infer"),
     "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
+    "parallel_moba": (".FLA.moba.parallel", "parallel_moba"),
     "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
     "chunk_gla": (".FLA.gla", "chunk_gla"),
     "fused_attnres": (".FLA.attnres", "fused_attnres"),
