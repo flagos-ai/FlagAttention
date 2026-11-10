@@ -55,19 +55,14 @@ from .splits import (
 )
 
 
-# Override switches for host scheduling / same-process A/B; None = policy above.
-# Module globals read at call time; benchmarks set them before capture, so one
-# process/input can capture different schedules without cold-start/environment noise.
+# Scheduling controls are read when attention is launched; None selects the policy.
 _PREFILL_SOFTMAX_HPP_OVERRIDE = None
-# Benchmark/ablation only: qk block-sparse skip. None = default (real mask with a
-# block mask, never skip without one, keeping the old path). 0 = never skip
-# (baseline), 1 = always skip (upper bound), 2 = real mask. _QK_SKIP_COUNT writes
-# (skips, blocks) per program to counters read by benchmarks only; prod = False.
+# QK skip modes: None follows the mask policy, 0 visits every block,
+# 1 skips every block for diagnostics, and 2 follows the block mask.
 _QK_SKIP_OVERRIDE = None
 _QK_SKIP_COUNT = False
 _SKIP_COUNTERS: dict = {}
-# Benchmark/ablation only: compaction list path. None = default (used only when the
-# caller declares sparsity, i.e. sparsity_bucket 2/3); True/False = force on/off (A/B).
+# None selects compaction from the sparsity declaration; a bool forces the choice.
 _QK_LIST_OVERRIDE = None
 _QK_LIST_CACHE: dict = {}
 
@@ -128,33 +123,11 @@ def _prefill_q_tokens(num_head_q: int, num_head_kv: int) -> int:
 
 
 def _prefill_tokens_per_split(max_tokens: int) -> int:
-    """Split the KV into few, long, and (almost) completely full tiles.
+    """Choose a bounded KV split size aligned to the QK/PV inner tile.
 
-    The pipeline launches qk / softmax / pv_accum once per split, and the
-    softmax kernel is per-program overhead bound, so fewer splits is better.
-    Measured on q=512/kv=4096 (8 heads, page 64):
-
-      tokens/split   512    1024    2048    4096
-      end-to-end    3506    2159    1733    1511us
-      softmax       2189    1063     617     417us
-      qk+pv          916     748     766     749us
-
-    A tile that is mostly padding is wasted work in every kernel though (at
-    q=17/kv=2305 a 2048 tile is only 12% full and costs +13.6%), and powers of
-    two are far too coarse for that: 2305 tokens is 2x1152 but 3x768 or 2x2048
-    with a nearly empty tail.  So instead of a bucket ladder, pick the fewest
-    splits that keep the tile within _PREFILL_TOKENS_PER_SPLIT_MAX and round the
-    tile up to a multiple of _TILE_STEP (the qk/pv inner block); the softmax
-    kernel takes a power-of-two vector width and masks the overhang, so the tile
-    no longer has to be a power of two itself.
-
-    Examples: 1024 -> 1024 (1 split), 1088 -> 1152 (1), 2305 -> 1152 (2),
-    4096 -> 4096 (1), 32768 -> 4096 (8).
-
-    The cap was 2048 until the softmax ablation showed its math is only ~14% of
-    the kernel and the rest is a fixed ~60-75ns per program: doubling the tile
-    halves the program count and measured -7.9% (q=512/kv=4096) and -15.4%
-    (q=512/kv=32768) end-to-end.
+    Use the fewest splits allowed by the split-size cap, then round the split
+    width to a multiple of _TILE_STEP. Softmax masks the extra lanes of its
+    power-of-two vector width, so the split width need not be a power of two.
     """
     splits = max(1, -(-max_tokens // _PREFILL_TOKENS_PER_SPLIT_MAX))
     tile = -(-max_tokens // splits)
@@ -273,23 +246,14 @@ def prepare_attention_blocksparse_prefill_bf16_workspace(
     max_tokens = int(block_ids.shape[1]) * page_size
     tokens_per_split = _prefill_tokens_per_split(max_tokens)
     max_splits = max(1, triton.cdiv(max_tokens, tokens_per_split))
-    # Flattened grid (coreDim) caps at 65535: softmax is per q row, tightest term
-    # rows * stage_slots * num_head_q * batch, so stage depth is bound by it too.
-    # The softmax grid is only rows*heads now, no coreDim bound; qk/pv still use
-    # q_tiles*stage*heads, held by rows_per_chunk below.
+    # Bound the number of split slots held in the intermediate scores buffer.
+    # Launch-time row chunking also respects the flattened grid limit.
     stage_capacity = max(1, min(_PREFILL_STAGE_CAP, max_splits))
     q_tokens = _prefill_q_tokens(hq, int(kcache.shape[2]))
     padded_q = triton.cdiv(max_seqlens_q, q_tokens) * q_tokens
-    # The softmax "unmasked" condition is computed here: dispatch cannot do a
-    # device->host sync (it errors out during NPUGraph capture).
-    #
-    # Unmasked has no valid_n, so every lane must be a real token: no row padding
-    # (q_len % 128 == 0), no split tail (kv_len % tile == 0), no tile overhang.
-    # tokens_per_split is a 128 multiple but **not necessarily a power of two**
-    # (see _prefill_tokens_per_split), so softmax VEC = next_pow2(tile) > tile and
-    # the extra columns read as **next q row** scores, polluting row max and row
-    # sum: measured q=128/kv=384 error 1.95e-03 (masked) -> 8.89e-02 (unmasked),
-    # q=128/kv=1152 4.88e-04 -> 6.89e-02, and test atol=0.1 exactly covers it.
+    # Resolve the unmasked path during preparation to avoid host synchronization
+    # inside graph capture. It requires full query tiles and KV splits, a stage
+    # depth that divides the split count, and no softmax vector overhang.
     stage_slots_eff = min(stage_capacity, max_splits)
     kv_lengths = [int(x) for x in seqlens_kvcache.reshape(-1).tolist()]
     q_lengths = [
@@ -307,12 +271,8 @@ def prepare_attention_blocksparse_prefill_bf16_workspace(
         q_shape=tuple(q.shape),
         cache_shape=tuple(kcache.shape),
         device=q.device,
-        # head-major: scores/probabilities use (batch, stage, hq, q, tps).
-        # Under q-major a (128,128) tile had q row stride hq*tps (32*4096 = 131072
-        # elements), a 64MB address span that Triton-Ascend lowered to element-wise
-        # access: pv's p load took 69% of the whole kernel (same 1.07GB, only the
-        # row stride changed to tps=4096, 18.66ms -> 5.745ms). head-major cuts the
-        # span to 1MB; softmax touches one contiguous token row at a time, unaffected.
+        # Head-major [batch, stage, head, query, token] buffers keep each
+        # head's probability rows adjacent for PV tile loads.
         scores=torch.empty(
             (
                 batch,
@@ -374,19 +334,8 @@ def attention_with_kvcache_blocksparse_prefill_bf16(
     with the final query-length tokens of each KV sequence. An optional uint8
     block mask selects 128-by-128 tiles; fully masked rows produce zero.
     """
-    # The list path first fills scores with -inf; under a dense mask that fill is
-    # pure overhead (dense-causal mask +5~13%), so **only an explicit sparse caller
-    # declaration** (sparsity_bucket 2/3, active <= 50%) uses it: the official
-    # benchmark's 75% sparse mask reports bucket 2. bucket 0/1 (active >= 50%) and
-    # **no bucket** keep the old path (no regressions); _QK_LIST_OVERRIDE forces it.
-    #
-    # Few kv tiles make the list unprofitable: compaction + fill is fixed cost and
-    # few blocks skip. Forced both in-process (75% sparse, bucket=2, bit-identical):
-    #   kv_tiles=3  -> list slower 7.9%  kv_tiles=16 -> list faster 4.7%
-    #   kv_tiles=9  -> list slower 0.7%  kv_tiles=32 -> faster 12.0%
-    #   kv_tiles=12 -> list faster 4.1%  kv_tiles>=64 -> faster 11.0%
-    # The crossover is between 9 and 12 (another agent independently measured
-    # kv=1536/12 tiles: list faster by 3.65%, consistent), so below 12 use dense.
+    # Compaction requires both an explicit sparse bucket and enough KV tiles
+    # to amortize the active-list construction and score-buffer initialization.
     list_allowed = (
         sparsity_bucket is not None
         and int(sparsity_bucket) in (2, 3)
@@ -441,11 +390,8 @@ def attention_with_kvcache_blocksparse_prefill_bf16(
     mask_arg = q if block_mask is None else block_mask
     mask_strides = (0, 0, 0, 0) if block_mask is None else block_mask.stride()
     stage_slots = min(int(workspace.scores.shape[1]), workspace.max_splits)
-    # Max 65535 programs per screen (flattened coreDim cap). Softmax is per q row,
-    # so the limit comes from rows * stage_slots * num_head_q * batch; stage depth
-    # was already cut in the workspace, and q-row chunking here covers any q_len.
-    # Both constraints together: softmax per q row (split-loop rows*heads, per-split
-    # rows*stage*heads), qk/pv per q tile (q_tiles*stage*heads). Take the tighter.
+    # Keep both the softmax row grid and the QK/PV tile grids within the
+    # backend's flattened launch limit of 65535 programs.
     _per_row = num_head_q * batch
     _rows_budget = min(
         65535 // max(1, _per_row),
@@ -456,22 +402,14 @@ def attention_with_kvcache_blocksparse_prefill_bf16(
         (_rows_budget // workspace.q_tokens) * workspace.q_tokens,
     )
     rows_per_chunk = min(rows_per_chunk, workspace.padded_q)
-    # qk's M tile is larger than softmax/pv, so it has its own row chunking: SCORES
-    # indexes absolute q rows, so the chunkings are independent -- a stage's qk must
-    # finish before softmax/pv read complete scores (same stream order anyway).
-    # Block-sparse skip needs a block mask; the rate depends on how many 128-row
-    # mask rows the M tile spans: M=256 keeps the whole block if either row is
-    # active (measured skippable 54~56%), M=128 decides per 128 rows (74~75%).
-    # With a mask at q=512/kv=32768, M=128 is 5.5 points faster end to end; without
-    # a mask nothing skips, so larger M=256 wins (exp_qk: qk -8%); pick by mask.
+    # QK uses independent row chunks because scores use absolute query indices.
+    # With a mask, align its tile to one logical mask row for block skipping;
+    # without a mask, use a larger tile to reduce the number of programs.
     qk_tile = (
         _PREFILL_QK_BLOCK_M_MASKED if block_mask is not None else _PREFILL_QK_BLOCK_M
     )
-    # One q tile costs stage_slots*num_head_q*batch program slots, so the row cap is
-    # 65535*qk_tile/(stage*hq*batch). The old form treated rows as tiles and squeezed
-    # chunks to 384 rows (masked)/256 (unmasked), so 512 rows launched qk twice with
-    # half the programs each, not filling 20 AICs -- unmasked 512/32768 lost 2.2%.
-    # Grid cap (flattened) still holds: cdiv(qk_rows,qk_block)*stage*hq*batch<=65535.
+    # Each QK tile occupies stage_slots * num_head_q * batch program slots.
+    # Bound the row chunk so the flattened grid stays within 65535 programs.
     _qk_rows_budget = (65535 * qk_tile) // max(1, stage_slots * num_head_q * batch)
     qk_rows_per_chunk = max(
         qk_tile,
@@ -508,9 +446,8 @@ def attention_with_kvcache_blocksparse_prefill_bf16(
         )
     for split_base in range(0, workspace.max_splits, stage_slots):
       if use_list:
-        # qk no longer writes -inf for masked blocks; this fills them at once (the
-        # scores (batch, stage) slice is contiguous, only this pass's stage slots),
-        # ordered before this pass's qk and after the previous pass's softmax/pv reads.
+        # Listed QK writes only active blocks. Initialize the current score
+        # slots to -inf before QK and before softmax/PV consume them.
         workspace.scores[:, :stage_slots].fill_(float("-inf"))
       for q_base in range(0, workspace.padded_q, qk_rows_per_chunk):
         qk_rows = min(qk_rows_per_chunk, workspace.padded_q - q_base)
@@ -525,8 +462,7 @@ def attention_with_kvcache_blocksparse_prefill_bf16(
         _bf16_prefill_qk_kernel[stage_grid](
             q, kcache, cu_seqlens_q, block_ids,
             seqlens_kvcache, mask_arg, workspace.scores,
-            # With COUNT=False this pointer is never written, so pass an existing
-            # tensor instead of allocating a 4MB counter for the production path.
+            # COUNT=False never writes the counter pointer; reuse an existing buffer.
             (
                 _skip_counter(workspace.scores.device)
                 if _QK_SKIP_COUNT
@@ -587,8 +523,7 @@ def attention_with_kvcache_blocksparse_prefill_bf16(
             triton.cdiv(num_head_q, hpp),
             batch,
         )
-        # The head loop is always a runtime loop: hpp can now equal num_head_q, and
-        # full unrolling would bloat the tile body many-fold (see the kernel table).
+        # Keep the head loop dynamic to bound generated code size as head count grows.
         hpp_unroll = 1
         _bf16_prefill_softmax_splits_kernel[vector_grid](
             workspace.scores, workspace.probabilities, cu_seqlens_q,
@@ -652,14 +587,8 @@ def attention_with_kvcache_blocksparse_prefill_bf16(
             LIST_SPLITS=workspace.max_splits,
             num_warps=8, num_stages=1,
         )
-    # finalize moves only ~1.5KB per program; the bottleneck is per-program fixed
-    # latency. One program on 8 rows (independent, mutually hiding latency) measured
-    # 32q/4kv -20% (short)/-3.5% (long), small shapes -32%. A 3-D tile takes
-    # MAX_SPLITS*ROWS*D*4 bytes, so fall back to 1 row for large split counts.
-    # Same per-program fixed latency bound; multiple rows per program hide each
-    # other (ROWS=8 measured -3.5% long). Rows can go higher: ROWS 8 -> 32 gained
-    # another -2.2~-3.0% on long cases in same-process A/B (bit-identical). Cap: UB
-    # 192KB vs MAX_SPLITS*ROWS*HEAD_DIM*4 bytes, inverse to splits (rule, not table).
+    # Process multiple query rows per finalize program while keeping the
+    # split-by-row-by-head-dimension FP32 tile within the scratch-memory budget.
     finalize_rows = 1
     for _cand in (32, 16, 8, 4, 2):
         if triton.next_power_of_2(workspace.max_splits) * _cand * _HEAD_DIM * 4 <= 96 * 1024:

@@ -54,10 +54,9 @@ def _bf16_prefill_softmax_splits_kernel(
     HEADS_PER_PROG: tl.constexpr,
     HPP_UNROLL: tl.constexpr,
 ):
-    """One program does (row, HEADS_PER_PROG heads) for all splits of this stage.
+    """Compute each row/head group's softmax statistics over the stage's splits.
 
-    Bit-identical to the per-split version (each split's softmax is independent),
-    with MAX_SPLITS fewer instances -- mostly program count x fixed overhead.
+    Each split has independent normalization state and a separate output slot.
     """
     q_local = Q_BASE + tl.program_id(0) * _PREFILL_VEC_ROWS_JIT + tl.arange(
         0, _PREFILL_VEC_ROWS_JIT
@@ -71,24 +70,13 @@ def _bf16_prefill_softmax_splits_kernel(
     if (Q_BASE + tl.program_id(0) * _PREFILL_VEC_ROWS_JIT >= q_end - q_begin):
         return
     offs_n = tl.arange(0, VEC)
-    # HEADS_PER_PROG == 1 unrolls this loop into the original code, byte-identical.
-    # HPP_UNROLL=HEADS_PER_PROG is the old static_range unroll; =1 is a runtime
-    # loop. Same-process A/B rotation (NPUGraph replay, median, bit-identical):
-    #   q=128/kv=1152 (VEC 2048) -10.6%    q=9  /kv=129  (VEC  256)  -6.7%
-    #   q=129/kv=257  (VEC  512)  -5.1%    q=127/kv=127  (VEC  128)  -5.2%
-    #   q=512/kv=2048 (VEC 2048)  -2.0%    q=17 /kv=8193 (VEC 4096)  -0.6%
-    #   other VEC=4096 shapes (q=512/kv=4096, 8192, 16385, 32768, masked and
-    #   unmasked): -0.1% ~ +0.4%, inconsistent direction, i.e. noise.
-    # Narrow tiles pay unroll size/slot overhead; a 4096-wide tile unrolls so the
-    # compiler schedules across iterations, so pick by VEC: >=4096 fully unrolled.
+    # HPP_UNROLL controls head-loop unrolling; a runtime loop bounds code size
+    # when a program processes several heads.
     for q_head_off in tl.range(
         0, HEADS_PER_PROG, loop_unroll_factor=HPP_UNROLL
     ):
       q_head = q_head_base + q_head_off
-      # Split loop is runtime too: MAX_SPLITS now reaches 8~16 and the head loop
-      # is already runtime, so their product bloats the tile body many-fold.
-      # Same-process A/B (bit-identical): 512/32768 masked -1.00% / unmasked -1.39%,
-      # 512/4096 -0.40%/-0.84%; <0.3ms shapes are capture noise (+2.7% = 0.09ms).
+      # Iterate splits dynamically to avoid multiplying the head-loop code size.
       # A final stage can contain fewer splits than the scores buffer has slots.
       # Do not store LSE/sums past the allocated split buffers.
       num_steps = tl.minimum(
@@ -99,9 +87,7 @@ def _bf16_prefill_softmax_splits_kernel(
         split_id = SPLIT_BASE + step
         split_begin = split_id * TOKENS_PER_SPLIT
         if UNMASKED:
-            # Whole split, stage divides splits: no invalid lanes, so no mask is
-            # needed. Masked stores are clearly costlier here (see bf16 decode), and
-            # VEC_ROWS==1 early return already guarantees valid rows; valid_m is dead.
+            # Preparation guarantees valid rows and full splits for this path.
             scores = tl.load(
                 SCORES + batch * S_SBATCH + step * S_SSPLIT
                 + q_local[:, None] * S_SQ + q_head * S_SHEAD + offs_n[None, :]
@@ -145,10 +131,8 @@ def _bf16_prefill_softmax_splits_kernel(
             ).to(tl.float32)
             maximum = tl.max(scores, axis=1)
             safe_max = tl.where(maximum == -float("inf"), 0.0, maximum)
-            # Invalid lanes have scores = load other=-inf, exp2(-inf)=0; invalid
-            # rows/lanes are store-masked by valid_m/valid_n anyway, so this whole-
-            # tile where is redundant: removing it at q=512/kv=16385 measured -3.9%
-            # (softmax 4.317 -> 4.147ms); output/probs/sums all bit-identical.
+            # Invalid scores load as -inf and exponentiate to zero. Store masks
+            # exclude invalid rows and vector-overhang lanes.
             probabilities = tl.exp2(scores - safe_max[:, None])
             denominator = tl.sum(probabilities, axis=1)
             tl.store(

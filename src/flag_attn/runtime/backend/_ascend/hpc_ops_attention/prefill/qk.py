@@ -38,15 +38,11 @@ def _bf16_prefill_qk_compact_kernel(
     TILES_PER_SPLIT: tl.constexpr,
     NUM_Q_TILES: tl.constexpr,
 ):
-    """Compaction: list the kv 128-token blocks the sparse mask keeps.
+    """Build the active KV-block list for each query tile, split, head and batch.
 
-    One program per (q tile, split, head, batch).  ``ACTIVE`` holds, for each
-    (batch, head, q tile, split), the within-split indices of the 128-token
-    blocks that are *not* fully masked out (``COUNTS`` the segment length).
-    ``_bf16_prefill_qk_kernel`` then walks only those, so the masked blocks are
-    never stored -- their -inf comes from the host ``fill_`` -- and its store
-    stays unconditional (a data-dependent store predicate costs +38..117% on
-    this backend, see the note in the qk kernel).
+    ACTIVE stores within-split indices of selected 128-token blocks, and COUNTS
+    stores each list's length. QK visits only those blocks; the host initializes
+    the other scores to -inf before the kernel runs.
     """
     flat = tl.program_id(0)
     q_tile = flat // MAX_SPLITS
@@ -128,28 +124,12 @@ def _bf16_prefill_qk_kernel(
     NUM_Q_TILES: tl.constexpr,
     LIST_SPLITS: tl.constexpr,
 ):
-    """q @ k^T for one (q tile, kv split, q head).
+    """Compute QK scores for one query tile, KV split and query head.
 
-    The inner KV tile is one full page (PAGE_SIZE tokens) instead of the
-    128-token block that softmax/pv use.  That is what makes this kernel fast:
-    a 128-token tile straddles two pages, so its page table entry varies per
-    row and the K address becomes a per-row gather (int64 page base + row
-    stride); a page-aligned tile has a *scalar* page number, so the page-table
-    lookup becomes a single scalar load and the K address collapses to
-    `physical * KB_SPAGE + arange(PAGE_SIZE) * KB_STOKEN + arange(128)`, an
-    affine load the backend turns into a plain DMA.  The page table is still
-    applied (BLOCK_IDS may be any permutation), it is just no longer per lane.
-    Measured on q=512/kv=32768/32q4kv in one process: 13.16ms -> 6.21ms for
-    this change alone (bit-exact scores), and the (128-token) block mask is
-    simply read once per 128 KV tokens, i.e. `_LOGICAL_BLOCK_M // PAGE_SIZE`
-    inner tiles, so the mask traffic is unchanged.  `_validate` only admits
-    PAGE_SIZE 32 or 64, both of which divide _LOGICAL_BLOCK_M, so the tiling is
-    always exact.
-
-    The store keeps the softmax layout (column offset tile_in_split*PAGE_SIZE),
-    so nothing outside this kernel changes.  No stride is hard-coded: S_SQ /
-    S_SHEAD / S_* come from the caller, so a head-major SCORES layout works
-    unchanged.
+    Each inner tile covers one KV page, giving it a scalar page-table lookup
+    and affine K addresses. Logical block masks cover 128 KV tokens, spanning
+    an integral number of 32- or 64-token pages. Score strides are supplied by
+    the caller to support the head-major intermediate layout.
     """
     flat_tile = tl.program_id(0)
     q_tile = flat_tile // MAX_SPLITS
@@ -205,10 +185,8 @@ def _bf16_prefill_qk_kernel(
 
     n_skip = 0
     n_block = 0
-    # List path: iterate only active blocks listed by compaction. Masked blocks
-    # write nothing; their -inf comes from host scores.fill_(-inf), so this store
-    # stays **unconditional** (a data-dependent predicate drops out of DMA
-    # lowering: per-row +38%, scalar branch +117%, reduce-only +159% (in-process)).
+    # Listed blocks are active; their score stores need no block-selection
+    # predicate. Unlisted scores retain the host's -inf initialization.
     lq_tile = q_local_start // _LOGICAL_BLOCK_M_JIT
     if LISTED:
         list_row = (
@@ -235,16 +213,9 @@ def _bf16_prefill_qk_kernel(
         m0 = 0
         m1 = 0
         if HAS_BLOCK_MASK:
-            # One block-mask entry covers mask_tiles inner tiles.  With
-            # QK_BLOCK_M rows the M tile spans QK_BLOCK_M // 128 logical q
-            # tiles, so exactly QK_BLOCK_M // 128 entries matter -- load them as
-            # *scalars* and broadcast.  (The obvious per-row gather
-            # `tl.load(... logical_q_tile * MASK_SQTILE ...)` is a 256-lane
-            # masked vector load for two distinct addresses, and it sits on the
-            # critical path in the skip path where there is no K DMA left to
-            # overlap it with.)  The kv index is clamped rather than masked: a
-            # masked scalar load serialises against the next DMA on this
-            # backend, and an out-of-range kv tile is dead anyway (`in_range`).
+            # Load and broadcast one mask entry for each logical query tile
+            # covered by this program. Clamp the KV mask index for the load;
+            # in_range excludes blocks beyond the supplied mask.
             kv_safe = tl.minimum(kv_tile, NUM_MASK_KV_TILES - 1)
             mask_base = (
                 BLOCK_MASK
@@ -265,18 +236,8 @@ def _bf16_prefill_qk_kernel(
             else:
                 m1 = m0
                 selected = selected & in_range & (m0 != 0)
-        # Block sparsity: the benchmark/real masks kill ~75% of the
-        # (128-row, kv-tile) cells, so a whole (QK_BLOCK_M x 128) block is very
-        # often dead.  A dead block's scores are -inf in every lane, so the K
-        # load + dot can be skipped and an -inf tile stored instead -- softmax
-        # (whose UNMASKED path has no valid_n and relies on qk writing -inf)
-        # and pv see byte-identical input.
-        #
-        # The test is deliberately a *scalar*: OR the block-mask entries of the
-        # QK_BLOCK_M // 128 logical q tiles covered by this program, and clamp
-        # the kv index (a masked scalar load serialises against the next K DMA,
-        # see the page-table note below).  An out-of-range kv tile is dead by
-        # construction (the mask load below returns other=0 for it).
+        # Skip K loads and matrix work only when every logical mask row covered
+        # by the tile is inactive. Store -inf so softmax assigns zero probability.
         do_skip = False
         if SKIP == 1:
             do_skip = True
@@ -301,17 +262,10 @@ def _bf16_prefill_qk_kernel(
                 tile_in_split = big * mask_tiles + sub
                 kv_tokens = split_begin + tile_in_split * PAGE_SIZE + offs_n
                 valid_n = kv_tokens < kv_len
-                # BLOCK_IDS is a logical -> physical page table, so the
-                # translation must be applied here (decode_kv writes K in place,
-                # keyed by physical page).  One inner tile lives entirely inside
-                # one page, so the logical page is a *scalar* and this is a
-                # single scalar load that leaves the K address affine.
-                #
-                # It must be UNMASKED: a masked scalar load costs ~2x on this
-                # backend (measured 9.06ms vs 4.57ms on q=512/kv=32768/32q4kv)
-                # -- it serialises against the following K DMA.  The tail page
-                # is instead clamped so the page-table address stays in bounds,
-                # and its lanes are dropped by valid_n / the causal mask below.
+                # Translate the logical page through BLOCK_IDS. Page-aligned
+                # tiles share one physical page, keeping K addresses affine.
+                # Clamp tail pages for the scalar lookup; valid_n and the
+                # causal mask exclude tokens beyond the sequence boundary.
                 logical_page = tl.minimum(
                     (split_begin + tile_in_split * PAGE_SIZE) // PAGE_SIZE,
                     max_page,

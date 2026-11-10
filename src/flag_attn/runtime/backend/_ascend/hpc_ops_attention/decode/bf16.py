@@ -47,26 +47,15 @@ HAS_TLE = False
 USE_TLE = False
 # 64 tokens per KV page, so a split covers PAGES_PER_SPLIT * 64 tokens.
 PAGES_PER_SPLIT = 8
-# Candidate split sizes for the MTP1 producer, 64 tokens per page.  The producer
-# walks its pages serially inside one program, so its cost is a fixed
-# per-program part (Q tile load, epilogue stores, the program's serial latency)
-# plus a per-page part; longer splits amortise the fixed part but burn page
-# slots on the tail split of short sequences.  PAGES_PER_SPLIT=32 does not
-# compile: "cbuf overflow, requires 4718592 bits while 4194304 bits available"
-# (L1 is 512KB).
+# Candidate MTP1 split sizes, in 64-token pages. Longer splits amortize program
+# overhead but add tail-page work; limit candidates to bound L1 scratch use.
 PAGES_PER_SPLIT_CHOICES = (8, 16)
-# Per-program and per-page-slot producer costs in microseconds, fitted on
-# Ascend910B4 at 8q/1kv, BLOCK_SIZE=64, D=128 (see
-# tools/ascend_profile/probe_pps.py).  Only their ratio drives the choice, so
-# the units cancel; the values reproduce the measured winner on every case.
+# Relative program and per-page costs used by the MTP1 split-size model.
+# Both weights use microsecond units; only their ratio affects selection.
 PRODUCER_PROGRAM_COST_US = 0.133
 PRODUCER_PAGE_COST_US = 0.0522
-# Pages merged into a single QK/PV dot by the MTP1 producer.  The pages are made
-# contiguous by _bf16_mtp_gather_v_kernel.  Measured on Ascend910B4 (8q/1kv,
-# same-window A/B vs 98a67b5): 8 pages/dot is best end to end
-# (uniform_512 91.2->81.0us, uniform_4096 576.1->489.3us,
-# one_64k_7x4k 222.1->157.8us); 4 pages/dot is worse than the per-page
-# baseline on uniform_512 (94.6us) because the gather is not amortised.
+# Pages combined in one MTP1 PV dot. The gather kernel places them in a
+# contiguous scratch operand while QK continues to read the paged cache.
 PAGES_PER_DOT = 8
 SPLITS_PER_REDUCTION = 16
 
@@ -87,8 +76,7 @@ def _choose_pages_per_split(lengths, mtp: int) -> int:
     growing KV length cannot re-shard an existing workspace.
     """
     if mtp != 1:
-        # The model was fitted against the MTP1 producer; MTP2/3/4 keep the
-        # stable eight-page split size.
+        # Adaptive split selection applies to MTP1; MTP2/3/4 use eight-page splits.
         return PAGES_PER_SPLIT
     if not lengths:
         return PAGES_PER_SPLIT
@@ -1178,11 +1166,8 @@ def _prepare_ascend_bf16_workspace(
         schedule["compact_producer"] = False
     max_splits = int(schedule["max_splits"])
     max_reduction_groups = int(schedule["max_reduction_groups"])
-    # Pad the split buffers up to the highest row the producer can write so it
-    # can store its partial tile unmasked (the masked store path is ~8x slower
-    # on this backend).  The producer indexes rows as ``seq_m * hq + head``, so
-    # with Q_ROWS wider than ``mtp * heads_per_group`` the invalid MTP rows also
-    # land inside the buffer; finalisation only ever reads rows below ``mtp * hq``.
+    # Pad split buffers for every row the producer can write without masking.
+    # Its row index is seq_m * hq + head; finalization reads only rows < mtp * hq.
     hkv = int(inputs.k_cache.shape[2])
     heads_per_group = hq // hkv
     q_rows = triton.next_power_of_2(mtp * heads_per_group)
@@ -1378,8 +1363,7 @@ def attention_decode_ascend_bf16_mtp1(
         USE_TASK_MAP=workspace.compact_producer,
         DIRECT_OUTPUT=workspace.max_splits == 1,
         FULL_SPLITS=workspace.full_producer_splits,
-        # Interleaved same-process A/B: 4 warps wins for the single-split
-        # (direct-output) workload; 8 stays best for the split paths.
+        # Use fewer warps for direct output than for split-output accumulation.
         num_warps=4 if workspace.max_splits == 1 else 8,
         num_stages=1,
     )

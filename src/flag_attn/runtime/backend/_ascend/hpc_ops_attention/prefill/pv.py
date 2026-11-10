@@ -69,13 +69,11 @@ def _bf16_prefill_pv_accum_kernel(
     NUM_Q_TILES: tl.constexpr,
     LIST_SPLITS: tl.constexpr,
 ):
-    """Accumulate the PV partial over the active 128-token blocks of a split.
+    """Accumulate a split's PV partial over the active 128-token KV blocks.
 
-    One V tile is one whole page, so the page number is a scalar and the V address
-    stays affine; the older 128-token tile spanned two pages and its per-row
-    gather took 68% of pv.  Only the blocks the QK kernel marked active are
-    visited, and a skipped block contributes ``dot(0, V)`` -- exactly the value
-    the softmax wrote for it.
+    Each V tile covers a whole page, so the page number is scalar and V
+    addresses remain affine. The active list matches QK's selected blocks;
+    unselected blocks have zero softmax probability and contribute nothing.
     """
     flat_tile = tl.program_id(0)
     q_tile = flat_tile // MAX_SPLITS
@@ -124,11 +122,7 @@ def _bf16_prefill_pv_accum_kernel(
             tile_in_split = it
             if LISTED:
                 tile_in_split = tl.load(list_row + it)
-        # V tile = one whole page: scalar page number, V address is "scalar base +
-        # arange*const" -> affine full-block DMA. The old 128-token tile spans 2
-        # pages (per-row gather vector, non-affine) -> on head-major this V load
-        # took 68% of pv (5.73ms -> 1.83ms is the no-mask bound; removing the mask
-        # computes wrong silently). Page table stays, scalar. pv 5.73ms -> 2.24ms.
+        # A whole-page V tile uses one scalar page lookup and affine DMA addresses.
             offs_p = tl.arange(0, PAGE_TILE)
             for page_in_tile in tl.static_range(0, PAGE_UNROLL):
                 chunk = tile_in_split * PAGE_UNROLL + page_in_tile
@@ -211,9 +205,7 @@ def _bf16_prefill_pv_accum_kernel(
         denominator[:, None] > 0.0, denominator[:, None], 1.0
     )
     if FUSE_FINALIZE:
-        # With one split, finalize just copies split_out into output: weights =
-        # exp2(lse - lse) = 1 and denominator = 1, so writing the normalized result
-        # to OUT is bit-identical, saving the finalize kernel and split_out trip.
+        # A single split needs no merge; store its normalized result directly.
         tl.store(
             OUT
             + (q_begin + offs_m[:, None]) * O_STOKEN
