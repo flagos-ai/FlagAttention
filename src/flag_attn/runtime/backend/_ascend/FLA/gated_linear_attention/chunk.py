@@ -44,6 +44,12 @@ Numerical notes:
   reach ``logsigmoid / 0.1``, i.e. ~10 log2 units per token, where a plain
   16-token panel already overflows to inf.
 
+For K=V=128, T>=1024 and 64-token chunks, the A and output stages share one
+kernel. Each 16-token panel is consumed immediately by the output dot, keeping
+the same exponent references without a full A tile live in the unified buffer.
+Training still stores A for backward dv; inference avoids that allocation and
+store. Other shapes retain the separate kernels.
+
 Memory: besides the dtype of the stored states (see above), the launch
 transient of the Ascend Triton runtime dominates the peak.  The runtime
 allocates one global-scratch slice per *program* of a launch (0.1-0.5 MiB at
@@ -349,6 +355,107 @@ def chunk_gla_fwd_o_kernel(
     tl.store(o + base_v + o_t[:, None] * (H * V) + o_v[None, :], b_o.to(o.dtype.element_ty), mask=m_tv)
 
 
+@triton.jit
+def _chunk_gla_A_panel(
+    q, k, g_cum, scale, T, base_k, i_t, i_p,
+    H: tl.constexpr, K: tl.constexpr, BT: tl.constexpr,
+    BC: tl.constexpr, BK: tl.constexpr,
+):
+    """One causal panel with the same midpoint reference as the standalone A kernel."""
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_r = tl.arange(0, BC)
+    m_t = o_t < T
+    c0 = i_t * BT + i_p * BC
+    o_c = c0 + o_r
+    m_c = o_c < T
+    c_mid = tl.minimum(c0 + BC // 2, T - 1)
+    # Rows above the panel are never needed for these columns; dropping
+    # them from the load also keeps their exponent inside float32.
+    m_q = m_t & (o_t >= c0)
+    b_A = tl.zeros([BT, BC], dtype=tl.float32)
+    for i_k in range(tl.cdiv(K, BK)):
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+        b_ref = tl.load(g_cum + base_k + c_mid * (H * K) + o_k, mask=m_k, other=0.0)
+        b_q = tl.load(q + base_k + o_t[:, None] * (H * K) + o_k[None, :],
+                      mask=m_q[:, None] & m_k[None, :], other=0.0)
+        b_g = tl.load(g_cum + base_k + o_t[:, None] * (H * K) + o_k[None, :],
+                      mask=m_q[:, None] & m_k[None, :], other=0.0)
+        b_qg = b_q.to(tl.float32) * exp2(tl.minimum(b_g - b_ref[None, :], PANEL_LOG_MAX))
+        b_kt = tl.load(k + base_k + o_c[None, :] * (H * K) + o_k[:, None],
+                       mask=m_k[:, None] & m_c[None, :], other=0.0)
+        b_gt = tl.load(g_cum + base_k + o_c[None, :] * (H * K) + o_k[:, None],
+                       mask=m_k[:, None] & m_c[None, :], other=0.0)
+        b_kg = b_kt.to(tl.float32) * exp2(b_ref[:, None] - b_gt)
+        b_A = tl.dot(b_qg, b_kg, b_A)
+    b_A = tl.where(o_t[:, None] >= o_c[None, :], b_A * scale, 0.0)
+    return b_A
+
+
+@triton.jit(do_not_specialize=["T", "NT", "I_T_LO"])
+def chunk_gla_fwd_Ao_kernel(
+    q, k, v, g_cum, h, A, o, scale, T, NT, I_T_LO,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, BC: tl.constexpr, BKA: tl.constexpr,
+    BK: tl.constexpr, BV: tl.constexpr,
+    SAVE_A: tl.constexpr, STATE_V_FIRST: tl.constexpr,
+):
+    """Build each A panel and consume it immediately in the output projection.
+
+    Training also stores A for backward dv. Inference keeps A entirely on-chip.
+    One value tile covers V, so the panel computation is not duplicated.
+    """
+    i_t = tl.program_id(0) + I_T_LO
+    i_bh = tl.program_id(1).to(tl.int64)
+    i_b, i_h = i_bh // H, i_bh % H
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_v = tl.arange(0, BV)
+    m_t = o_t < T
+    m_v = o_v < V
+    m_tv = m_t[:, None] & m_v[None, :]
+    base_k = i_b * T * H * K + i_h * K
+    base_q = base_k
+    base_v = i_b * T * H * V + i_h * V
+    o_h = ((i_b * NT + i_t) * H + i_h) * K * V
+
+    b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    for i_k in range(tl.cdiv(K, BK)):
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+        m_tk = m_t[:, None] & m_k[None, :]
+        b_q = tl.load(q + base_q + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0)
+        b_g = tl.load(g_cum + base_q + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0)
+        # Fold the scale into the operand: the accumulator stays untouched.
+        b_qg = b_q * exp2(b_g) * scale
+        if STATE_V_FIRST:
+            b_h = tl.load(h + o_h + o_v[:, None].to(tl.int64) * K + o_k[None, :],
+                          mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+            b_o = tl.dot(b_qg, tl.trans(b_h), b_o)
+        else:
+            b_h = tl.load(h + o_h + o_k[:, None].to(tl.int64) * V + o_v[None, :],
+                          mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+            b_o = tl.dot(b_qg, b_h, b_o)
+
+
+    for i_p in range(BT // BC):
+        b_A = _chunk_gla_A_panel(q, k, g_cum, scale, T, base_k, i_t, i_p, H, K, BT, BC, BKA)
+        o_c = i_t * BT + i_p * BC + tl.arange(0, BC)
+        if SAVE_A:
+            p_A = A + (i_b * T + o_t)[:, None] * (H * BT) + i_h * BT + (o_c - i_t * BT)[None, :]
+            tl.store(p_A, b_A, mask=m_t[:, None])
+        b_v = tl.load(v + base_v + o_c[:, None] * (H * V) + o_v[None, :],
+                      mask=(o_c[:, None] < T) & m_v[None, :], other=0.0)
+        b_o = tl.dot(b_A, b_v.to(tl.float32), b_o)
+    tl.store(o + base_v + o_t[:, None] * (H * V) + o_v[None, :], b_o.to(o.dtype.element_ty), mask=m_tv)
+
+
+def _use_fused_output(K: int, V: int, T: int, bt: int = BT) -> bool:
+    # The measured win uses one 128-wide value tile and a 128-wide A dot.
+    # Wider values would duplicate A or increase live storage; short inputs
+    # retain the standalone kernels until their launch/compute tradeoff is measured.
+    return K == V == 128 and T >= 1024 and bt == BT
+
+
 def chunk_gla_fwd_chunked(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -371,7 +478,9 @@ def chunk_gla_fwd_chunked(
     ``state_v_first``).  Returns ``(o, ht)`` where ``ht`` is the float32 final
     state (``None`` unless ``output_final_state``).  With
     ``return_intermediates=True`` a third element ``dict`` carries ``g_cum``
-    and ``A`` (float32) and ``h`` (input dtype).
+    and ``A`` (float32) and ``h`` (input dtype). For K=V=128, T>=1024 and 64-token chunks,
+    A is fused into the output kernel and is only stored when intermediates
+    are requested for backward.
 
     Variable-length inputs are not supported yet: ``cu_seqlens`` (and the
     ``cu_seqlens_cpu`` twin kept for API compatibility) must be ``None``.
@@ -403,7 +512,10 @@ def chunk_gla_fwd_chunked(
     # the input dtype; the kernels upcast them before the float32 dots.
     h = torch.empty((B, nt, H, *state_shape), device=q.device, dtype=q.dtype)
     g_cum = torch.empty((B, T, H, K), device=q.device, dtype=torch.float32)
-    A = torch.empty((B, T, H, bt), device=q.device, dtype=torch.float32)
+    fused_output = _use_fused_output(K, V, T, bt)
+    A = None
+    if not fused_output or return_intermediates:
+        A = torch.empty((B, T, H, bt), device=q.device, dtype=torch.float32)
     o = torch.empty_like(v)
     ht = None
     if output_final_state:
@@ -440,46 +552,56 @@ def chunk_gla_fwd_chunked(
         STATE_V_FIRST=state_v_first,
     )
 
-    cpb = _chunks_per_launch(nt * B * H, nt, FIXED_MAX_PROGRAMS)
-    for i_lo in range(0, nt, cpb):
-        chunk_gla_fwd_A_kernel[(min(cpb, nt - i_lo), B * H)](
-            q=q,
-            k=k,
-            g_cum=g_cum,
-            A=A,
-            scale=scale,
-            T=T,
-            I_T_LO=i_lo,
-            H=H,
-            K=K,
-            BT=bt,
-            BC=BC,
-            BK=bkw,
-        )
+    if fused_output:
+        cpb = _chunks_per_launch(nt * B * H, nt, FIXED_MAX_PROGRAMS)
+        for i_lo in range(0, nt, cpb):
+            chunk_gla_fwd_Ao_kernel[(min(cpb, nt - i_lo), B * H)](
+                q=q, k=k, v=v, g_cum=g_cum, h=h, A=A, o=o,
+                scale=scale, T=T, NT=nt, I_T_LO=i_lo,
+                H=H, K=K, V=V, BT=bt, BC=BC, BKA=128, BK=bkc, BV=128,
+                SAVE_A=return_intermediates, STATE_V_FIRST=state_v_first,
+            )
+    else:
+        cpb = _chunks_per_launch(nt * B * H, nt, FIXED_MAX_PROGRAMS)
+        for i_lo in range(0, nt, cpb):
+            chunk_gla_fwd_A_kernel[(min(cpb, nt - i_lo), B * H)](
+                q=q,
+                k=k,
+                g_cum=g_cum,
+                A=A,
+                scale=scale,
+                T=T,
+                I_T_LO=i_lo,
+                H=H,
+                K=K,
+                BT=bt,
+                BC=BC,
+                BK=bkw,
+            )
 
-    bov = min(BV, triton.next_power_of_2(V))
-    n_vo = triton.cdiv(V, bov)
-    cpb = _chunks_per_launch(n_vo * nt * B * H, nt, FIXED_MAX_PROGRAMS)
-    for i_lo in range(0, nt, cpb):
-        chunk_gla_fwd_o_kernel[(n_vo, min(cpb, nt - i_lo), B * H)](
-            q=q,
-            v=v,
-            g_cum=g_cum,
-            h=h,
-            A=A,
-            o=o,
-            scale=scale,
-            T=T,
-            NT=nt,
-            I_T_LO=i_lo,
-            H=H,
-            K=K,
-            V=V,
-            BT=bt,
-            BK=bkc,
-            BV=bov,
-            STATE_V_FIRST=state_v_first,
-        )
+        bov = min(BV, triton.next_power_of_2(V))
+        n_vo = triton.cdiv(V, bov)
+        cpb = _chunks_per_launch(n_vo * nt * B * H, nt, FIXED_MAX_PROGRAMS)
+        for i_lo in range(0, nt, cpb):
+            chunk_gla_fwd_o_kernel[(n_vo, min(cpb, nt - i_lo), B * H)](
+                q=q,
+                v=v,
+                g_cum=g_cum,
+                h=h,
+                A=A,
+                o=o,
+                scale=scale,
+                T=T,
+                NT=nt,
+                I_T_LO=i_lo,
+                H=H,
+                K=K,
+                V=V,
+                BT=bt,
+                BK=bkc,
+                BV=bov,
+                STATE_V_FIRST=state_v_first,
+            )
 
     if return_intermediates:
         return o, ht, {"g_cum": g_cum, "h": h, "A": A}

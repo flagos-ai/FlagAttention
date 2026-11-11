@@ -30,7 +30,7 @@ import os
 
 import torch
 
-from .chunk import MAX_HEAD_DIM, chunk_gla_fwd_chunked
+from .chunk import MAX_HEAD_DIM, _use_fused_output, chunk_gla_fwd_chunked
 from .chunk_bwd import chunk_gla_bwd_chunked
 from .chunk_varlen import chunk_gla_varlen
 from .chunk_varlen_kernel import chunk_gla_varlen_kernel
@@ -120,6 +120,18 @@ def chunk_gla(
         scale = q.shape[-1] ** -0.5
     if _use_chunked(q, v):
         if cu_seqlens is None and cu_seqlens_cpu is None:
+            # Only training needs the saved A matrix used by backward dv.
+            needs_backward = torch.is_grad_enabled() and any(
+                t is not None and t.requires_grad for t in (q, k, v, g, initial_state)
+            )
+            if _use_fused_output(q.shape[-1], v.shape[-1], q.shape[1]) and not needs_backward:
+                return chunk_gla_fwd_chunked(
+                    q.contiguous(), k.contiguous(), v.contiguous(), g.contiguous(),
+                    scale=scale,
+                    initial_state=None if initial_state is None else initial_state.contiguous(),
+                    output_final_state=output_final_state,
+                    state_v_first=state_v_first,
+                )
             return _ChunkGLAFunction.apply(
                 q.contiguous(),
                 k.contiguous(),
