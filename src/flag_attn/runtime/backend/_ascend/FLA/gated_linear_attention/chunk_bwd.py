@@ -357,6 +357,117 @@ def chunk_gla_bwd_dqkg_kernel(
 
 
 @triton.jit(do_not_specialize=["T", "NT", "I_T_LO"])
+def chunk_gla_bwd_dqkg_split_kernel(
+    q,
+    k,
+    v,
+    g_cum,
+    h,
+    dh,
+    do,
+    dq,
+    dk,
+    dg,
+    scale,
+    T,
+    NT,
+    I_T_LO,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
+):
+    """Wider K projection with disjoint state-product, dq, and dk phases.
+
+    Reading h/dh again costs GM traffic but limits live state tiles so BK=128
+    fits. The wider K tile halves program and launch-group counts on the
+    measured large D=128 workloads. Keep the decay reduction at 64 values.
+    """
+    i_k = tl.program_id(0)
+    i_t = tl.program_id(1) + I_T_LO
+    i_bh = tl.program_id(2).to(tl.int64)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_t = i_t * BT + tl.arange(0, BT)
+    m_k = o_k < K
+    m_t = o_t < T
+    m_tk = m_t[:, None] & m_k[None, :]
+
+    base_k = i_b * T * H * K + i_h * K
+    base_v = i_b * T * H * V + i_h * V
+    o_state = ((i_b * NT + i_t) * H + i_h) * K * V
+
+    # State-decay reduction first: its two states expire before either dot.
+    b_dgk = tl.zeros([BK], dtype=tl.float32)
+    for i_v in range(tl.cdiv(V, 64)):
+        o_v = i_v * 64 + tl.arange(0, 64)
+        m_v = o_v < V
+        if STATE_V_FIRST:
+            b_h = tl.load(h + o_state + o_v[:, None].to(tl.int64) * K + o_k[None, :],
+                mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+            b_dh = tl.load(dh + o_state + o_v[:, None].to(tl.int64) * K + o_k[None, :],
+                mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+        else:
+            b_h = tl.load(h + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
+                mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+            b_dh = tl.load(dh + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
+                mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+        b_dgk += tl.sum(b_h * b_dh, axis=0)
+    b_dq = tl.zeros([BT, BK], dtype=tl.float32)
+    for j_v in range(tl.cdiv(V, BV)):
+        v_q = j_v * BV + tl.arange(0, BV)
+        mv_q = v_q < V
+        b_do = tl.load(do + base_v + o_t[:, None] * (H * V) + v_q[None, :],
+            mask=m_t[:, None] & mv_q[None, :], other=0.0).to(tl.float32)
+        if STATE_V_FIRST:
+            h_q = tl.load(h + o_state + v_q[:, None].to(tl.int64) * K + o_k[None, :],
+                mask=mv_q[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+        else:
+            h_q = tl.load(h + o_state + o_k[None, :].to(tl.int64) * V + v_q[:, None],
+                mask=mv_q[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+        b_dq = tl.dot(b_do, h_q, b_dq)
+    b_dk = tl.zeros([BT, BK], dtype=tl.float32)
+    for j_v in range(tl.cdiv(V, BV)):
+        v_k = j_v * BV + tl.arange(0, BV)
+        mv_k = v_k < V
+        b_v = tl.load(v + base_v + o_t[:, None] * (H * V) + v_k[None, :],
+            mask=m_t[:, None] & mv_k[None, :], other=0.0).to(tl.float32)
+        if STATE_V_FIRST:
+            dh_k = tl.load(dh + o_state + v_k[:, None].to(tl.int64) * K + o_k[None, :],
+                mask=mv_k[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+        else:
+            dh_k = tl.load(dh + o_state + o_k[None, :].to(tl.int64) * V + v_k[:, None],
+                mask=mv_k[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+        b_dk = tl.dot(b_v, dh_k, b_dk)
+    last_idx = i_t * BT + BT - 1
+    last_idx = tl.where(last_idx < T, last_idx, T - 1)
+    b_gl = tl.load(g_cum + base_k + last_idx * (H * K) + o_k, mask=m_k, other=0.0)
+    b_g = tl.load(g_cum + base_k + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0)
+    b_q = tl.load(q + base_k + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0)
+    b_k = tl.load(k + base_k + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0)
+    p_dq = dq + base_k + o_t[:, None] * (H * K) + o_k[None, :]
+    p_dk = dk + base_k + o_t[:, None] * (H * K) + o_k[None, :]
+
+    b_dgk = b_dgk * exp2(b_gl)
+    b_dq = b_dq * scale * exp2(b_g) + tl.load(p_dq, mask=m_tk, other=0.0)
+    b_dk = b_dk * exp2(b_gl[None, :] - b_g)
+    # The k_e factor carries g_last; only the inter-chunk term contributes here.
+    b_dgk += tl.sum(b_dk * b_k.to(tl.float32), axis=0)
+    b_dk += tl.load(p_dk, mask=m_tk, other=0.0)
+
+    b_dg = b_q.to(tl.float32) * b_dq - b_k.to(tl.float32) * b_dk
+    b_dg = b_dg - tl.cumsum(b_dg, axis=0) + tl.sum(b_dg, axis=0)[None, :] + b_dgk[None, :]
+
+    tl.store(p_dq, b_dq, mask=m_tk)
+    tl.store(p_dk, b_dk, mask=m_tk)
+    tl.store(dg + base_k + o_t[:, None] * (H * K) + o_k[None, :], b_dg, mask=m_tk)
+
+
+@triton.jit(do_not_specialize=["T", "NT", "I_T_LO"])
 def chunk_gla_bwd_dv_kernel(
     k,
     g_cum,
@@ -533,32 +644,52 @@ def chunk_gla_bwd_chunked(
             BC=BC,
             BK=bkw,
         )
-    cpb_k = _chunks_per_launch(nk * nt * B * H, nt, FIXED_MAX_PROGRAMS)
-    for i_lo in range(0, nt, cpb_k):
-        n = min(cpb_k, nt - i_lo)
-        chunk_gla_bwd_dqkg_kernel[(nk, n, B * H)](
-            q=q,
-            k=k,
-            v=v,
-            g_cum=g_cum,
-            h=h,
-            dh=dh,
-            do=do,
-            dq=dq,
-            dk=dk,
-            dg=dg,
-            scale=scale,
-            T=T,
-            NT=nt,
-            I_T_LO=i_lo,
-            H=H,
-            K=K,
-            V=V,
-            BT=bt,
-            BK=bkc,
-            BV=bv,
-            STATE_V_FIRST=state_v_first,
-        )
+    # The split phases pay off when halving the K grid also removes several
+    # launch groups. FP32 inputs exceed UB with this tile; retain the old path.
+    split_inter = (
+        q.dtype in (torch.float16, torch.bfloat16)
+        and K == V == 128 and bt == 64 and T >= 1024 and nt * B * H >= 1024
+    )
+    if split_inter:
+        inter_bk, inter_bv = 128, 64
+        inter_nk = triton.cdiv(K, inter_bk)
+        cpb_k = _chunks_per_launch(inter_nk * nt * B * H, nt, FIXED_MAX_PROGRAMS)
+        for i_lo in range(0, nt, cpb_k):
+            n = min(cpb_k, nt - i_lo)
+            chunk_gla_bwd_dqkg_split_kernel[(inter_nk, n, B * H)](
+                q=q, k=k, v=v, g_cum=g_cum, h=h, dh=dh, do=do,
+                dq=dq, dk=dk, dg=dg, scale=scale,
+                T=T, NT=nt, I_T_LO=i_lo, H=H, K=K, V=V,
+                BT=bt, BK=inter_bk, BV=inter_bv, STATE_V_FIRST=state_v_first,
+            )
+    else:
+        cpb_k = _chunks_per_launch(nk * nt * B * H, nt, FIXED_MAX_PROGRAMS)
+        for i_lo in range(0, nt, cpb_k):
+            n = min(cpb_k, nt - i_lo)
+            chunk_gla_bwd_dqkg_kernel[(nk, n, B * H)](
+                q=q,
+                k=k,
+                v=v,
+                g_cum=g_cum,
+                h=h,
+                dh=dh,
+                do=do,
+                dq=dq,
+                dk=dk,
+                dg=dg,
+                scale=scale,
+                T=T,
+                NT=nt,
+                I_T_LO=i_lo,
+                H=H,
+                K=K,
+                V=V,
+                BT=bt,
+                BK=bkc,
+                BV=bv,
+                STATE_V_FIRST=state_v_first,
+            )
+
     n_vd = triton.cdiv(V, bvw)
     cpb_v = _chunks_per_launch(n_vd * nt * B * H, nt, FIXED_MAX_PROGRAMS)
     for i_lo in range(0, nt, cpb_v):
