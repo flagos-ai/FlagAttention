@@ -45,8 +45,12 @@ Numerical notes:
   16-token panel already overflows to inf.
 
 For K=V=128, T>=1024 and 64-token chunks, the A and output stages share one
-kernel. Each 16-token panel is consumed immediately by the output dot, keeping
-the same exponent references without a full A tile live in the unified buffer.
+kernel. The cumsum stage marks chunks whose gates stay within 60 log2 units
+of their midpoint reference and have sufficient operand exponent headroom;
+those use one full-width A dot followed by a causal mask. Other chunks consume each 16-token panel immediately, retaining
+the original exponent references for strongly decaying gates. Each path
+writes its output independently to avoid a mixed Cube/Vector output merge
+that CANN 9.1 cannot compile.
 Training still stores A for backward dv; inference avoids that allocation and
 store. Other shapes retain the separate kernels.
 
@@ -81,6 +85,8 @@ BC = 16
 # Cap on the panel exponent, in log2 units.  It keeps rows above the panel
 # finite (their dA / q values are zero) without touching the in-panel factors.
 PANEL_LOG_MAX = tl.constexpr(100.0)
+# Keep both whole-chunk gate factors representable with headroom for operands.
+WIDE_LOG_SPAN_MAX = tl.constexpr(60.0)
 # Launch tiles.  The state scan and the output projection use much wider tiles
 # than the intra-chunk matrix: both amortise redundant k/v (resp. h) loads.
 BK = 64
@@ -146,6 +152,68 @@ def chunk_gla_fwd_cumsum_kernel(
     b_g = tl.load(g + off + o_t[:, None] * (H * K) + o_k[None, :], mask=m, other=0.0)
     b_g = tl.cumsum(b_g.to(tl.float32) * RCP_LN2, axis=0)
     tl.store(g_cum + off + o_t[:, None] * (H * K) + o_k[None, :], b_g, mask=m)
+
+
+@triton.jit
+def _wide_operand_safe(x):
+    """Leave headroom for the gate factors; biased exponents 67/187 encode +/-60."""
+    if x.dtype == tl.float16:
+        magnitude = x.to(tl.uint16, bitcast=True) & 0x7fff
+        return magnitude < 0x7c00
+    elif x.dtype == tl.bfloat16:
+        magnitude = x.to(tl.uint16, bitcast=True) & 0x7fff
+        return (magnitude == 0) | ((magnitude >= (67 << 7)) & (magnitude < (187 << 7)))
+    else:
+        magnitude = x.to(tl.int32, bitcast=True) & 0x7fffffff
+        return (magnitude == 0) | ((magnitude >= (67 << 23)) & (magnitude < (187 << 23)))
+
+
+@triton.jit
+def _wide_block_unsafe(q, k, offsets, mask):
+    b_q = tl.load(q + offsets, mask=mask, other=0.0)
+    b_k = tl.load(k + offsets, mask=mask, other=0.0)
+    unsafe = mask & ~(_wide_operand_safe(b_q) & _wide_operand_safe(b_k))
+    return tl.max(tl.max(unsafe.to(tl.int32), axis=0), axis=0)
+
+
+@triton.jit(do_not_specialize=["T"])
+def chunk_gla_fwd_cumsum_wide_kernel(
+    q, k, g, g_cum, wide_ok, T,
+    H: tl.constexpr, K: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr,
+):
+    """Compute gates and one device-side wide-dot eligibility flag per chunk/head."""
+    i_t = tl.program_id(0)
+    i_bh = tl.program_id(1).to(tl.int64)
+    i_b, i_h = i_bh // H, i_bh % H
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_k = tl.arange(0, BK)
+    m = (o_t[:, None] < T) & (o_k[None, :] < K)
+    off = i_b * T * H * K + i_h * K + o_t[:, None] * (H * K) + o_k[None, :]
+    b_g = tl.load(g + off, mask=m, other=0.0).to(tl.float32)
+    b_g = tl.cumsum(b_g * RCP_LN2, axis=0)
+    tl.store(g_cum + off, b_g, mask=m)
+
+    mid = tl.minimum(BT // 2, T - 1 - i_t * BT)
+    b_ref = tl.sum(tl.where(tl.arange(0, BT)[:, None] == mid, b_g, 0.0), axis=0)
+    span = tl.max(tl.max(tl.where(m, tl.abs(b_g - b_ref[None, :]), 0.0), axis=0), axis=0)
+    p_flag = wide_ok + (i_b * tl.cdiv(T, BT) + i_t) * H + i_h
+    if span <= WIDE_LOG_SPAN_MAX:
+        # fp16 finite values already have sufficient headroom. For bf16/fp32,
+        # nonzero magnitudes must lie in [2^-60, 2^60), so multiplying by
+        # either gate factor cannot overflow or underflow an operand to zero.
+        if q.dtype.element_ty == tl.float32 or k.dtype.element_ty == tl.float32:
+            # Scan fp32 operands in halves so they fit beside the cumsum tile.
+            any_unsafe = tl.full((), 0, tl.int32)
+            for i_k in range(tl.cdiv(K, 64)):
+                cols = i_k * 64 + tl.arange(0, 64)
+                op_mask = (o_t[:, None] < T) & (cols[None, :] < K)
+                offsets = i_b * T * H * K + i_h * K + o_t[:, None] * (H * K) + cols[None, :]
+                any_unsafe = tl.maximum(any_unsafe, _wide_block_unsafe(q, k, offsets, op_mask))
+        else:
+            any_unsafe = _wide_block_unsafe(q, k, off, m)
+        tl.store(p_flag, any_unsafe == 0)
+        return
+    tl.store(p_flag, False)
 
 
 @triton.jit(do_not_specialize=["T", "NT"])
@@ -392,21 +460,120 @@ def _chunk_gla_A_panel(
     return b_A
 
 
-@triton.jit(do_not_specialize=["T", "NT", "I_T_LO"])
-def chunk_gla_fwd_Ao_kernel(
-    q, k, v, g_cum, h, A, o, scale, T, NT, I_T_LO,
-    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
-    BT: tl.constexpr, BC: tl.constexpr, BKA: tl.constexpr,
-    BK: tl.constexpr, BV: tl.constexpr,
-    SAVE_A: tl.constexpr, STATE_V_FIRST: tl.constexpr,
+@triton.jit
+def _chunk_gla_wide_output(
+    q,
+    k,
+    v,
+    g_cum,
+    A,
+    scale,
+    T,
+    i_t,
+    i_bh,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BKA: tl.constexpr,
+    BV: tl.constexpr,
+    SAVE_A: tl.constexpr,
 ):
-    """Build each A panel and consume it immediately in the output projection.
+    """Intra-chunk output under the whole-chunk gate-span guard."""
+    i_b, i_h = i_bh // H, i_bh % H
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_v = tl.arange(0, BV)
+    m_t = o_t < T
+    m_v = o_v < V
+    m_tv = m_t[:, None] & m_v[None, :]
+    base_k = i_b * T * H * K + i_h * K
+    base_v = i_b * T * H * V + i_h * V
 
-    Training also stores A for backward dv. Inference keeps A entirely on-chip.
-    One value tile covers V, so the panel computation is not duplicated.
-    """
-    i_t = tl.program_id(0) + I_T_LO
-    i_bh = tl.program_id(1).to(tl.int64)
+    b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    o_k = tl.arange(0, BKA)
+    mk = o_k < K
+    mt = m_t[:, None] & mk[None, :]
+    b_ref = tl.load(g_cum + base_k + tl.minimum(i_t * BT + BT // 2, T - 1) * (H * K) + o_k, mask=mk, other=0.0)
+    bg = tl.load(g_cum + base_k + o_t[:, None] * (H * K) + o_k[None, :], mask=mt, other=0.0)
+    qq = tl.load(q + base_k + o_t[:, None] * (H * K) + o_k[None, :], mask=mt, other=0.0).to(tl.float32)
+    kk = tl.load(k + base_k + o_t[:, None] * (H * K) + o_k[None, :], mask=mt, other=0.0).to(tl.float32)
+    qg = qq * exp2(bg - b_ref[None, :])
+    kg = kk * exp2(b_ref[None, :] - bg)
+    b_A = tl.dot(qg, tl.trans(kg))
+    rr = tl.arange(0, BT)
+    b_A = tl.where(rr[:, None] >= rr[None, :], b_A * scale, 0.0)
+    if SAVE_A:
+        p_A = A + (i_b * T + o_t)[:, None] * (H * BT) + i_h * BT + rr[None, :]
+        tl.store(p_A, b_A, mask=m_t[:, None])
+    vv = tl.load(v + base_v + o_t[:, None] * (H * V) + o_v[None, :],
+                 mask=m_tv, other=0.0).to(tl.float32)
+    b_o = tl.dot(b_A, vv, b_o)
+    return b_o
+
+
+@triton.jit
+def _chunk_gla_panel_output(
+    q,
+    k,
+    v,
+    g_cum,
+    A,
+    scale,
+    T,
+    i_t,
+    i_bh,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    BKA: tl.constexpr,
+    BV: tl.constexpr,
+    SAVE_A: tl.constexpr,
+):
+    """Intra-chunk output with the original safe column-panel references."""
+    i_b, i_h = i_bh // H, i_bh % H
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_v = tl.arange(0, BV)
+    m_t = o_t < T
+    m_v = o_v < V
+    m_tv = m_t[:, None] & m_v[None, :]
+    base_k = i_b * T * H * K + i_h * K
+    base_v = i_b * T * H * V + i_h * V
+
+    b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    for i_p in range(BT // BC):
+        b_A = _chunk_gla_A_panel(q, k, g_cum, scale, T, base_k, i_t, i_p, H, K, BT, BC, BKA)
+        o_c = i_t * BT + i_p * BC + tl.arange(0, BC)
+        if SAVE_A:
+            p_A = A + (i_b * T + o_t)[:, None] * (H * BT) + i_h * BT + (o_c - i_t * BT)[None, :]
+            tl.store(p_A, b_A, mask=m_t[:, None])
+        b_v = tl.load(v + base_v + o_c[:, None] * (H * V) + o_v[None, :],
+                      mask=(o_c[:, None] < T) & m_v[None, :], other=0.0)
+        b_o = tl.dot(b_A, b_v.to(tl.float32), b_o)
+    return b_o
+
+
+@triton.jit
+def _chunk_gla_inter_output(
+    b_o,
+    q,
+    g_cum,
+    h,
+    scale,
+    T,
+    NT,
+    i_t,
+    i_bh,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
+):
+    """Add the inter-chunk state projection to the local output."""
     i_b, i_h = i_bh // H, i_bh % H
     o_t = i_t * BT + tl.arange(0, BT)
     o_v = tl.arange(0, BV)
@@ -418,7 +585,6 @@ def chunk_gla_fwd_Ao_kernel(
     base_v = i_b * T * H * V + i_h * V
     o_h = ((i_b * NT + i_t) * H + i_h) * K * V
 
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
@@ -437,15 +603,53 @@ def chunk_gla_fwd_Ao_kernel(
             b_o = tl.dot(b_qg, b_h, b_o)
 
 
-    for i_p in range(BT // BC):
-        b_A = _chunk_gla_A_panel(q, k, g_cum, scale, T, base_k, i_t, i_p, H, K, BT, BC, BKA)
-        o_c = i_t * BT + i_p * BC + tl.arange(0, BC)
-        if SAVE_A:
-            p_A = A + (i_b * T + o_t)[:, None] * (H * BT) + i_h * BT + (o_c - i_t * BT)[None, :]
-            tl.store(p_A, b_A, mask=m_t[:, None])
-        b_v = tl.load(v + base_v + o_c[:, None] * (H * V) + o_v[None, :],
-                      mask=(o_c[:, None] < T) & m_v[None, :], other=0.0)
-        b_o = tl.dot(b_A, b_v.to(tl.float32), b_o)
+    return b_o
+
+
+@triton.jit(do_not_specialize=["T", "NT", "I_T_LO"])
+def chunk_gla_fwd_Ao_kernel(
+    q, k, v, g_cum, h, A, o, wide_ok, scale, T, NT, I_T_LO,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, BC: tl.constexpr, BKA: tl.constexpr,
+    BK: tl.constexpr, BV: tl.constexpr,
+    SAVE_A: tl.constexpr, STATE_V_FIRST: tl.constexpr,
+):
+    """Dispatch safe chunks to a wide dot and retain panels for larger spans.
+
+    Each path ends at its own global store. CANN 9.1 fails to compile the
+    shared-accumulator merge form, so keep the mixed-core output paths
+    independent, including inference without A storage.
+    """
+    i_t = tl.program_id(0) + I_T_LO
+    i_bh = tl.program_id(1).to(tl.int64)
+    i_b, i_h = i_bh // H, i_bh % H
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_v = tl.arange(0, BV)
+    m_t = o_t < T
+    m_v = o_v < V
+    m_tv = m_t[:, None] & m_v[None, :]
+    base_v = i_b * T * H * V + i_h * V
+
+    use_wide = tl.load(wide_ok + (i_b * NT + i_t) * H + i_h)
+    if use_wide:
+        b_o = _chunk_gla_wide_output(
+            q, k, v, g_cum, A, scale, T, i_t, i_bh,
+            H, K, V, BT, BKA, BV, SAVE_A,
+        )
+        b_o = _chunk_gla_inter_output(
+            b_o, q, g_cum, h, scale, T, NT, i_t, i_bh,
+            H, K, V, BT, BK, BV, STATE_V_FIRST,
+        )
+        tl.store(o + base_v + o_t[:, None] * (H * V) + o_v[None, :], b_o.to(o.dtype.element_ty), mask=m_tv)
+        return
+    b_o = _chunk_gla_panel_output(
+        q, k, v, g_cum, A, scale, T, i_t, i_bh,
+        H, K, V, BT, BC, BKA, BV, SAVE_A,
+    )
+    b_o = _chunk_gla_inter_output(
+        b_o, q, g_cum, h, scale, T, NT, i_t, i_bh,
+        H, K, V, BT, BK, BV, STATE_V_FIRST,
+    )
     tl.store(o + base_v + o_t[:, None] * (H * V) + o_v[None, :], b_o.to(o.dtype.element_ty), mask=m_tv)
 
 
@@ -513,6 +717,7 @@ def chunk_gla_fwd_chunked(
     h = torch.empty((B, nt, H, *state_shape), device=q.device, dtype=q.dtype)
     g_cum = torch.empty((B, T, H, K), device=q.device, dtype=torch.float32)
     fused_output = _use_fused_output(K, V, T, bt)
+    wide_ok = torch.empty((B, nt, H), device=q.device, dtype=torch.bool) if fused_output else None
     A = None
     if not fused_output or return_intermediates:
         A = torch.empty((B, T, H, bt), device=q.device, dtype=torch.float32)
@@ -521,15 +726,22 @@ def chunk_gla_fwd_chunked(
     if output_final_state:
         ht = torch.empty((B, H, *state_shape), device=q.device, dtype=torch.float32)
 
-    chunk_gla_fwd_cumsum_kernel[(nt, triton.cdiv(K, bkw), B * H)](
-        g=g,
-        g_cum=g_cum,
-        T=T,
-        H=H,
-        K=K,
-        BT=bt,
-        BK=bkw,
-    )
+    if fused_output:
+        chunk_gla_fwd_cumsum_wide_kernel[(nt, B * H)](
+            q=q, k=k, g=g, g_cum=g_cum, wide_ok=wide_ok, T=T,
+            H=H, K=K, BT=bt, BK=bkw,
+        )
+    else:
+        chunk_gla_fwd_cumsum_kernel[(nt, triton.cdiv(K, bkw), B * H)](
+            g=g,
+            g_cum=g_cum,
+            T=T,
+            H=H,
+            K=K,
+            BT=bt,
+            BK=bkw,
+        )
+
 
     bk, bv = _state_tiles(K, V)
     chunk_gla_fwd_h_kernel[(triton.cdiv(K, bk), triton.cdiv(V, bv), B * H)](
@@ -556,7 +768,7 @@ def chunk_gla_fwd_chunked(
         cpb = _chunks_per_launch(nt * B * H, nt, FIXED_MAX_PROGRAMS)
         for i_lo in range(0, nt, cpb):
             chunk_gla_fwd_Ao_kernel[(min(cpb, nt - i_lo), B * H)](
-                q=q, k=k, v=v, g_cum=g_cum, h=h, A=A, o=o,
+                q=q, k=k, v=v, g_cum=g_cum, h=h, A=A, o=o, wide_ok=wide_ok,
                 scale=scale, T=T, NT=nt, I_T_LO=i_lo,
                 H=H, K=K, V=V, BT=bt, BC=BC, BKA=128, BK=bkc, BV=128,
                 SAVE_A=return_intermediates, STATE_V_FIRST=state_v_first,
