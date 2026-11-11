@@ -52,6 +52,8 @@ the state tile), so no host-side transpose or extra copy is made.  Variable
 length inputs keep using the recurrent implementation.
 """
 
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
@@ -64,6 +66,16 @@ BWD_BV = 128
 BWD_BK = 64
 BWD_BK_W = 128
 BWD_BV_W = 256
+
+
+@lru_cache(maxsize=1)
+def _raw_intra_launcher():
+    # Load lazily so builds without TLE Raw retain the existing kernels.
+    try:
+        from .chunk_bwd_raw import launch_dqk_intra
+    except ImportError:
+        return None
+    return launch_dqk_intra
 
 
 @triton.jit(do_not_specialize=["T", "NT"])
@@ -626,24 +638,31 @@ def chunk_gla_bwd_chunked(
             BT=bt,
             BV=bv,
         )
-    cpb_kw = _chunks_per_launch(nkw * nt * B * H, nt, FIXED_MAX_PROGRAMS)
-    for i_lo in range(0, nt, cpb_kw):
-        n = min(cpb_kw, nt - i_lo)
-        chunk_gla_bwd_dqk_intra_kernel[(nkw, n, B * H)](
-            q=q,
-            k=k,
-            g_cum=g_cum,
-            dA=dA,
-            dq=dq,
-            dk=dk,
-            T=T,
-            I_T_LO=i_lo,
-            H=H,
-            K=K,
-            BT=bt,
-            BC=BC,
-            BK=bkw,
-        )
+    raw_intra = None
+    if (q.dtype in (torch.float16, torch.bfloat16) and K == V == 128
+            and bt == 64 and T >= 1024 and nt * B * H >= 1024):
+        raw_intra = _raw_intra_launcher()
+    if raw_intra is not None:
+        raw_intra(q, k, g_cum, dA, dq, dk)
+    else:
+        cpb_kw = _chunks_per_launch(nkw * nt * B * H, nt, FIXED_MAX_PROGRAMS)
+        for i_lo in range(0, nt, cpb_kw):
+            n = min(cpb_kw, nt - i_lo)
+            chunk_gla_bwd_dqk_intra_kernel[(nkw, n, B * H)](
+                q=q,
+                k=k,
+                g_cum=g_cum,
+                dA=dA,
+                dq=dq,
+                dk=dk,
+                T=T,
+                I_T_LO=i_lo,
+                H=H,
+                K=K,
+                BT=bt,
+                BC=BC,
+                BK=bkw,
+            )
     # The split phases pay off when halving the K grid also removes several
     # launch groups. FP32 inputs exceed UB with this tile; retain the old path.
     split_inter = (
