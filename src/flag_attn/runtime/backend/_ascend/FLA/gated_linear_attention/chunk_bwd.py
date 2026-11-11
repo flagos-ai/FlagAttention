@@ -42,7 +42,7 @@ by the intra kernel and extended by the inter-chunk/dg kernel afterwards.
 The kernels themselves stay one-chunk-per-program: like the forward they are
 launched once per group of chunks (with an ``I_T_LO`` offset) so that the
 per-program launch scratch of the Ascend Triton runtime stays bounded, see
-``chunk.MAX_PROGRAMS``.
+``chunk.FIXED_MAX_PROGRAMS``.
 
 Both state layouts of the forward are supported: ``state_v_first=False`` stores
 ``h``/``dh`` as ``[B, NT, H, K, V]`` and ``state_v_first=True`` as
@@ -56,7 +56,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .chunk import BC, BK, PANEL_LOG_MAX, _chunks_per_launch, _state_tiles, exp2
+from .chunk import BC, BK, FIXED_MAX_PROGRAMS, PANEL_LOG_MAX, _chunks_per_launch, _state_tiles, exp2
 
 # Tile of the V loop in the dv and dq/dk/dg kernels.  Narrower than the forward
 # output tile: the backward stages keep several float32 accumulators live.
@@ -501,7 +501,7 @@ def chunk_gla_bwd_chunked(
     )
     # Each kernel is launched once per group of chunks: the full grid is just
     # split, which bounds the per-program launch scratch of each launch.
-    cpb = _chunks_per_launch(nt * B * H, nt)
+    cpb = _chunks_per_launch(nt * B * H, nt, FIXED_MAX_PROGRAMS)
     for i_lo in range(0, nt, cpb):
         chunk_gla_bwd_dA_kernel[(min(cpb, nt - i_lo), B * H)](
             v=v,
@@ -515,7 +515,7 @@ def chunk_gla_bwd_chunked(
             BT=bt,
             BV=bv,
         )
-    cpb_kw = _chunks_per_launch(nkw * nt * B * H, nt)
+    cpb_kw = _chunks_per_launch(nkw * nt * B * H, nt, FIXED_MAX_PROGRAMS)
     for i_lo in range(0, nt, cpb_kw):
         n = min(cpb_kw, nt - i_lo)
         chunk_gla_bwd_dqk_intra_kernel[(nkw, n, B * H)](
@@ -533,7 +533,7 @@ def chunk_gla_bwd_chunked(
             BC=BC,
             BK=bkw,
         )
-    cpb_k = _chunks_per_launch(nk * nt * B * H, nt)
+    cpb_k = _chunks_per_launch(nk * nt * B * H, nt, FIXED_MAX_PROGRAMS)
     for i_lo in range(0, nt, cpb_k):
         n = min(cpb_k, nt - i_lo)
         chunk_gla_bwd_dqkg_kernel[(nk, n, B * H)](
@@ -560,7 +560,7 @@ def chunk_gla_bwd_chunked(
             STATE_V_FIRST=state_v_first,
         )
     n_vd = triton.cdiv(V, bvw)
-    cpb_v = _chunks_per_launch(n_vd * nt * B * H, nt)
+    cpb_v = _chunks_per_launch(n_vd * nt * B * H, nt, FIXED_MAX_PROGRAMS)
     for i_lo in range(0, nt, cpb_v):
         chunk_gla_bwd_dv_kernel[(n_vd, min(cpb_v, nt - i_lo), B * H)](
             k=k,

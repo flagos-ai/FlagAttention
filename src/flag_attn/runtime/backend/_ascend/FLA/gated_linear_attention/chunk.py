@@ -86,16 +86,22 @@ MAX_HEAD_DIM = 512
 # Cap on the number of programs of one chunk-parallel launch; see the module
 # docstring.  Small problems stay below it and run a single launch.
 MAX_PROGRAMS = 1024
+# Fixed-length launches use a smaller program budget to reduce peak scratch
+# memory. Keep the packed varlen default separate: its short batches are
+# launch-bound.
+FIXED_MAX_PROGRAMS = 512
 
 
-def _chunks_per_launch(programs: int, nt: int) -> int:
+def _chunks_per_launch(programs: int, nt: int, max_programs: int | None = None) -> int:
     """Chunks covered by one launch of a kernel whose full grid is ``programs``.
 
-    A full grid at or below ``MAX_PROGRAMS`` runs as a single launch; wider grids
-    are split into ``ceil(programs / MAX_PROGRAMS)`` launches of contiguous
-    chunks.
+    A full grid at or below the program budget runs as a single launch; wider
+    grids are split into ``ceil(programs / budget)`` groups of contiguous
+    chunks. The default budget is ``MAX_PROGRAMS``; fixed-length callers use
+    ``FIXED_MAX_PROGRAMS`` to reduce launch scratch.
     """
-    groups = max(1, triton.cdiv(programs, MAX_PROGRAMS))
+    budget = MAX_PROGRAMS if max_programs is None else max_programs
+    groups = max(1, triton.cdiv(programs, budget))
     return triton.cdiv(nt, groups)
 
 
@@ -434,7 +440,7 @@ def chunk_gla_fwd_chunked(
         STATE_V_FIRST=state_v_first,
     )
 
-    cpb = _chunks_per_launch(nt * B * H, nt)
+    cpb = _chunks_per_launch(nt * B * H, nt, FIXED_MAX_PROGRAMS)
     for i_lo in range(0, nt, cpb):
         chunk_gla_fwd_A_kernel[(min(cpb, nt - i_lo), B * H)](
             q=q,
@@ -453,7 +459,7 @@ def chunk_gla_fwd_chunked(
 
     bov = min(BV, triton.next_power_of_2(V))
     n_vo = triton.cdiv(V, bov)
-    cpb = _chunks_per_launch(n_vo * nt * B * H, nt)
+    cpb = _chunks_per_launch(n_vo * nt * B * H, nt, FIXED_MAX_PROGRAMS)
     for i_lo in range(0, nt, cpb):
         chunk_gla_fwd_o_kernel[(n_vo, min(cpb, nt - i_lo), B * H)](
             q=q,
