@@ -16,25 +16,32 @@
 
 Fixed-length calls use the chunked forward/backward pair (``chunk.py`` /
 ``chunk_bwd.py``) in either state layout (``state_v_first`` included).  Packed
-variable-length inputs (``cu_seqlens`` with ``B == 1``) use the chunked varlen
-wrapper once the average segment is long enough for its per-segment launch
-overhead to pay off; shorter varlen inputs fall back to the recurrent
-implementation in ``recurrent.py``.  Variable-length inputs with
-``state_v_first`` always use the recurrent implementation, which is the
-numerical reference for both.
+variable-length inputs (``cu_seqlens`` with ``B == 1``) use the packed varlen
+kernels, and everything else (``state_v_first`` with varlen, head dims above the
+chunked limit, unsupported dtypes) falls back to the recurrent implementation
+in ``recurrent.py``, which is the numerical reference for both.
+
+The older host-split varlen wrapper stays available through
+``FLAG_ATTN_GLA_VARLEN_SPLIT=1``: it is slower on short segments but uses the
+BC=16 panel factorisation, so it keeps full accuracy for very steep gates.
 """
+
+import os
 
 import torch
 
 from .chunk import MAX_HEAD_DIM, chunk_gla_fwd_chunked
 from .chunk_bwd import chunk_gla_bwd_chunked
 from .chunk_varlen import chunk_gla_varlen
+from .chunk_varlen_kernel import chunk_gla_varlen_kernel
 from .recurrent import chunk_gla as _recurrent_chunk_gla
 
 _CHUNKED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-# The chunked varlen path splits by segment on the host, so it only beats the
-# single-launch recurrent kernel once a segment averages this many tokens.
-_VARLEN_CHUNKED_MIN_TOKENS = 1024
+# The packed varlen kernels need three forward launches regardless of segment
+# count, so they only win once the packed sequence is long enough; short varlen
+# stays on the single-launch recurrent kernel.
+_VARLEN_KERNEL_MIN_TOKENS = 1024
+_SPLIT_VARLEN = {"1", "true", "on", "yes"}
 
 
 class _ChunkGLAFunction(torch.autograd.Function):
@@ -85,17 +92,6 @@ def _use_chunked(q: torch.Tensor, v: torch.Tensor) -> bool:
     return q.dtype in _CHUNKED_DTYPES and max(q.shape[-1], v.shape[-1]) <= MAX_HEAD_DIM
 
 
-def _varlen_use_chunked(T: int, cu_seqlens, cu_seqlens_cpu) -> bool:
-    """Whether the packed varlen call is long enough for the chunked path."""
-    cu = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
-    try:
-        offsets = cu.tolist()
-    except Exception:
-        return False
-    segments = len(offsets) - 1
-    return segments > 0 and T // segments >= _VARLEN_CHUNKED_MIN_TOKENS
-
-
 def chunk_gla(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -137,9 +133,21 @@ def chunk_gla(
         if (
             not state_v_first
             and q.shape[0] == 1
-            and _varlen_use_chunked(q.shape[1], cu_seqlens, cu_seqlens_cpu)
+            and q.shape[1] >= _VARLEN_KERNEL_MIN_TOKENS
         ):
-            return chunk_gla_varlen(
+            if os.environ.get("FLAG_ATTN_GLA_VARLEN_SPLIT", "0").lower() in _SPLIT_VARLEN:
+                return chunk_gla_varlen(
+                    q,
+                    k,
+                    v,
+                    g,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqlens_cpu=cu_seqlens_cpu,
+                )
+            return chunk_gla_varlen_kernel(
                 q,
                 k,
                 v,
