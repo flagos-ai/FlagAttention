@@ -44,8 +44,12 @@ launched once per group of chunks (with an ``I_T_LO`` offset) so that the
 per-program launch scratch of the Ascend Triton runtime stays bounded, see
 ``chunk.MAX_PROGRAMS``.
 
-Only the fixed-length, ``[K, V]`` state layout is handled here; variable-length
-inputs and ``state_v_first`` keep using the recurrent implementation.
+Both state layouts of the forward are supported: ``state_v_first=False`` stores
+``h``/``dh`` as ``[B, NT, H, K, V]`` and ``state_v_first=True`` as
+``[B, NT, H, V, K]``, together with the matching ``initial_state``/``dht``
+layouts.  The layout is handled inside the kernels (a transposed load/store of
+the state tile), so no host-side transpose or extra copy is made.  Variable
+length inputs keep using the recurrent implementation.
 """
 
 import torch
@@ -81,12 +85,17 @@ def chunk_gla_bwd_dh_kernel(
     BV: tl.constexpr,
     USE_FINAL_STATE_GRADIENT: tl.constexpr,
     STORE_INITIAL_STATE_GRADIENT: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
 ):
     """Reverse inter-chunk state scan.
 
     Mirrors the forward state pass with ``dht`` as the seed: the state gradient
     leaving chunk ``i`` is stored before the update that folds chunk ``i`` in,
     and the value left after the last iteration is ``dh0``.
+
+    ``STATE_V_FIRST`` selects the ``[V, K]`` state layout, exactly as in the
+    forward state kernel: the accumulator stays ``[BK, BV]`` and only the
+    load/store of the ``[K, V]`` tile is transposed.
     """
     i_k = tl.program_id(0)
     i_v = tl.program_id(1)
@@ -101,9 +110,15 @@ def chunk_gla_bwd_dh_kernel(
 
     b_dh = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_FINAL_STATE_GRADIENT:
-        b_dh = tl.load(
-            dht + i_bh * K * V + o_k[:, None].to(tl.int64) * V + o_v[None, :], mask=m_h, other=0.0
-        ).to(tl.float32)
+        p_dht = dht + i_bh * K * V
+        if STATE_V_FIRST:
+            b_dh = tl.trans(
+                tl.load(p_dht + o_v[:, None].to(tl.int64) * K + o_k[None, :],
+                        mask=m_v[:, None] & m_k[None, :], other=0.0)
+            )
+        else:
+            b_dh = tl.load(p_dht + o_k[:, None].to(tl.int64) * V + o_v[None, :], mask=m_h, other=0.0)
+        b_dh = b_dh.to(tl.float32)
 
     base_q = i_b * T * H * K + i_h * K
     base_v = i_b * T * H * V + i_h * V
@@ -114,8 +129,12 @@ def chunk_gla_bwd_dh_kernel(
         m_tv = m_t[:, None] & m_v[None, :]
 
         o_dh = ((i_b * NT + i_t) * H + i_h) * K * V
-        tl.store(dh + o_dh + o_k[:, None].to(tl.int64) * V + o_v[None, :],
-                 b_dh.to(dh.dtype.element_ty), mask=m_h)
+        if STATE_V_FIRST:
+            tl.store(dh + o_dh + o_v[:, None].to(tl.int64) * K + o_k[None, :],
+                     tl.trans(b_dh).to(dh.dtype.element_ty), mask=m_v[:, None] & m_k[None, :])
+        else:
+            tl.store(dh + o_dh + o_k[:, None].to(tl.int64) * V + o_v[None, :],
+                     b_dh.to(dh.dtype.element_ty), mask=m_h)
 
         last_idx = i_t * BT + BT - 1
         last_idx = tl.where(last_idx < T, last_idx, T - 1)
@@ -128,9 +147,12 @@ def chunk_gla_bwd_dh_kernel(
         b_dh = tl.dot(b_q.to(tl.float32) * exp2(b_g) * scale, b_do.to(tl.float32), b_dh)
 
     if STORE_INITIAL_STATE_GRADIENT:
-        tl.store(
-            dh0 + i_bh * K * V + o_k[:, None].to(tl.int64) * V + o_v[None, :], b_dh, mask=m_h
-        )
+        p_dh0 = dh0 + i_bh * K * V
+        if STATE_V_FIRST:
+            tl.store(p_dh0 + o_v[:, None].to(tl.int64) * K + o_k[None, :], tl.trans(b_dh),
+                     mask=m_v[:, None] & m_k[None, :])
+        else:
+            tl.store(p_dh0 + o_k[:, None].to(tl.int64) * V + o_v[None, :], b_dh, mask=m_h)
 
 
 @triton.jit(do_not_specialize=["T", "I_T_LO"])
@@ -256,12 +278,17 @@ def chunk_gla_bwd_dqkg_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
 ):
     """Inter-chunk dq/dk, added on top of the intra passes, plus dg.
 
     ``dq``/``dk`` are read back from the intra kernel, extended with the
     inter-chunk terms and written out final; the ``g_last`` term of ``dg`` only
     uses the inter-chunk ``dk``.
+
+    The state tiles are always materialised as ``[BV, BK]`` so both dots
+    contract on V; ``STATE_V_FIRST`` only changes the addressing (``[V, K]`` is
+    the natural layout of that tile, ``[K, V]`` is read transposed).
     """
     i_k = tl.program_id(0)
     i_t = tl.program_id(1) + I_T_LO
@@ -289,10 +316,17 @@ def chunk_gla_bwd_dqkg_kernel(
         b_do = tl.load(do + base_v + o_t[:, None] * (H * V) + o_v[None, :], mask=m_tv, other=0.0)
         # State tiles are read transposed ([BV, BK]) so both dots contract on V.
         # h/dh are stored in the input dtype; upcast for the float32 dots.
-        b_h = tl.load(h + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
-                      mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
-        b_dh = tl.load(dh + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
-                       mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+        if STATE_V_FIRST:
+            # [V, K] layout: the o_v-major tile is already [BV, BK].
+            b_h = tl.load(h + o_state + o_v[:, None].to(tl.int64) * K + o_k[None, :],
+                          mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+            b_dh = tl.load(dh + o_state + o_v[:, None].to(tl.int64) * K + o_k[None, :],
+                           mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+        else:
+            b_h = tl.load(h + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
+                          mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+            b_dh = tl.load(dh + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
+                           mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
         # dL/dg_last from the state decay: h_next = exp2(g_last) * h.
         b_dgk += tl.sum(b_h * b_dh, axis=0)
         b_dq = tl.dot(b_do.to(tl.float32), b_h, b_dq)
@@ -339,6 +373,7 @@ def chunk_gla_bwd_dv_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
 ):
     """dv = A^T @ do + k_e @ dh."""
     i_v = tl.program_id(0)
@@ -373,8 +408,13 @@ def chunk_gla_bwd_dv_kernel(
         b_gl = tl.load(g_cum + base_k + last_idx * (H * K) + o_k, mask=m_k, other=0.0)
         b_g = tl.load(g_cum + base_k + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0)
         b_k = tl.load(k + base_k + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0)
-        b_dh = tl.load(dh + o_state + o_k[:, None].to(tl.int64) * V + o_v[None, :],
-                       mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+        if STATE_V_FIRST:
+            # [V, K] layout: same [BK, BV] tile, read transposed.
+            b_dh = tl.load(dh + o_state + o_v[None, :].to(tl.int64) * K + o_k[:, None],
+                           mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+        else:
+            b_dh = tl.load(dh + o_state + o_k[:, None].to(tl.int64) * V + o_v[None, :],
+                           mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
         b_dv = tl.dot(b_k.to(tl.float32) * exp2(b_gl[None, :] - b_g), b_dh, b_dv)
 
     tl.store(dv + base_v + o_t[:, None] * (H * V) + o_v[None, :], b_dv, mask=m_tv)
@@ -392,12 +432,15 @@ def chunk_gla_bwd_chunked(
     dht: torch.Tensor | None,
     scale: float,
     initial_state: torch.Tensor | None = None,
+    state_v_first: bool = False,
 ):
     """Chunked GLA backward from the forward intermediates.
 
-    ``h`` is the ``[B, NT, H, K, V]`` state array in the input dtype, ``A`` the
-    fp32 ``[B, T, H, BT]`` intra-chunk matrix and ``g_cum`` the fp32 base-2 gate
-    cumsum, all as returned by ``chunk_gla_fwd_chunked``.  Returns
+    ``h`` is the ``[B, NT, H, K, V]`` state array in the input dtype (``[B, NT,
+    H, V, K]`` when ``state_v_first``, matching the forward), ``A`` the fp32
+    ``[B, T, H, BT]`` intra-chunk matrix and ``g_cum`` the fp32 base-2 gate
+    cumsum, all as returned by ``chunk_gla_fwd_chunked``.  ``initial_state`` and
+    ``dht`` must use the same layout as ``h``'s last two dims.  Returns
     ``(dq, dk, dv, dg, dh0)``: ``dq``/``dk``/``dh0`` in float32, ``dv``/``dg``
     in the input dtype (the caller casts them to it anyway).
     """
@@ -405,8 +448,18 @@ def chunk_gla_bwd_chunked(
     V = v.shape[-1]
     bt = A.shape[-1]
     nt = h.shape[1]
-    assert h.shape == (B, nt, H, K, V), "h must be the forward [B, NT, H, K, V] state array."
+    state_shape = (V, K) if state_v_first else (K, V)
+    state_layout = "V, K" if state_v_first else "K, V"
+    assert tuple(h.shape) == (B, nt, H, *state_shape), (
+        f"h must be the forward [B, NT, H, {state_layout}] state array."
+    )
     assert g_cum.shape == (B, T, H, K), "g_cum must be the forward [B, T, H, K] cumsum."
+    if dht is not None:
+        assert tuple(dht.shape) == (B, H, *state_shape), f"dht must be [B, H, {state_layout}]."
+    if initial_state is not None:
+        assert tuple(initial_state.shape) == (B, H, *state_shape), (
+            f"initial_state must be [B, H, {state_layout}]."
+        )
 
     bkc = min(BWD_BK, triton.next_power_of_2(K))
     bkw = min(BWD_BK_W, triton.next_power_of_2(K))
@@ -444,6 +497,7 @@ def chunk_gla_bwd_chunked(
         BV=bsv,
         USE_FINAL_STATE_GRADIENT=dht is not None,
         STORE_INITIAL_STATE_GRADIENT=dh0 is not None,
+        STATE_V_FIRST=state_v_first,
     )
     # Each kernel is launched once per group of chunks: the full grid is just
     # split, which bounds the per-program launch scratch of each launch.
@@ -503,6 +557,7 @@ def chunk_gla_bwd_chunked(
             BT=bt,
             BK=bkc,
             BV=bv,
+            STATE_V_FIRST=state_v_first,
         )
     n_vd = triton.cdiv(V, bvw)
     cpb_v = _chunks_per_launch(n_vd * nt * B * H, nt)
@@ -523,5 +578,6 @@ def chunk_gla_bwd_chunked(
             BT=bt,
             BK=bkw,
             BV=bvw,
+            STATE_V_FIRST=state_v_first,
         )
     return dq, dk, dv, dg, dh0

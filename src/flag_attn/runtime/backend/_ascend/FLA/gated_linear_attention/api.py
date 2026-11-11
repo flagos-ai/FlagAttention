@@ -14,12 +14,14 @@
 
 """Public ``chunk_gla`` entry point for the Ascend backend.
 
-Fixed-length calls in the default ``[K, V]`` state layout use the chunked
-forward/backward pair (``chunk.py`` / ``chunk_bwd.py``).  Packed variable-length
-inputs (``cu_seqlens`` with ``B == 1``) use the chunked varlen wrapper once the
-average segment is long enough for its per-segment launch overhead to pay off;
-shorter varlen inputs and ``state_v_first`` fall back to the recurrent
-implementation in ``recurrent.py``, which is the numerical reference for both.
+Fixed-length calls use the chunked forward/backward pair (``chunk.py`` /
+``chunk_bwd.py``) in either state layout (``state_v_first`` included).  Packed
+variable-length inputs (``cu_seqlens`` with ``B == 1``) use the chunked varlen
+wrapper once the average segment is long enough for its per-segment launch
+overhead to pay off; shorter varlen inputs fall back to the recurrent
+implementation in ``recurrent.py``.  Variable-length inputs with
+``state_v_first`` always use the recurrent implementation, which is the
+numerical reference for both.
 """
 
 import torch
@@ -39,7 +41,7 @@ class _ChunkGLAFunction(torch.autograd.Function):
     """Autograd wrapper around the chunked forward and backward."""
 
     @staticmethod
-    def forward(ctx, q, k, v, g, scale, initial_state, output_final_state):
+    def forward(ctx, q, k, v, g, scale, initial_state, output_final_state, state_v_first):
         o, ht, aux = chunk_gla_fwd_chunked(
             q,
             k,
@@ -48,10 +50,12 @@ class _ChunkGLAFunction(torch.autograd.Function):
             scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
+            state_v_first=state_v_first,
             return_intermediates=True,
         )
         ctx.save_for_backward(q, k, v, g, initial_state, aux["h"], aux["A"], aux["g_cum"])
         ctx.scale = scale
+        ctx.state_v_first = state_v_first
         return o, ht
 
     @staticmethod
@@ -71,8 +75,9 @@ class _ChunkGLAFunction(torch.autograd.Function):
             None if dht is None else dht.contiguous(),
             ctx.scale,
             initial_state=initial_state,
+            state_v_first=ctx.state_v_first,
         )
-        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), dg.to(g.dtype), None, dh0, None
+        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), dg.to(g.dtype), None, dh0, None, None
 
 
 def _use_chunked(q: torch.Tensor, v: torch.Tensor) -> bool:
@@ -107,8 +112,9 @@ def chunk_gla(
 
     The signature follows flag_attn.FLA.gated_linear_attention.chunk_gla.
     ``g`` is a per-key gate of shape ``[B, T, H, K]``; ``initial_state`` is
-    float32.  ``cu_seqlens`` (variable length) and ``state_v_first`` are served
-    by the recurrent implementation.
+    float32, in the ``[B, H, V, K]`` ``state_v_first`` layout when requested.
+    Variable-length inputs with ``state_v_first`` are served by the recurrent
+    implementation.
     """
     assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
     assert v.shape[:3] == q.shape[:3], "v must share batch, sequence and head dimensions."
@@ -116,7 +122,7 @@ def chunk_gla(
         assert initial_state.dtype == torch.float32, "initial_state must be in float32."
     if scale is None:
         scale = q.shape[-1] ** -0.5
-    if not state_v_first and _use_chunked(q, v):
+    if _use_chunked(q, v):
         if cu_seqlens is None and cu_seqlens_cpu is None:
             return _ChunkGLAFunction.apply(
                 q.contiguous(),
@@ -126,8 +132,13 @@ def chunk_gla(
                 scale,
                 None if initial_state is None else initial_state.contiguous(),
                 output_final_state,
+                state_v_first,
             )
-        if q.shape[0] == 1 and _varlen_use_chunked(q.shape[1], cu_seqlens, cu_seqlens_cpu):
+        if (
+            not state_v_first
+            and q.shape[0] == 1
+            and _varlen_use_chunked(q.shape[1], cu_seqlens, cu_seqlens_cpu)
+        ):
             return chunk_gla_varlen(
                 q,
                 k,
