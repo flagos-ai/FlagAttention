@@ -418,7 +418,7 @@ def _prepare_triton_forward(
     num_key_tiles = key_dim // BLOCK_KEY
     num_value_tiles = value_dim // block_value
     num_tiles = num_key_tiles * num_value_tiles
-    local_g = _chunk_local_cumsum(g.contiguous())
+    local_g = _chunk_local_cumsum(g)
     level_lut = _level_lut(q.device.index or 0)
     partial_shape = (
         batch,
@@ -485,7 +485,7 @@ def _prepare_triton_forward(
                 BK=BLOCK_KEY,
                 BV=block_value,
                 NV=num_value_tiles,
-                    num_warps=merge_warps,
+                num_warps=merge_warps,
                 num_stages=num_stages,
             )
         _inter_fwd_kernel[(num_chunks, batch * heads, num_tiles)](
