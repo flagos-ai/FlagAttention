@@ -22,6 +22,7 @@ from .chunk_bwd import chunk_gla_bwd_dqk_intra_kernel as _panel_kernel
 
 
 _FACTOR_CPP = str(Path(__file__).resolve().with_name("chunk_bwd_raw_factor.cpp"))
+_REDUCE_CPP = str(Path(__file__).resolve().with_name("chunk_bwd_raw_reduce.cpp"))
 
 
 @dialect(name="cann", file=_FACTOR_CPP, extern_func_name="gla_bwd_key_factor",
@@ -34,6 +35,33 @@ def _key_factor(*args, **kwargs):
          pipeline={"core": "vector", "pipe": "PIPE_V"})
 def _query_factor(*args, **kwargs):
     ...
+
+
+@dialect(name="cann", file=_REDUCE_CPP, extern_func_name="gla_bwd_state_product",
+         pipeline={"core": "vector", "pipe": "PIPE_V"})
+def _state_product_call(*args, **kwargs):
+    ...
+
+
+@dialect(name="cann", file=_REDUCE_CPP, extern_func_name="gla_bwd_reverse_sum",
+         pipeline={"core": "vector", "pipe": "PIPE_V"})
+def _reverse_sum_call(*args, **kwargs):
+    ...
+
+
+@triton.jit
+def _state_product(h, dh):
+    tl.static_assert(h.shape[0] == 128 and h.shape[1] == 64)
+    # One vcadd per contiguous V row, with one scalar result per K.
+    _, result = raw.call(_state_product_call, [dh, h, tl.zeros((1, 128), tl.float32)],
+                         output_indices=[1, 2])
+    return tl.sum(result, axis=0)
+
+
+@triton.jit
+def _reverse_sum(x, carry):
+    tl.static_assert(x.shape[0] == 64 and x.shape[1] == 128)
+    return raw.call(_reverse_sum_call, [carry[None, :], x], output_indices=[1])
 
 
 @triton.jit

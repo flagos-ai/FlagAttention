@@ -78,6 +78,15 @@ def _raw_intra_launcher():
     return launch_dqk_intra
 
 
+@lru_cache(maxsize=1)
+def _raw_inter_reductions():
+    try:
+        from .chunk_bwd_raw import _reverse_sum, _state_product
+    except ImportError:
+        return None, None
+    return _state_product, _reverse_sum
+
+
 @triton.jit(do_not_specialize=["T", "NT"])
 def chunk_gla_bwd_dh_kernel(
     q,
@@ -391,6 +400,8 @@ def chunk_gla_bwd_dqkg_split_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
+    STATE_PRODUCT: tl.constexpr = None,
+    REVERSE_SUM: tl.constexpr = None,
 ):
     """Wider K projection with disjoint state-product, dq, and dk phases.
 
@@ -418,17 +429,25 @@ def chunk_gla_bwd_dqkg_split_kernel(
     for i_v in range(tl.cdiv(V, 64)):
         o_v = i_v * 64 + tl.arange(0, 64)
         m_v = o_v < V
-        if STATE_V_FIRST:
-            b_h = tl.load(h + o_state + o_v[:, None].to(tl.int64) * K + o_k[None, :],
-                mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
-            b_dh = tl.load(dh + o_state + o_v[:, None].to(tl.int64) * K + o_k[None, :],
-                mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+        if STATE_PRODUCT is not None and not STATE_V_FIRST:
+            # V is contiguous in [K,V] states; reduce each row directly in UB.
+            b_h = tl.load(h + o_state + o_k[:, None].to(tl.int64) * V + o_v[None, :],
+                          mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+            b_dh = tl.load(dh + o_state + o_k[:, None].to(tl.int64) * V + o_v[None, :],
+                           mask=m_k[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+            b_dgk += STATE_PRODUCT(b_h, b_dh)
         else:
-            b_h = tl.load(h + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
-                mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
-            b_dh = tl.load(dh + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
-                mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
-        b_dgk += tl.sum(b_h * b_dh, axis=0)
+            if STATE_V_FIRST:
+                b_h = tl.load(h + o_state + o_v[:, None].to(tl.int64) * K + o_k[None, :],
+                    mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+                b_dh = tl.load(dh + o_state + o_v[:, None].to(tl.int64) * K + o_k[None, :],
+                    mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+            else:
+                b_h = tl.load(h + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
+                    mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+                b_dh = tl.load(dh + o_state + o_k[None, :].to(tl.int64) * V + o_v[:, None],
+                    mask=m_v[:, None] & m_k[None, :], other=0.0).to(tl.float32)
+            b_dgk += tl.sum(b_h * b_dh, axis=0)
     b_dq = tl.zeros([BT, BK], dtype=tl.float32)
     for j_v in range(tl.cdiv(V, BV)):
         v_q = j_v * BV + tl.arange(0, BV)
@@ -472,7 +491,10 @@ def chunk_gla_bwd_dqkg_split_kernel(
     b_dk += tl.load(p_dk, mask=m_tk, other=0.0)
 
     b_dg = b_q.to(tl.float32) * b_dq - b_k.to(tl.float32) * b_dk
-    b_dg = b_dg - tl.cumsum(b_dg, axis=0) + tl.sum(b_dg, axis=0)[None, :] + b_dgk[None, :]
+    if REVERSE_SUM is None:
+        b_dg = b_dg - tl.cumsum(b_dg, axis=0) + tl.sum(b_dg, axis=0)[None, :] + b_dgk[None, :]
+    else:
+        b_dg = REVERSE_SUM(b_dg, b_dgk)
 
     tl.store(p_dq, b_dq, mask=m_tk)
     tl.store(p_dk, b_dk, mask=m_tk)
@@ -671,6 +693,7 @@ def chunk_gla_bwd_chunked(
     )
     if split_inter:
         inter_bk, inter_bv = 128, 64
+        state_product, reverse_sum = _raw_inter_reductions()
         inter_nk = triton.cdiv(K, inter_bk)
         cpb_k = _chunks_per_launch(inter_nk * nt * B * H, nt, FIXED_MAX_PROGRAMS)
         for i_lo in range(0, nt, cpb_k):
@@ -680,6 +703,7 @@ def chunk_gla_bwd_chunked(
                 dq=dq, dk=dk, dg=dg, scale=scale,
                 T=T, NT=nt, I_T_LO=i_lo, H=H, K=K, V=V,
                 BT=bt, BK=inter_bk, BV=inter_bv, STATE_V_FIRST=state_v_first,
+                STATE_PRODUCT=state_product, REVERSE_SUM=reverse_sum,
             )
     else:
         cpb_k = _chunks_per_launch(nk * nt * B * H, nt, FIXED_MAX_PROGRAMS)
