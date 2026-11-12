@@ -43,9 +43,9 @@ def _state_product_call(*args, **kwargs):
     ...
 
 
-@dialect(name="cann", file=_REDUCE_CPP, extern_func_name="gla_bwd_reverse_sum",
+@dialect(name="cann", file=_REDUCE_CPP, extern_func_name="gla_bwd_reverse_tree",
          pipeline={"core": "vector", "pipe": "PIPE_V"})
-def _reverse_sum_call(*args, **kwargs):
+def _reverse_tree_call(*args, **kwargs):
     ...
 
 
@@ -61,7 +61,7 @@ def _state_product(h, dh):
 @triton.jit
 def _reverse_sum(x, carry):
     tl.static_assert(x.shape[0] == 64 and x.shape[1] == 128)
-    return raw.call(_reverse_sum_call, [carry[None, :], x], output_indices=[1])
+    return raw.call(_reverse_tree_call, [carry[None, :], x], output_indices=[1])
 
 
 @triton.jit
