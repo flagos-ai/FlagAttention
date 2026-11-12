@@ -12,19 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public ``chunk_gla`` entry point for the Ascend backend.
+"""Public Ascend ``chunk_gla`` API and autograd dispatch.
 
-Fixed-length calls use the chunked forward/backward pair (``chunk.py`` /
-``chunk_bwd.py``) in either state layout (``state_v_first`` included).  Packed
-variable-length inputs (``cu_seqlens`` with ``B == 1``) use the packed varlen
-kernels, and everything else (``state_v_first`` with varlen, head dims above the
-chunked limit, unsupported dtypes) falls back to the recurrent implementation
-in ``recurrent.py``, which is the numerical reference for both.
-
-The older host-split varlen wrapper stays available through
-``FLAG_ATTN_GLA_VARLEN_SPLIT=1``: it is slower on short segments but uses the
-BC=16 panel factorisation, so it keeps full accuracy for very steep gates.
-"""
+Fixed-length inputs use chunked kernels in either state layout. Packed varlen
+uses dedicated kernels; short or unsupported calls fall back to recurrent.
+``FLAG_ATTN_GLA_VARLEN_SPLIT=1`` selects the host-split varlen path."""
 
 import os
 
@@ -37,9 +29,7 @@ from .chunk_varlen_kernel import chunk_gla_varlen_kernel
 from .recurrent import chunk_gla as _recurrent_chunk_gla
 
 _CHUNKED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-# The packed varlen kernels need three forward launches regardless of segment
-# count, so they only win once the packed sequence is long enough; short varlen
-# stays on the single-launch recurrent kernel.
+# Use packed kernels for long varlen inputs and recurrent for short inputs.
 _VARLEN_KERNEL_MIN_TOKENS = 1024
 _SPLIT_VARLEN = {"1", "true", "on", "yes"}
 

@@ -12,45 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Chunked GLA backward for the Ascend backend (experimental, correctness first).
+"""Fixed-length chunked GLA backward for Ascend.
 
-The decomposition follows ``fla/ops/gla/chunk.py`` and reuses the forward
-intermediates produced by ``chunk_gla_fwd_chunked`` (``g_cum``, ``h``, ``A``),
-with the same numerical conventions: base-2 cumsummed gates, float32 dots, and
-``BC``-wide column panels for the intra-chunk exponentials.
+Stages: reverse state scan dh, causal dA, intra-chunk dq/dk, inter-chunk
+dq/dk/dg, and dv. The forward supplies log2 gate cumsums, A, and chunk states.
+Gate gradients use inclusive suffix sums of q*dq-k*dk plus state-decay carry.
+Final-state gradients seed dh; the scan also produces initial-state gradients.
+Both state layouts are addressed in-kernel without transpose copies.
 
-With ``h[i]`` the state entering chunk ``i`` and ``dh[i]`` the gradient of the
-state *leaving* chunk ``i`` (so ``dh[NT-1]`` is seeded by ``dht`` and the scan
-tail is ``dh0``):
-
-    dh[i] = exp2(g_last) * dh[i+1] + scale * (q * exp2(g_cum))^T do
-    dv    = A^T @ do + k_e @ dh[i]
-    dA    = tril(do @ v^T) * scale
-    dq    = scale * exp2(g_cum) * (do @ h[i]^T) + dq_intra
-    dk    = exp2(g_last - g_cum) * (v @ dh[i]^T) + dk_intra
-    dg    = reverse_cumsum(q * dq - k * dk) + dL/dg_last
-
-``dg`` uses the usual reverse-cumsum trick: ``g_cum[t]`` is the running sum of
-the gates inside the chunk, so the gradient of gate ``t`` collects every
-``g_cum`` derivative at or after ``t``, plus one term for the ``g_last`` that
-scales the inter-chunk recurrence.
-
-The intra-chunk part is split in two kernels.  ``dq`` is a full-chunk dot, but
-``dk`` of a column panel only covers the rows of that panel, so it is written
-by the intra kernel and extended by the inter-chunk/dg kernel afterwards.
-
-The kernels themselves stay one-chunk-per-program: like the forward they are
-launched once per group of chunks (with an ``I_T_LO`` offset) so that the
-per-program launch scratch of the Ascend Triton runtime stays bounded, see
-``chunk.FIXED_MAX_PROGRAMS``.
-
-Both state layouts of the forward are supported: ``state_v_first=False`` stores
-``h``/``dh`` as ``[B, NT, H, K, V]`` and ``state_v_first=True`` as
-``[B, NT, H, V, K]``, together with the matching ``initial_state``/``dht``
-layouts.  The layout is handled inside the kernels (a transposed load/store of
-the state tile), so no host-side transpose or extra copy is made.  Variable
-length inputs keep using the recurrent implementation.
-"""
+Dots use FP32; stored dh and final dv/dg use their corresponding input dtypes.
+Chunk-parallel launches use the fixed-length program budget to bound scratch.
+Large fp16/bf16 K=V=128 workloads use split state/dq/dk phases and optional
+TLE Raw factors/reductions. Guarded wide intra dots retain a panel fallback;
+Other configurations use panel intra dots and standard state projections.
+Varlen wrappers live separately."""
 
 from functools import lru_cache
 
@@ -403,12 +378,10 @@ def chunk_gla_bwd_dqkg_split_kernel(
     STATE_PRODUCT: tl.constexpr = None,
     REVERSE_SUM: tl.constexpr = None,
 ):
-    """Wider K projection with disjoint state-product, dq, and dk phases.
+    """K projection with separate state-product, dq, and dk phases.
 
-    Reading h/dh again costs GM traffic but limits live state tiles so BK=128
-    fits. The wider K tile halves program and launch-group counts on the
-    measured large D=128 workloads. Keep the decay reduction at 64 values.
-    """
+    Reload h/dh in each phase to limit live state tiles for BK=128.
+    The state-decay reduction uses 64-element value tiles."""
     i_k = tl.program_id(0)
     i_t = tl.program_id(1) + I_T_LO
     i_bh = tl.program_id(2).to(tl.int64)
@@ -685,8 +658,8 @@ def chunk_gla_bwd_chunked(
                 BC=BC,
                 BK=bkw,
             )
-    # The split phases pay off when halving the K grid also removes several
-    # launch groups. FP32 inputs exceed UB with this tile; retain the old path.
+    # Separate phases bound live storage for BK=128/BV=64. FP32 inputs
+    # exceed the UB capacity of this tile and use the standard projection.
     split_inter = (
         q.dtype in (torch.float16, torch.bfloat16)
         and K == V == 128 and bt == 64 and T >= 1024 and nt * B * H >= 1024

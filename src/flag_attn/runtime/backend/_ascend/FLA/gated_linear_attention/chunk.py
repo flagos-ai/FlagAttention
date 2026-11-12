@@ -12,74 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Chunked GLA forward for the Ascend backend (experimental, correctness first).
+"""Fixed-length chunked GLA forward for Ascend.
 
-This module only adds a chunked forward; the public ``chunk_gla`` entry point
-in ``api.py`` pairs it with the backward in ``chunk_bwd.py`` for fixed-length
-inputs, and keeps dispatching variable-length inputs to the recurrent
-implementation in ``recurrent.py``.
+Gates are cumsummed in log2 units within each chunk (BT=64). The state scan
+computes h_next = exp2(g_last) * h + (k * exp2(g_last - g_cum))^T @ v;
+output combines the incoming state projection with causal A @ v.
+Dots and running states use FP32; stored chunk states use the input dtype.
+Both [K,V] and state_v_first [V,K] state layouts are supported.
 
-The formulation follows ``fla/ops/gla/chunk.py``.  With per-chunk gates
-cumsummed in base 2 (``g_cum``, float32) and ``BT`` tokens per chunk:
+Intra-chunk A normally uses BC=16 panels with midpoint exponent references
+and a capped query factor to limit overflow under strong gate decay.
+For K=V=128 and T>=1024, A and output are fused. Chunks with midpoint gate
+span <=60 log2 units and sufficient q/k exponent headroom use a full-width
+dot; others consume panels immediately. Each branch stores independently
+to avoid a CANN 9.1 mixed-core accumulator-merge compilation failure.
+Training saves A for backward dv; fused inference omits its allocation.
 
-    k_e   = k * exp2(g_last - g_cum)
-    h_i   = exp2(g_last) * h_{i-1} + k_e^T v_i          (sequential over chunks)
-    A     = scale * q @ k^T * exp2(g_i - g_j), j <= i    (intra chunk, causal)
-    o     = scale * (q * exp2(g_cum)) @ h_{i-1} + A @ v
-
-Numerical notes:
-* every ``tl.dot`` runs in float32 (exact on this target and, at these tile
-  sizes, faster than casting the operands down) and the running state stays in
-  float32 registers.  Both match what the FLA Ascend backend does to keep the
-  recurrence stable;
-* the *stored* inter-chunk states ``h`` are the largest intermediate of the
-  chunked path: ``[B, NT, H, K, V]``, O(T * K * V / BT) elements.  They are
-  therefore kept in the input dtype (bf16/fp16) instead of float32 and only
-  upcast when loaded, which halves that array at no measurable cost;
-* ``A`` is built in ``BC``-wide column panels: the panel midpoint is the
-  exponent reference for the ``exp2(g_i - g_j)`` factorisation, and the rows
-  above the panel are dropped from the load.  That bounds each exponential to
-  half the decay of a panel instead of the whole chunk, which matters because a
-  64-token reference overflows float32 for strongly decaying gates: the tests
-  reach ``logsigmoid / 0.1``, i.e. ~10 log2 units per token, where a plain
-  16-token panel already overflows to inf.
-
-For K=V=128, T>=1024 and 64-token chunks, the A and output stages share one
-kernel. The cumsum stage marks chunks whose gates stay within 60 log2 units
-of their midpoint reference and have sufficient operand exponent headroom;
-those use one full-width A dot followed by a causal mask. Other chunks consume each 16-token panel immediately, retaining
-the original exponent references for strongly decaying gates. Each path
-writes its output independently to avoid a mixed Cube/Vector output merge
-that CANN 9.1 cannot compile.
-Training still stores A for backward dv; inference avoids that allocation and
-store. Other shapes retain the separate kernels.
-
-Memory: besides the dtype of the stored states (see above), the launch
-transient of the Ascend Triton runtime dominates the peak.  The runtime
-allocates one global-scratch slice per *program* of a launch (0.1-0.5 MiB at
-these tile sizes), so a wide launch is far more expensive than its tensors: the
-inter-chunk dq/dk/dg kernel alone reached ~4.3 GiB of scratch at
-B=2,T=2048,H=16,K=V=512.  The chunk-parallel kernels are therefore launched
-once per group of ``_chunks_per_launch`` chunks, carrying the chunk offset
-``I_T_LO``: the grids shrink by that factor while the kernels stay
-one-chunk-per-program, and small problems still run a single full-size launch.
-
-Not implemented here: variable-length inputs (``cu_seqlens``); the backward
-lives in ``chunk_bwd.py``.
-"""
+Chunk-parallel launches are grouped with a 512-program budget to bound
+runtime scratch. The backward lives in chunk_bwd.py; packed and host-split
+varlen paths are dispatched separately by api.py."""
 
 import torch
 import triton
 import triton.language as tl
 
 RCP_LN2 = tl.constexpr(1.4426950216)
-# Chunk size for the inter-chunk state scan, and column-panel width of the
-# intra-chunk attention matrix.  ``BC`` bounds the exponent span of A: splitting
-# exp2(g_i - g_j) as exp2(g_i - ref) * exp2(ref - g_j) around a reference inside
-# the panel lets each factor reach exp2((BC // 2) * |g| * log2 e), which is
-# capped by ``PANEL_LOG_MAX`` below.  The tests go up to
-# ``logsigmoid(rand) / 0.1``, i.e. ~10 log2 units per token: 8 tokens of span
-# stays near 2^80, 16 are already past the float32 range.
+# State-scan chunk size and intra-chunk panel width. Midpoint references
+# limit each gate factor's exponent span; PANEL_LOG_MAX caps the query factor.
 BT = 64
 BC = 16
 # Cap on the panel exponent, in log2 units.  It keeps rows above the panel
@@ -418,7 +377,7 @@ def chunk_gla_fwd_o_kernel(
     b_A = tl.load(A + (i_b * T + o_t)[:, None] * (H * BT) + i_h * BT + tl.arange(0, BT)[None, :],
                   mask=m_t[:, None] & m_s, other=0.0)
     b_v = tl.load(v + base_v + o_t[:, None] * (H * V) + o_v[None, :], mask=m_tv, other=0.0)
-    # float32 dots here are both the accurate and (on this target) the fast path.
+    # Accumulate the intra-chunk projection in float32.
     b_o = tl.dot(tl.where(m_s, b_A, 0.0), b_v.to(tl.float32), b_o)
     tl.store(o + base_v + o_t[:, None] * (H * V) + o_v[None, :], b_o.to(o.dtype.element_ty), mask=m_tv)
 
@@ -531,7 +490,7 @@ def _chunk_gla_panel_output(
     BV: tl.constexpr,
     SAVE_A: tl.constexpr,
 ):
-    """Intra-chunk output with the original safe column-panel references."""
+    """Intra-chunk output with safe column-panel exponent references."""
     i_b, i_h = i_bh // H, i_bh % H
     o_t = i_t * BT + tl.arange(0, BT)
     o_v = tl.arange(0, BV)
@@ -654,9 +613,7 @@ def chunk_gla_fwd_Ao_kernel(
 
 
 def _use_fused_output(K: int, V: int, T: int, bt: int = BT) -> bool:
-    # The measured win uses one 128-wide value tile and a 128-wide A dot.
-    # Wider values would duplicate A or increase live storage; short inputs
-    # retain the standalone kernels until their launch/compute tradeoff is measured.
+    # The fused kernel uses one 128-wide value tile and a 64-token chunk.
     return K == V == 128 and T >= 1024 and bt == BT
 
 

@@ -1,13 +1,8 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Guarded wide intra-chunk gradients with TLE Raw vector gate factors.
-
-Only the fixed 64-token, K=128 tile is supported. The guard runs separately
-from dA: fusing its reductions with that dot makes CANN substantially slower.
-Unsafe chunks retain the original panel mathematics. Their persistent scan
-keeps fallback launch overhead independent of the number of chunk groups.
-"""
+"""TLE Raw factors/reductions for fixed 64-token, K=128 GLA backward tiles.
+Guarded wide intra dots use a persistent panel fallback for unsafe chunks."""
 
 from pathlib import Path
 

@@ -1,18 +1,9 @@
+# This file contains code copied from the flash-linear-attention project.
+# The original source code was licensed under the MIT license and included
+# the following copyright notice:
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
-#
-# Adapted for the FlagAttention Ascend backend from:
-#   fla/ops/gla/fused_recurrent.py
-#   fla/ops/common/fused_recurrent.py
-#
-# The kernels are the plain recurrent formulation of GLA: they carry one
-# [K, V] state per program and need no matrix multiply, which matches the
-# Ascend vector core. Autotuning is disabled; every launch uses a fixed
-# warp count.
 
 import torch
 import triton

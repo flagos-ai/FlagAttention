@@ -12,64 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Variable-length (packed) chunked GLA for the Ascend backend.
+"""Host-split packed variable-length GLA for Ascend.
 
-The packed layout matches ``fla``: ``q/k/v/g`` are ``[1, T, H, *]`` with every
-sequence concatenated along ``T`` and ``cu_seqlens`` (``N + 1`` integers,
-``cu_seqlens[0] == 0``) delimiting them.  ``initial_state``/``ht`` hold one
-state *per sequence*, i.e. ``[N, H, K, V]`` (``[N, H, V, K]`` when
-``state_v_first``), exactly like the recurrent implementation in
-``recurrent.py`` and the generic ``flag_attn.FLA`` ``chunk_gla``.
+Inputs have shape [1,T,H,*], with cu_seqlens delimiting independent sequences
+and one initial/final state per sequence. The host validates boundaries,
+preferring cu_seqlens_cpu to avoid a device-to-host read, then invokes the
+fixed-length chunked forward/backward on contiguous sequence views.
+Each segment chooses its own chunk size, including short and tail chunks.
 
-Algorithm
----------
-Sequences are independent in GLA: nothing (neither the gate cumsum, nor the
-intra-chunk matrix, nor the inter-chunk state scan) crosses a sequence
-boundary.  So the simplest reliable varlen chunked path is a host-side split:
+Forward intermediates are saved per segment; backward does not rerun forward.
+Outputs and gradients are concatenated in sequence order, with no copy for a
+single segment. Empty sequences preserve their state and state gradient.
+The cost grows with segment count through launches and concatenation.
 
-    for i in range(N):
-        s, e = cu_seqlens[i], cu_seqlens[i + 1]
-        o[:, s:e], ht[i] = chunk_gla_fwd_chunked(
-            q[:, s:e], k[:, s:e], v[:, s:e], g[:, s:e],
-            initial_state=initial_state[i:i + 1], ...)
-
-``q[:, s:e]`` is a contiguous view along ``T`` (dims ``[1, L, H, K]``, row
-stride still ``H * K``), so the fixed-length kernels address it correctly and
-no copy of ``q/k/v/g`` is needed.  The per-sequence chunk size is picked by
-``chunk_gla_fwd_chunked`` itself (``min(BT, max(BC, next_power_of_2(L)))``), so
-segments shorter than one chunk (e.g. 15 tokens) use a single short chunk, and
-segment lengths need not be multiples of the chunk size.
-
-The backward is the same split, applied to ``chunk_gla_bwd_chunked``: segments
-do not interact, so nothing accumulates across them and the per-segment ``dq`` /
-``dk`` / ``dv`` / ``dg`` / ``dh0`` are simply packed back in sequence order.
-``h``/``A``/``g_cum`` are kept per segment from the forward (the chunked
-forward computes them unconditionally), so the backward does not need a second
-forward pass.  The whole thing is wrapped in a ``torch.autograd.Function``
-(``chunk_gla_varlen``), but the raw ``chunk_gla_varlen_fwd`` /
-``chunk_gla_varlen_bwd`` pair is exported as well, so ``api.py`` can keep its
-own autograd wrapper if it prefers.
-
-Cost: one launch group per sequence (4 kernels forward, 5 backward) instead of
-one group for the whole batch, plus one device-to-host read of ``cu_seqlens``
-(avoided when ``cu_seqlens_cpu`` is supplied), plus one ``torch.cat`` per
-packed output/gradient tensor (a single segment is returned as-is, with no
-copy).  On the CANN 9.1 test box a bare host-side op costs ~60-120 us and each
-kernel launch ~50 us, so for many *short* sequences this wrapper is slower than
-the single-launch recurrent kernel; the chunked kernels only pay off once the
-sequences are long enough for their parallelism to beat the serial recurrence
-(and then the fixed-length chunked path is the right baseline, not recurrent).
-
-Limitations
------------
-* ``B`` must be 1 (packed layout), as in ``recurrent.py``;
-* ``state_v_first`` is accepted by the forward (the forward kernels support it)
-  but not by the backward: ``chunk_bwd.py`` assumes the ``[K, V]`` layout, so
-  ``chunk_gla_varlen`` refuses it and ``api.py`` should keep sending it to the
-  recurrent implementation;
-* ``cu_seqlens[-1]`` must equal ``T`` (i.e. no padding after the last
-  sequence).
-"""
+api.py selects this path with FLAG_ATTN_GLA_VARLEN_SPLIT=1. It retains the
+fixed-length panel exponent handling for strong gates. The public autograd
+wrapper requires B=1 and the default [K,V] state layout; state_v_first varlen
+calls are dispatched to recurrent. The last boundary must equal T."""
 
 import torch
 
@@ -134,12 +93,7 @@ def _check_inputs(
 
 
 def _pack(parts: list[torch.Tensor], dim: int) -> torch.Tensor:
-    """Concatenate per-segment tensors along ``dim`` (single segment: no copy).
-
-    One ``torch.cat`` per packed tensor instead of one ``copy_`` per segment:
-    on this stack every host-side op costs ~60-120 us, so the dispatch count
-    matters more than the bytes moved.
-    """
+    """Concatenate segments along ``dim``; return a single segment without copying."""
     return parts[0] if len(parts) == 1 else torch.cat(parts, dim=dim)
 
 
@@ -455,7 +409,6 @@ def chunk_gla_varlen(
         None if initial_state is None else initial_state.contiguous(),
         output_final_state,
         chunk_size,
-        # Either boundary tensor fully determines the split; prefer the CPU copy
-        # so the forward does not pay a device-to-host read (~150 us here).
+        # Prefer CPU boundaries to avoid a device-to-host read.
         cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens,
     )

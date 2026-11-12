@@ -12,130 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""True variable-length (packed) chunked GLA for the Ascend backend.
+"""Packed variable-length chunked GLA kernels for Ascend.
 
-One launch group per kernel for the whole packed batch, instead of the host-side
-per-segment split of ``chunk_varlen.py`` (which needs four launches per segment).
-The packed layout, the semantics (one state per sequence), the numerics and the
-``[K, V]`` / ``[V, K]`` state conventions are the same as ``chunk.py`` /
-``chunk_bwd.py``.
+Inputs are [1,T,H,*], with one state per sequence. Kernels read bos/eos from
+cu_seqlens and derive compact state slots by summing preceding chunk counts;
+no host chunk_indices tensor is built. State scans stay within each sequence,
+and empty sequences preserve their initial state and its gradient.
 
-Indexing without host data
---------------------------
-The fixed-length kernels map ``(chunk, head)`` to a grid axis.  For a packed
-batch that mapping needs, per chunk, its sequence and token range.  ``fla``
-materializes a ``[NT, 2]`` ``chunk_indices`` tensor on the host, which needs a
-device-to-host read of ``cu_seqlens`` (``.tolist()``, ~240 us on this stack,
-measured) plus a host-to-device copy of the index tensor (~150-190 us).  Those
-two ops alone cost more than the whole recurrent forward of a short batch, so
-this module avoids them:
+Forward has three kernel stages: gate cumsum, state scan, and fused A/output.
+Backward has four: dh, fused dA/intra dqk, inter dqkg, and dv. A and dA are
+not stored in GM; dv rebuilds A. Grouped launches bound runtime scratch.
+Dots and running states use FP32; stored chunk states use the input dtype.
 
-* the host only uses ``T`` (packed length) and ``N = cu_seqlens.numel() - 1``,
-  both tensor metadata, so no device read happens;
-* the chunk-parallel kernels use the *padded* grid ``(cdiv(T, BT), N * H)`` and
-  a program whose chunk starts at or past its sequence end returns immediately
-  (measured: early-exit programs are ~free on this target, a 32x5 grid costs the
-  same as 1x5);
-* each program reads its own ``bos``/``eos`` from ``cu_seqlens`` (two scalar
-  loads) and derives its chunk id inside the sequence from ``program_id``;
-* the *compact* global chunk slot used to index the per-chunk state array is
-  recovered from ``cu_seqlens`` alone by summing ``cdiv(len_m, BT)`` over the
-  preceding sequences (``_chunk_offset``, a short loop of scalar loads; the
-  sequences are independent, so no host array is needed).  The state array is
-  therefore allocated for ``cdiv(T, BT) + N`` slots -- the exact upper bound of
-  ``sum_n cdiv(len_n, BT)`` -- and not for the ``N * cdiv(T, BT)`` a per-sequence
-  padding would need;
-* the sequential state scan (forward ``h``, backward ``dh``) walks the sequences
-  and then the chunks of each sequence with *runtime* loop bounds read from
-  ``cu_seqlens``, so it does exactly the work of the packed batch and never
-  crosses a sequence boundary.  Its running chunk counter is the same slot the
-  chunk-parallel kernels compute with ``_chunk_offset``.
+Short batches use padded grids and an upper bound on state slots. CPU
+boundaries, when supplied, give exact sizes; otherwise T>=4096 triggers one
+host boundary read. Backward reuses the forward plan without another read.
+Programs outside their sequence return early, though highly uneven batches
+can still create many padded programs.
 
-Zero-length sequences are supported: ``cdiv(0, BT) == 0`` means no chunk is
-attached to them, the scan body never runs and the final state (and its
-gradient) is the initial one.
+Gate factors use a whole-chunk midpoint reference and exponent caps;
+the host-split path uses BC=16 panel references.
 
-The padded grid is the only thing that needs the host read, so it is the only
-thing that pays for it: ``cu_seqlens_cpu`` (when the caller has it) always takes
-precedence and is free, and a long packed batch (``T >= HOST_READ_MIN_TOKENS``,
-4096) reads ``cu_seqlens`` once (~240 us) to get the exact ``max_nt`` instead of
-the ``N``-fold overestimate ``cdiv(T, bt)`` -- measured 2.1x on ``fwd_o`` and
-2.5x on ``bwd_dqkg`` for 4x2048 on 8 heads.  A short batch skips the read
-because there the launch and allocation floor dominates anyway.
-
-Kernel structure (3 launches forward, 5 launches backward)
-----------------------------------------------------------
-Forward, mirroring ``chunk.py`` with the same base-2 gates and float32 dots:
-
-1. ``fwd_cumsum`` (grid ``(cdiv(T, BT), cdiv(K, BK), N * H)``): per-chunk
-   inclusive gate cumsum into one fp32 ``g_cum`` tensor.  The separate kernel is
-   not stylistic: an in-register ``tl.cumsum`` inside the sequential scan costs
-   ~27x the whole scan on this backend (measured 17.5 ms vs 0.64 ms for 4x2048
-   on 8 heads), and the scans need the *last row* of the cumsum anyway, which
-   they load directly instead of reducing.
-2. ``fwd_h`` (grid ``(NK, NV, H)``, sequential over chunks): the state entering
-   each chunk is stored in the input dtype, the final state is written per
-   sequence.
-3. ``fwd_o`` (grid ``(cdiv(T, BT), N * H)``, chunk-parallel): builds the
-   intra-chunk matrix ``A`` and the output
-   ``o = scale * (q * exp2(g_cum)) @ h + A @ v`` in one pass over the head
-   dimension, so ``A`` never reaches global memory.
-
-Backward, mirroring ``chunk_bwd.py``:
-
-1. ``bwd_dh`` (grid ``(NK, NV, H)``, reverse sequential): the state gradient
-   entering each chunk plus the per-sequence ``dh0``.
-2. ``bwd_dqk_intra`` (grid ``(nk, cdiv(T, BT), N * H)``): ``dA = tril(do @ v^T)
-   * scale`` accumulated over the value dimension in registers, then the
-   intra-chunk ``dq``/``dk``.
-3. ``bwd_dqkg`` (grid ``(nk, cdiv(T, BT), N * H)``): the inter-chunk
-   ``dq``/``dk`` from ``h``/``dh``, added on top of the intra values, plus
-   ``dg``.
-4. ``bwd_dv`` (grid ``(nv, cdiv(T, BT), N * H)``): ``dv = A^T @ do + k_e @ dh``,
-   rebuilding ``A`` from ``q``/``k``/``g_cum`` instead of reading it back.
-
-Numerics: the intra-chunk exponentials are factorised against one reference per
-chunk (the midpoint token) instead of the ``BC``-wide panels of ``chunk.py``:
-``exp2(g_i - g_j) = exp2(g_i - ref) * exp2(ref - g_j)``, with both factors
-capped at ``LOG_CAP`` log2 units.  With the reference at the midpoint each
-factor spans at most half a chunk of decay, and the cap only saturates pairs
-whose true ``exp2(g_i - g_j)`` is below ``2 ** -LOG_CAP`` (~1e-30, i.e. zero in
-float32), so the capped product is a lower bound of a vanishing term.  Dropping
-the panel loop is what lets ``A``/``dA`` live in registers: no global matrix, no
-panel re-loads.  For the strongest gate decay of the fixed-length tests
-(``logsigmoid(x) / 0.1``, ~10 log2 units per token) the half-chunk span is
-~320 log2 units, so the cap does engage there; the affected ``A`` entries are
-below 1e-30 and the measured error against the recurrent reference stays at
-1e-4 relative or better on every varlen shape tested.
-
-Everything is float32 internally, the running state stays float32, and the
-stored per-chunk states use the input dtype, exactly like ``chunk.py``.
-
-Known backend workarounds (both reproduced with minimal kernels)
----------------------------------------------------------------
-* two transposed strided state tiles held live in one loop body miscompile as
-  soon as the loop runs more than once (the ``tl.dot`` then reads a clobbered
-  tile while the elementwise product of the *same* two tiles stays exact), so
-  ``bwd_dqkg`` uses three single-state-tile value loops;
-* ``tl.trans`` is only reliable on a tile that an arithmetic op has already
-  materialised, so ``bwd_dqk_intra`` reads ``v`` transposed straight from global
-  memory instead of transposing a loaded tile.
-
-Limitations
------------
-* ``B`` must be 1 (packed layout); ``cu_seqlens[-1]`` should equal ``q.shape[1]``
-  (token positions are clamped to ``T``, so a short last boundary leaves the tail
-  untouched instead of reading out of bounds);
-* the chunk-parallel grids are padded to ``cdiv(T, BT)`` chunks *per sequence*,
-  so a batch with one very long sequence next to many short ones dispatches
-  ``N * cdiv(T, BT) * H`` programs where only ``NT * H`` do work.  The padding is
-  free at the shapes measured here (early-exit programs cost ~nothing), but a
-  batch with hundreds of short sequences beside a very long one would want the
-  compact ``chunk_indices`` grid;
-* the backward only supports the ``[K, V]`` state layout (as in
-  ``chunk_varlen.py``); the forward also accepts ``state_v_first``;
-* ``K, V <= MAX_HEAD_DIM`` (512), as for the fixed-length chunked path.
-"""
+Separate state-dependent value loops avoid state-tile clobbering. Loading v
+in transposed order directly avoids transposing a loaded tile on this backend. K/V<=512; the public autograd entry supports only [K,V]
+state layout, while the low-level forward also accepts state_v_first."""
 
 import torch
 import triton
@@ -173,13 +73,9 @@ LOG_CAP = PANEL_LOG_MAX
 # to the running state; cap the state tile area (elements) so the widest tile
 # combination still fits the 192 KiB unified buffer.
 STATE_AREA = 16384
-# Reading ``cu_seqlens`` on the host costs ~240 us here (one device-to-host
-# sync), which is more than the whole forward of a small packed batch.  The host
-# read is therefore skipped while the packed batch is short, and only long
-# batches pay it: there it buys an exact ``max_nt`` for the chunk grids, whose
-# default (``cdiv(T, bt)``) overestimates every segment by up to a factor of N.
-# The kernels never need the boundaries themselves -- they read ``cu_seqlens``
-# on the device -- so this only sizes the grids and the state arrays.
+# Read host boundaries only for long batches to size grids and state arrays
+# exactly. Short batches use upper bounds without device-to-host synchronization;
+# kernels read their sequence boundaries directly on device.
 HOST_READ_MIN_TOKENS = 4096
 
 
@@ -607,15 +503,10 @@ def chunk_gla_varlen_bwd_dqkg_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
 ):
-    """Inter-chunk ``dq``/``dk`` added on top of the intra pass, plus ``dg``.
+    """Add inter-chunk dq/dk to the intra gradients and compute dg.
 
-    The state enters three separate value loops (``dq`` from ``h``, ``dk`` from
-    ``dh``, the ``dL/dg_last`` product from both): holding two transposed strided
-    state tiles live in one loop body miscompiles on this backend once the loop
-    runs more than once (see the module docstring), while the elementwise
-    product of the same two tiles stays exact.  The extra pass over ``h``/``dh``
-    is cheap next to the saved launch.
-    """
+    Separate value loops keep transposed h/dh tiles out of each other's dot
+    lifetimes, avoiding clobbered operands on this backend."""
     i_k = tl.program_id(0)
     i_t = tl.program_id(1) + I_T_LO
     i_bh = tl.program_id(2)
@@ -824,8 +715,7 @@ def _prepare(
         # Only the CPU copy was supplied: the kernels read cu_seqlens on device.
         cu_seqlens = cu_seqlens_cpu.to(q.device)
     elif not isinstance(cu_seqlens, torch.Tensor):
-        # A plain list of boundaries also works (it is what the forward stores in
-        # its intermediates); this is the only case that pays a host-to-device copy.
+        # Convert list boundaries to a device tensor for kernel indexing.
         cu_seqlens = torch.tensor(list(cu_seqlens), dtype=torch.int32, device=q.device)
     elif cu_seqlens.device != q.device:
         cu_seqlens = cu_seqlens.to(q.device)
@@ -871,9 +761,8 @@ def _prepare(
         nt_upper = max(1, sum((e - s + bt - 1) // bt for s, e in zip(values, values[1:])))
         return cu_seqlens, T, N, H, K, V, bt, max_nt, nt_upper
 
-    # No host read: bound every sequence by the packed length.  Correct for any
-    # split (and free for the short batches this path is for), but it overpads
-    # the grids when the sequences are much shorter than the packed batch.
+    # Bound each sequence by the packed length without reading boundaries
+    # on the host. This pads the grid when segments are shorter than T.
     max_nt = triton.cdiv(T, bt)
     return cu_seqlens, T, N, H, K, V, bt, max_nt, max_nt + N
 
@@ -1149,13 +1038,10 @@ def chunk_gla_varlen_kernel_bwd(
 
 
 def _contiguous(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    """Make the inputs contiguous, without paying a dispatch per tensor.
+    """Return tensors with contiguous packed-row strides.
 
-    ``is_contiguous()`` is a metadata check, so the common case (already
-    contiguous, which is what the public entry point hands over) costs nothing;
-    the kernels address the packed rows with the plain ``H * K`` / ``H * V``
-    strides and therefore do require it.
-    """
+    Already contiguous tensors pass through unchanged; kernels require the
+    H*K and H*V row strides."""
     return tuple(t if t.is_contiguous() else t.contiguous() for t in tensors)
 
 
