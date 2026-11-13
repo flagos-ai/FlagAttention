@@ -25,17 +25,20 @@ import triton
 
 from .kernels import _combine_splits_kernel, _rel_attn_paged_kernel
 
-_BLOCK_M = 64
-_BLOCK_N = 64
+_BLOCK_M = int(os.environ.get("INKLING_FA4_BM", "64"))
+_BLOCK_N = int(os.environ.get("INKLING_FA4_BN", "64"))
+_NUM_WARPS = int(os.environ.get("INKLING_FA4_WARPS", "4"))
+#: Profiling knobs, resolved once: reading the environment on every call cost a
+#: measurable slice of the (small) per-call budget.
+_SPLITS_OVERRIDE = os.environ.get("INKLING_FA4_SPLITS")
+_USE_BIAS = os.environ.get("INKLING_FA4_NO_BIAS") != "1"
 _COMBINE_ROWS = 16
 _MAX_HEAD_DIM = 256
 _MAX_SPLITS = 32
 #: Programs we want in flight (roughly three waves of the 40 AI cores).
-_TARGET_PROGRAMS = 64
+_TARGET_PROGRAMS = 128
 #: ``INKLING_FA4_SPLITS`` overrides the automatic split choice for A/B runs.
 _SPLITS_ENV = "INKLING_FA4_SPLITS"
-#: ``INKLING_FA4_NO_BIAS=1`` drops the relative-bias load: profiling only.
-_NO_BIAS_ENV = "INKLING_FA4_NO_BIAS"
 
 #: Split-KV scratch buffers, kept alive between calls.  Allocating them per call
 #: lets the caching allocator hand the block to the next allocation while the
@@ -48,7 +51,7 @@ _PARTIAL_CACHE_MAX = 16
 
 
 def _partial_buffers(splits, total_q, num_heads, head_dim_v, device):
-    key = (str(device), splits, total_q, num_heads, head_dim_v)
+    key = (device.index, splits, total_q, num_heads, head_dim_v)
     buffers = _PARTIAL_CACHE.get(key)
     if buffers is None:
         if len(_PARTIAL_CACHE) >= _PARTIAL_CACHE_MAX:
@@ -63,13 +66,56 @@ def _partial_buffers(splits, total_q, num_heads, head_dim_v, device):
     return buffers
 
 
-def _choose_splits(num_splits, base_programs, kv_upper, block_n):
+#: Per-call launch decisions keyed by the input geometry.  The benchmark cases are
+#: ~200-900 us per call, of which ~50-60 us was Python: caching the plan keeps the
+#: hot path to a dict lookup plus the stride reads.
+_PLAN_CACHE: dict = {}
+
+
+def _plan(total_q, batch, num_heads, num_kv_heads, head_dim_q, head_dim_v, block_size,
+          rel_extent, max_seqlen_q, num_splits, causal, window_left, window_right,
+          kv_upper):
+    key = (total_q, batch, num_heads, num_kv_heads, head_dim_q, head_dim_v, block_size,
+           rel_extent, max_seqlen_q, num_splits, causal, window_left, window_right,
+           kv_upper)
+    plan = _PLAN_CACHE.get(key)
+    if plan is not None:
+        return plan
+    num_q_blocks = triton.cdiv(max_seqlen_q, _BLOCK_M)
+    base_programs = num_q_blocks * batch * num_heads
+    splits = _choose_splits(num_splits, base_programs, kv_upper, _BLOCK_N, max_seqlen_q)
+    split_kv = splits > 1
+    has_left = window_left is not None and window_left >= 0
+    has_right = window_right is not None and window_right >= 0
+    plan = (
+        splits,
+        split_kv,
+        num_q_blocks,
+        max(16, triton.next_power_of_2(max(head_dim_q, head_dim_v))),
+        has_left,
+        has_right,
+        bool(causal) and kv_upper <= rel_extent,
+    )
+    if len(_PLAN_CACHE) >= 64:
+        _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
+    _PLAN_CACHE[key] = plan
+    return plan
+
+
+#: Long prefill already gives every program plenty of work, and the combine
+#: launch costs more than the extra parallelism buys (measured: long_prefill
+#: 0.45 ms with one split vs 0.54 ms with two), so only short-query shapes split.
+_MAX_SPLIT_QLEN = 64
+
+
+def _choose_splits(num_splits, base_programs, kv_upper, block_n, max_seqlen_q):
     max_splits = max(1, min(_MAX_SPLITS, triton.cdiv(max(kv_upper, 1), block_n)))
-    override = os.environ.get(_SPLITS_ENV)
-    if override:
-        return max(1, min(int(override), max_splits))
+    if _SPLITS_OVERRIDE is not None:
+        return max(1, min(int(_SPLITS_OVERRIDE), max_splits))
     if num_splits > 1:
         return max(1, min(num_splits, max_splits))
+    if max_seqlen_q > _MAX_SPLIT_QLEN:
+        return 1
     want = max(1, _TARGET_PROGRAMS // max(1, base_programs))
     splits = 1
     while splits < want and splits < max_splits:
@@ -89,12 +135,10 @@ def _check(q, key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q, 
         raise ValueError("block_table must have shape [batch, max_num_blocks]")
     if cache_seqlens.ndim != 1 or cu_seqlens_q.ndim != 1:
         raise ValueError("cache_seqlens and cu_seqlens_q must be 1-D")
-    devices = {
-        t.device
-        for t in (q, key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q, rel_logits)
-    }
-    if len(devices) != 1:
-        raise ValueError("all attention inputs must be on the same device")
+    device = q.device
+    for tensor in (key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q, rel_logits):
+        if tensor.device != device:
+            raise ValueError("all attention inputs must be on the same device")
     if q.shape[1] % key_cache.shape[2] != 0:
         raise ValueError("num_heads must be divisible by num_kv_heads")
     if rel_logits.shape != (q.shape[0], q.shape[1], rel_extent):
@@ -152,23 +196,28 @@ def inkling_fa4_rel_attention(
     if max_seqlen_q <= 0:
         raise ValueError("max_seqlen_q must be positive for non-empty q")
 
-    rel_logits = rel_logits.contiguous()
+    if not rel_logits.is_contiguous():
+        rel_logits = rel_logits.contiguous()
     # One query head per program: packing the heads that share a KV head was
     # measured 4-8x slower here, because the per-row head index turns both the Q
-    # tile load and the output store into scalar gathers (measured on
-    # long_prefill 5.58 -> 1.38 ms and sliding_window 2.53 -> 0.50 ms once the
-    # packing was removed).
+    # tile load and the output store into scalar gathers.
     kv_group = num_heads // num_kv_heads
     h_grid = num_heads
-    num_q_blocks = triton.cdiv(max_seqlen_q, _BLOCK_M)
-    base_programs = num_q_blocks * batch_size * h_grid
-    kv_upper = block_table.shape[1] * block_size
-    splits = _choose_splits(num_splits, base_programs, kv_upper, _BLOCK_N)
-    split_kv = splits > 1
-
     window_left, window_right = window_size
-    has_left = window_left is not None and window_left >= 0
-    has_right = window_right is not None and window_right >= 0
+    kv_upper = block_table.shape[1] * block_size
+    (
+        splits,
+        split_kv,
+        num_q_blocks,
+        block_d,
+        has_left,
+        has_right,
+        bias_all_in_range,
+    ) = _plan(
+        total_q, batch_size, num_heads, num_kv_heads, head_dim_q, head_dim_v, block_size,
+        rel_extent, max_seqlen_q, num_splits, bool(causal), window_left, window_right,
+        kv_upper,
+    )
 
     if split_kv:
         partial_out, partial_lse = _partial_buffers(
@@ -182,7 +231,6 @@ def inkling_fa4_rel_attention(
         po_strides = (0, 0, 0, 0)
         pl_strides = (0, 0, 0)
 
-    block_d = max(16, triton.next_power_of_2(max(head_dim_q, head_dim_v)))
     grid = (num_q_blocks, batch_size * h_grid, splits)
     _rel_attn_paged_kernel[grid](
         q,
@@ -223,10 +271,8 @@ def inkling_fa4_rel_attention(
         float(softmax_scale),
         NUM_HEADS=num_heads,
         KV_GROUP=kv_group,
-        USE_BIAS=os.environ.get(_NO_BIAS_ENV) != "1",
-        # When causal masking already guarantees 0 <= q_pos-k_pos and the whole KV
-        # span fits inside rel_extent, the bias index needs no clamp/mask.
-        BIAS_ALL_IN_RANGE=bool(causal) and kv_upper <= rel_extent,
+        USE_BIAS=_USE_BIAS,
+        BIAS_ALL_IN_RANGE=bias_all_in_range,
         HEAD_DIM=head_dim_q,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
@@ -240,7 +286,7 @@ def inkling_fa4_rel_attention(
         WINDOW_RIGHT=window_right if has_right else 0,
         NUM_SPLITS=splits,
         SPLIT_KV=split_kv,
-        num_warps=4,
+        num_warps=_NUM_WARPS,
     )
 
     if split_kv:
