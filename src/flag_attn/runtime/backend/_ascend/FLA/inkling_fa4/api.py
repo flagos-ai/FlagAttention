@@ -25,12 +25,18 @@ import triton
 
 from .kernels import _combine_splits_kernel, _rel_attn_paged_kernel
 
-#: Ascend tile shapes.  Sweeping 16/32/64/128 rows, 64/128/256 keys and 2/4/8 warps
-#: changed the seven benchmark cases by less than 2% (they are latency/launch bound,
-#: not compute bound); 128-key tiles do not fit the 192 KiB UB together with the
-#: fp32 score tile and the bias tile.
+#: Ascend tile shapes.  Two shapes are worth keeping: a 16x128 tile for short-query
+#: (decode-like) shapes, where most rows of a 64-row tile are masked and the wider
+#: KV tile halves the number of loop iterations (decode_8k 827 -> 586 us), and a
+#: 64x64 tile for longer queries, where a 16-row tile would make every program walk
+#: the whole KV window (long_prefill 454 -> 739 us).  Wider than 128 keys does not
+#: fit the 192 KiB UB together with the fp32 score tile.
 _BLOCK_M = 64
 _BLOCK_N = 64
+_SMALL_Q_BLOCK_M = 16
+_SMALL_Q_BLOCK_N = 128
+#: Query length up to which the short-query tile is used.
+_SMALL_Q = 64
 _NUM_WARPS = 4
 #: ``INKLING_FA4_SPLITS`` pins the split-KV count for A/B runs; resolved once because
 #: reading the environment on every call cost a measurable slice of the budget.
@@ -84,9 +90,13 @@ def _plan(total_q, batch, num_heads, num_kv_heads, head_dim_q, head_dim_v, block
     plan = _PLAN_CACHE.get(key)
     if plan is not None:
         return plan
-    num_q_blocks = triton.cdiv(max_seqlen_q, _BLOCK_M)
+    if max_seqlen_q <= _SMALL_Q:
+        block_m, block_n = _SMALL_Q_BLOCK_M, _SMALL_Q_BLOCK_N
+    else:
+        block_m, block_n = _BLOCK_M, _BLOCK_N
+    num_q_blocks = triton.cdiv(max_seqlen_q, block_m)
     base_programs = num_q_blocks * batch * num_heads
-    splits = _choose_splits(num_splits, base_programs, kv_upper, _BLOCK_N, max_seqlen_q)
+    splits = _choose_splits(num_splits, base_programs, kv_upper, block_n, max_seqlen_q)
     split_kv = splits > 1
     has_left = window_left is not None and window_left >= 0
     has_right = window_right is not None and window_right >= 0
@@ -94,6 +104,8 @@ def _plan(total_q, batch, num_heads, num_kv_heads, head_dim_q, head_dim_v, block
         splits,
         split_kv,
         num_q_blocks,
+        block_m,
+        block_n,
         max(16, triton.next_power_of_2(max(head_dim_q, head_dim_v))),
         has_left,
         has_right,
@@ -212,6 +224,8 @@ def inkling_fa4_rel_attention(
         splits,
         split_kv,
         num_q_blocks,
+        block_m,
+        block_n,
         block_d,
         has_left,
         has_right,
@@ -276,8 +290,8 @@ def inkling_fa4_rel_attention(
         KV_GROUP=kv_group,
         BIAS_ALL_IN_RANGE=bias_all_in_range,
         HEAD_DIM=head_dim_q,
-        BLOCK_M=_BLOCK_M,
-        BLOCK_N=_BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         BLOCK_D=block_d,
         REL_EXTENT=rel_extent,
         BLOCK_SIZE=block_size,
