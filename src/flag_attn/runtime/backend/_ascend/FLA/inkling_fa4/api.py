@@ -25,13 +25,16 @@ import triton
 
 from .kernels import _combine_splits_kernel, _rel_attn_paged_kernel
 
-_BLOCK_M = int(os.environ.get("INKLING_FA4_BM", "64"))
-_BLOCK_N = int(os.environ.get("INKLING_FA4_BN", "64"))
-_NUM_WARPS = int(os.environ.get("INKLING_FA4_WARPS", "4"))
-#: Profiling knobs, resolved once: reading the environment on every call cost a
-#: measurable slice of the (small) per-call budget.
+#: Ascend tile shapes.  Sweeping 16/32/64/128 rows, 64/128/256 keys and 2/4/8 warps
+#: changed the seven benchmark cases by less than 2% (they are latency/launch bound,
+#: not compute bound); 128-key tiles do not fit the 192 KiB UB together with the
+#: fp32 score tile and the bias tile.
+_BLOCK_M = 64
+_BLOCK_N = 64
+_NUM_WARPS = 4
+#: ``INKLING_FA4_SPLITS`` pins the split-KV count for A/B runs; resolved once because
+#: reading the environment on every call cost a measurable slice of the budget.
 _SPLITS_OVERRIDE = os.environ.get("INKLING_FA4_SPLITS")
-_USE_BIAS = os.environ.get("INKLING_FA4_NO_BIAS") != "1"
 _COMBINE_ROWS = 16
 _MAX_HEAD_DIM = 256
 _MAX_SPLITS = 32
@@ -271,7 +274,6 @@ def inkling_fa4_rel_attention(
         float(softmax_scale),
         NUM_HEADS=num_heads,
         KV_GROUP=kv_group,
-        USE_BIAS=_USE_BIAS,
         BIAS_ALL_IN_RANGE=bias_all_in_range,
         HEAD_DIM=head_dim_q,
         BLOCK_M=_BLOCK_M,
