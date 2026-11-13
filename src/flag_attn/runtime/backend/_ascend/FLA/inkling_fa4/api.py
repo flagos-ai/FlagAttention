@@ -34,6 +34,8 @@ _MAX_SPLITS = 32
 _TARGET_PROGRAMS = 64
 #: ``INKLING_FA4_SPLITS`` overrides the automatic split choice for A/B runs.
 _SPLITS_ENV = "INKLING_FA4_SPLITS"
+#: ``INKLING_FA4_NO_BIAS=1`` drops the relative-bias load: profiling only.
+_NO_BIAS_ENV = "INKLING_FA4_NO_BIAS"
 
 #: Split-KV scratch buffers, kept alive between calls.  Allocating them per call
 #: lets the caching allocator hand the block to the next allocation while the
@@ -221,6 +223,10 @@ def inkling_fa4_rel_attention(
         float(softmax_scale),
         NUM_HEADS=num_heads,
         KV_GROUP=kv_group,
+        USE_BIAS=os.environ.get(_NO_BIAS_ENV) != "1",
+        # When causal masking already guarantees 0 <= q_pos-k_pos and the whole KV
+        # span fits inside rel_extent, the bias index needs no clamp/mask.
+        BIAS_ALL_IN_RANGE=bool(causal) and kv_upper <= rel_extent,
         HEAD_DIM=head_dim_q,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,

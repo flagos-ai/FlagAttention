@@ -46,6 +46,8 @@ def _rel_attn_paged_kernel(
     softmax_scale,
     NUM_HEADS: tl.constexpr,
     KV_GROUP: tl.constexpr,
+    USE_BIAS: tl.constexpr,
+    BIAS_ALL_IN_RANGE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -117,6 +119,8 @@ def _rel_attn_paged_kernel(
     acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
 
     kv_span = kv_hi - kv_lo
+    # Column offsets of the bias row slice: constant for the whole loop.
+    bias_col = tl.arange(0, BLOCK_N) * stride_rel_d
     for j0 in range(0, kv_span, BLOCK_N):
         j = j0 + tl.arange(0, BLOCK_N)
         k_valid = j < kv_span
@@ -145,20 +149,39 @@ def _rel_attn_paged_kernel(
         )
         scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * softmax_scale
 
-        rel_dist = q_pos[:, None] - n[None, :]
-        in_range = (rel_dist >= 0) & (rel_dist < REL_EXTENT)
-        # Clamp instead of zeroing: a monotone index keeps the address affine so
-        # the load stays vectorised; the mask already drops the out-of-range lanes.
-        safe_idx = tl.minimum(tl.maximum(rel_dist, 0), REL_EXTENT - 1)
-        rel_bias = tl.load(
-            rel_ptr
-            + q_glob[:, None] * stride_rel_t
-            + head[:, None] * stride_rel_h
-            + safe_idx * stride_rel_d,
-            mask=row_valid[:, None] & k_valid[None, :] & in_range,
-            other=0.0,
-        ).to(tl.float32)
-        scores = scores + rel_bias
+        if USE_BIAS:
+            # Relative index of the first column of this tile; the index grows by
+            # one per column, so the whole slice is one contiguous row run and the
+            # per-row base can be hoisted out of the elementwise address math.
+            bias_start = q_pos - ((kv_hi - 1) - j0)
+            bias_row = (
+                rel_ptr
+                + q_glob * stride_rel_t
+                + head * stride_rel_h
+                + bias_start * stride_rel_d
+            )
+            if BIAS_ALL_IN_RANGE:
+                # causal + KV span within rel_extent: every attended key is in
+                # range, so no clamp and no in-range mask are needed at all.
+                rel_bias = tl.load(
+                    bias_row[:, None] + bias_col[None, :],
+                    mask=row_valid[:, None] & k_valid[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                rel_dist = bias_start[:, None] + tl.arange(0, BLOCK_N)[None, :]
+                in_range = (rel_dist >= 0) & (rel_dist < REL_EXTENT)
+                clamp_lo = tl.maximum(rel_dist, 0)
+                safe_idx = tl.minimum(clamp_lo, REL_EXTENT - 1)
+                rel_bias = tl.load(
+                    rel_ptr
+                    + q_glob[:, None] * stride_rel_t
+                    + head[:, None] * stride_rel_h
+                    + safe_idx * stride_rel_d,
+                    mask=row_valid[:, None] & k_valid[None, :] & in_range,
+                    other=0.0,
+                ).to(tl.float32)
+            scores = scores + rel_bias
 
         keep = row_valid[:, None] & k_valid[None, :]
         if CAUSAL:
