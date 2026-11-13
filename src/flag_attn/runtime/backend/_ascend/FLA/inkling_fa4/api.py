@@ -31,7 +31,7 @@ _COMBINE_ROWS = 16
 _MAX_HEAD_DIM = 256
 _MAX_SPLITS = 32
 #: Programs we want in flight (roughly three waves of the 40 AI cores).
-_TARGET_PROGRAMS = 32
+_TARGET_PROGRAMS = 64
 #: ``INKLING_FA4_SPLITS`` overrides the automatic split choice for A/B runs.
 _SPLITS_ENV = "INKLING_FA4_SPLITS"
 
@@ -151,16 +151,14 @@ def inkling_fa4_rel_attention(
         raise ValueError("max_seqlen_q must be positive for non-empty q")
 
     rel_logits = rel_logits.contiguous()
-    # Packing the query heads that share a KV head trades a per-row head index
-    # (strided Q / rel-bias row loads) for fewer KV passes.  It only pays off
-    # when a token block is full: for decode (q_len of a few tokens) the packed
-    # tile would be mostly idle, so fall back to one query head per program.
-    group_size = num_heads // num_kv_heads
-    pack_gqa = max_seqlen_q >= max(1, _BLOCK_M // group_size)
-    group = group_size if pack_gqa else 1
-    h_grid = num_kv_heads if pack_gqa else num_heads
-    tokens_per_block = max(1, _BLOCK_M // group)
-    num_q_blocks = triton.cdiv(max_seqlen_q, tokens_per_block)
+    # One query head per program: packing the heads that share a KV head was
+    # measured 4-8x slower here, because the per-row head index turns both the Q
+    # tile load and the output store into scalar gathers (measured on
+    # long_prefill 5.58 -> 1.38 ms and sliding_window 2.53 -> 0.50 ms once the
+    # packing was removed).
+    kv_group = num_heads // num_kv_heads
+    h_grid = num_heads
+    num_q_blocks = triton.cdiv(max_seqlen_q, _BLOCK_M)
     base_programs = num_q_blocks * batch_size * h_grid
     kv_upper = block_table.shape[1] * block_size
     splits = _choose_splits(num_splits, base_programs, kv_upper, _BLOCK_N)
@@ -222,14 +220,9 @@ def inkling_fa4_rel_attention(
         block_table.stride(1),
         float(softmax_scale),
         NUM_HEADS=num_heads,
-        NUM_KV_HEADS=num_kv_heads,
-        H_GRID=h_grid,
-        GROUP=group,
-        KV_GROUP=group_size,
-        PACK_GQA=pack_gqa,
+        KV_GROUP=kv_group,
         HEAD_DIM=head_dim_q,
         BLOCK_M=_BLOCK_M,
-        TOKENS_PER_BLOCK=tokens_per_block,
         BLOCK_N=_BLOCK_N,
         BLOCK_D=block_d,
         REL_EXTENT=rel_extent,

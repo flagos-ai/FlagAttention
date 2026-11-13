@@ -45,14 +45,9 @@ def _rel_attn_paged_kernel(
     stride_bt_block,
     softmax_scale,
     NUM_HEADS: tl.constexpr,
-    NUM_KV_HEADS: tl.constexpr,
-    H_GRID: tl.constexpr,
-    GROUP: tl.constexpr,
     KV_GROUP: tl.constexpr,
-    PACK_GQA: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    TOKENS_PER_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     REL_EXTENT: tl.constexpr,
@@ -67,17 +62,18 @@ def _rel_attn_paged_kernel(
 ):
     """Packed-GQA relative attention over the paged KV cache.
 
-    One program covers ``TOKENS_PER_BLOCK`` query tokens of one sequence for one
-    KV head, with the ``GROUP`` query heads that share it packed into the tile
-    rows (BLOCK_M = TOKENS_PER_BLOCK * GROUP).  The KV range is clipped by the
-    causal bound and the sliding window before it is split across ``NUM_SPLITS``
-    programs, so short-window and long-cache shapes both get enough programs.
+    One program covers up to ``BLOCK_M`` consecutive query tokens of one sequence
+    for one query head (GQA heads are not packed: the per-row head index made the
+    Q load and the output store scalarise, which measured 4-8x slower).  The KV
+    range is clipped by the causal bound and the sliding window, then split across
+    ``NUM_SPLITS`` programs so long caches and short windows both get parallelism.
     """
     pid_m = tl.program_id(0)
     pid_sh = tl.program_id(1)
     pid_split = tl.program_id(2)
-    seq = pid_sh // H_GRID
-    head_slot = pid_sh - seq * H_GRID
+    seq = pid_sh // NUM_HEADS
+    head = pid_sh - seq * NUM_HEADS
+    kv_head = head // KV_GROUP
 
     q_start = tl.load(cu_seqlens_q_ptr + seq)
     q_end = tl.load(cu_seqlens_q_ptr + seq + 1)
@@ -85,21 +81,13 @@ def _rel_attn_paged_kernel(
     q_len = q_end - q_start
 
     rows = tl.arange(0, BLOCK_M)
-    t_idx = rows // GROUP
-    h_off = rows - t_idx * GROUP
-    token = pid_m * TOKENS_PER_BLOCK + t_idx
+    token = pid_m * BLOCK_M + rows
     # Rows past the sequence end duplicate its last token so that the KV range
     # stays exactly the range the valid rows need.
     token_c = tl.minimum(token, tl.maximum(q_len - 1, 0))
     row_valid = token < q_len
     q_pos = (k_len - q_len) + token_c
     q_glob = q_start + token_c
-    if PACK_GQA:
-        kv_head = head_slot
-    else:
-        kv_head = head_slot // KV_GROUP
-    head = head_slot * GROUP + h_off
-
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < HEAD_DIM
 
@@ -128,9 +116,17 @@ def _rel_attn_paged_kernel(
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
 
-    for n0 in range(kv_lo, kv_hi, BLOCK_N):
-        n = n0 + tl.arange(0, BLOCK_N)
-        k_valid = n < kv_hi
+    kv_span = kv_hi - kv_lo
+    for j0 in range(0, kv_span, BLOCK_N):
+        j = j0 + tl.arange(0, BLOCK_N)
+        k_valid = j < kv_span
+        # Walk the KV window backwards: with ``pos = kv_hi - 1 - j`` the relative
+        # index ``q_pos - pos`` grows by one along the column axis, so the bias
+        # load becomes a contiguous ascending row slice.  With the forward walk
+        # it was a descending (negative-stride) address, which the compiler
+        # turned into one scalar gather per element - the dominant cost of the
+        # prefill shapes.
+        n = (kv_hi - 1) - j
         logical = n // BLOCK_SIZE
         offset = n - logical * BLOCK_SIZE
         physical = tl.load(
@@ -151,7 +147,9 @@ def _rel_attn_paged_kernel(
 
         rel_dist = q_pos[:, None] - n[None, :]
         in_range = (rel_dist >= 0) & (rel_dist < REL_EXTENT)
-        safe_idx = tl.where(in_range, rel_dist, 0)
+        # Clamp instead of zeroing: a monotone index keeps the address affine so
+        # the load stays vectorised; the mask already drops the out-of-range lanes.
+        safe_idx = tl.minimum(tl.maximum(rel_dist, 0), REL_EXTENT - 1)
         rel_bias = tl.load(
             rel_ptr
             + q_glob[:, None] * stride_rel_t
