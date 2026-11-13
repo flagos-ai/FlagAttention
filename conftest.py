@@ -349,6 +349,8 @@ def _normalize_benchmark_detail(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError("benchmark result property must be a mapping")
     detail = {field: value[field] for field in _BENCHMARK_DETAIL_FIELDS[:-1]}
+    if value.get("native_baseline_skip_reason"):
+        detail["native_baseline_skip_reason"] = value["native_baseline_skip_reason"]
     phase = value.get("phase")
     metrics = []
     for source in value["result"]:
@@ -356,7 +358,7 @@ def _normalize_benchmark_detail(value: Any) -> dict[str, Any]:
             raise TypeError("benchmark metric must be a mapping")
         has_local = _has_valid_baseline_speedup(source)
         has_compared = _has_valid_compared_speedup(source)
-        if not has_local and not has_compared:
+        if not has_local and not has_compared and not _has_valid_latency(source):
             continue
         metric = {field: source.get(field) for field in _BENCHMARK_METRIC_FIELDS}
         metric["latency"] = float(metric["latency"])
@@ -382,6 +384,19 @@ def _normalize_benchmark_detail(value: Any) -> dict[str, Any]:
         metrics.append(metric)
     detail["result"] = metrics
     return detail
+
+
+def _has_valid_latency(metric: Mapping[str, Any]) -> bool:
+    if metric.get("error_msg") is not None:
+        return False
+    latency = metric.get("latency")
+    if not isinstance(latency, Real) or isinstance(latency, bool):
+        return False
+    try:
+        latency = float(latency)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(latency) and latency > 0
 
 
 def _has_valid_baseline_speedup(metric: Mapping[str, Any]) -> bool:

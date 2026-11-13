@@ -12,13 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NVIDIA TileLang baseline for Log-Linear Attention forward benchmarks."""
+"""NVIDIA FLA baseline for Log-Linear Attention forward benchmarks."""
 
-import importlib.util
+import importlib
 import math
-import sys
-from functools import lru_cache
-from pathlib import Path
 
 import torch
 
@@ -37,41 +34,21 @@ BENCHMARK_SHAPES = (
     (8, 2048, 32, 256),
     (8, 1024, 8, 64),
 )
-CHUNK_SIZE = 64
-BLOCK_KEY = 64
-
-
-@lru_cache(maxsize=1)
-def _tilelang_provider():
-    path = Path(__file__).resolve().parents[1] / "benchmark" / "log_linear_tilelang_baseline.py"
-    name = "_flag_attn_log_linear_tilelang_baseline"
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(name, None)
-        raise
-    return module
 
 
 def native():
+    """Return FLA's public CUDA implementation when it is installed."""
     global NATIVE_UNAVAILABLE_REASON
     try:
-        provider = _tilelang_provider()
-    except (ImportError, OSError, AttributeError, RuntimeError) as exc:
+        op = importlib.import_module("fla.ops.log_linear_attn").chunk_log_linear_attn
+    except (ImportError, AttributeError) as exc:
         NATIVE_UNAVAILABLE_REASON = str(exc)
         return None
-    if provider.tilelang is None:
-        NATIVE_UNAVAILABLE_REASON = "TileLang is unavailable"
+    if not callable(op):
+        NATIVE_UNAVAILABLE_REASON = "FLA chunk_log_linear_attn is not callable"
         return None
     NATIVE_UNAVAILABLE_REASON = None
-
-    def tilelang_native(runner):
-        return runner()
-
-    return tilelang_native
+    return op
 
 
 def grid():
@@ -88,13 +65,10 @@ def build_inputs(binding, dtype, device):
     g = -0.05 * torch.rand(batch, sequence, heads, device=device, dtype=torch.float32)
     level_scales = torch.sigmoid(
         torch.randn(
-            batch, sequence, heads, levels, device=device, dtype=torch.float32,
+            batch, sequence, heads, levels, device=device, dtype=torch.float32
         )
     ).to(dtype)
-    runner, _, _ = _tilelang_provider()._prepare_tilelang_forward(
-        q, k, v, g, level_scales
-    )
-    return (runner,), {}
+    return (q, k, v, g, level_scales), {}
 
 
 def key_shape(binding):
@@ -104,7 +78,6 @@ def key_shape(binding):
 def config(binding, dtype):
     batch, sequence, heads, dim = binding
     levels = math.ceil(math.log2(sequence)) + 1
-    num_key_tiles = dim // BLOCK_KEY
 
     def tensor(shape, tensor_dtype=dtype):
         return {"shape": shape, "dtype": str(tensor_dtype)}
@@ -112,7 +85,7 @@ def config(binding, dtype):
     return {
         "op": OP_NAME,
         "dtype": str(dtype),
-        "benchmark_scope": "prepared_kernel_forward",
+        "benchmark_scope": "public_api_forward",
         "phase": "forward",
         "dims": dict(zip(("B", "T", "H", "D"), binding)),
         "inputs": {
@@ -121,12 +94,10 @@ def config(binding, dtype):
             "v": tensor([batch, sequence, heads, dim]),
             "g": tensor([batch, sequence, heads], torch.float32),
             "level_scales": tensor([batch, sequence, heads, levels]),
-            "level_lut": tensor([CHUNK_SIZE, CHUNK_SIZE], torch.int32),
-            "prepared_g": tensor([batch, sequence, heads], torch.float32),
         },
         "outputs": {
-            "partial": tensor([batch, sequence, heads, num_key_tiles, dim]),
             "output": tensor([batch, sequence, heads, dim]),
+            "final_state": {"scalar": None},
         },
         "input_seed": 0,
         "mutation": "none",

@@ -214,6 +214,18 @@ def record_benchmark_result(
                         f"on-machine reference missing and NV baseline unmatched "
                         f"({metric['base_miss_reason']})"
                     )
+    if _BASE_DATA is None and any(
+        metric.get("latency_base") is None
+        and metric.get("compared_speedup") is None
+        and isinstance(metric.get("latency"), Real)
+        and not isinstance(metric.get("latency"), bool)
+        and math.isfinite(metric["latency"])
+        and metric["latency"] > 0
+        for metric in metrics
+    ):
+        metadata.setdefault(
+            "native_baseline_skip_reason", "no on-machine or NV baseline available"
+        )
     detail = {
         "level": level,
         "op_name": op_name,
