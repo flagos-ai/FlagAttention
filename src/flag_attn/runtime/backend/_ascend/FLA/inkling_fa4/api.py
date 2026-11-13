@@ -300,7 +300,7 @@ def inkling_fa4_rel_attention(
         WINDOW_LEFT=window_left if has_left else 0,
         HAS_RIGHT=has_right,
         WINDOW_RIGHT=window_right if has_right else 0,
-        NUM_SPLITS=splits,
+        num_splits=splits,
         SPLIT_KV=split_kv,
         num_warps=_NUM_WARPS,
     )
@@ -322,8 +322,8 @@ def inkling_fa4_rel_attention(
             out.stride(1),
             out.stride(2),
             total_rows,
+            splits,
             NUM_HEADS=num_heads,
-            NUM_SPLITS=splits,
             HEAD_DIM=head_dim_v,
             BLOCK_D=block_d,
             ROWS=_COMBINE_ROWS,

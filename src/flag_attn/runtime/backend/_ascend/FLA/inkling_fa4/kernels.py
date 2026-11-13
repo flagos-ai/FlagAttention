@@ -58,7 +58,7 @@ def _rel_attn_paged_kernel(
     WINDOW_LEFT: tl.constexpr,
     HAS_RIGHT: tl.constexpr,
     WINDOW_RIGHT: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
+    num_splits,
     SPLIT_KV: tl.constexpr,
 ):
     """Packed-GQA relative attention over the paged KV cache.
@@ -102,7 +102,7 @@ def _rel_attn_paged_kernel(
     )
 
     if SPLIT_KV:
-        per_split = (k_len + NUM_SPLITS - 1) // NUM_SPLITS
+        per_split = (k_len + num_splits - 1) // num_splits
         kv_lo = pid_split * per_split
         kv_hi = tl.minimum(kv_lo + per_split, k_len)
     else:
@@ -264,8 +264,8 @@ def _combine_splits_kernel(
     stride_out_h,
     stride_out_d,
     total_rows,
+    num_splits,
     NUM_HEADS: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     ROWS: tl.constexpr,
@@ -280,7 +280,7 @@ def _combine_splits_kernel(
     mask_d = offs_d < HEAD_DIM
 
     m_run = tl.full([ROWS], -float("inf"), tl.float32)
-    for s in tl.static_range(NUM_SPLITS):
+    for s in range(0, num_splits):
         m_run = tl.maximum(
             m_run,
             tl.load(
@@ -294,7 +294,7 @@ def _combine_splits_kernel(
         )
     den = tl.zeros([ROWS], tl.float32)
     acc = tl.zeros([ROWS, BLOCK_D], tl.float32)
-    for s in tl.static_range(NUM_SPLITS):
+    for s in range(0, num_splits):
         lse_s = tl.load(
             partial_lse_ptr
             + s * stride_pl_s
