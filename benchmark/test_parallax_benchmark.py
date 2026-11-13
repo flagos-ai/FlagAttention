@@ -30,6 +30,11 @@ import torch
 import triton
 
 from flag_attn.testing import backend as test_backend
+
+try:
+    from benchmark.recording import BenchmarkRecorder
+except ModuleNotFoundError:
+    from recording import BenchmarkRecorder
 try:
     if not test_backend.is_nvidia():
         raise ImportError("external FLA CUDA comparison unavailable")
@@ -769,6 +774,7 @@ def _run_phase_table(
     title: str,
     fla_column: str,
     flag_attn_column: str,
+    record_property=None,
 ) -> None:
     _print_header(
         title=title,
@@ -777,6 +783,13 @@ def _run_phase_table(
     )
 
     for dtype in _selected_dtypes():
+        recorder = (
+            BenchmarkRecorder(
+                record_property, op_name="parallel_parallax",
+                dtype=str(dtype), mode=Config.mode.value, phase="forward",
+            )
+            if phase == "fwd" else None
+        )
         for case in DEFAULT_CASES:
             result = _benchmark_case(
                 case=case,
@@ -788,6 +801,16 @@ def _run_phase_table(
                 dtype=dtype,
                 result=result,
             )
+            if recorder is not None:
+                recorder.add(
+                    shape_detail={
+                        key: getattr(case, key)
+                        for key in ("B", "T", "H", "HQ", "D")
+                    },
+                    latency_base=result.fla_ms, latency=result.flag_attn_ms,
+                )
+        if recorder is not None:
+            recorder.record()
 
     print("-" * TABLE_WIDTH)
 
@@ -796,7 +819,7 @@ def _run_phase_table(
     not test_backend.supports_operator("parallel_parallax"),
     reason=test_backend.skip_reason("parallel_parallax"),
 )
-def test_perf_parallel_parallax() -> None:
+def test_perf_parallel_parallax(record_property) -> None:
     torch.manual_seed(42)
     iter_unit = "ms/sample" if Config.mode.value == "kernel" else "calls/sample"
 
@@ -828,6 +851,7 @@ def test_perf_parallel_parallax() -> None:
         title="[Forward]",
         fla_column="FLA-fwd(ms)",
         flag_attn_column="FlagAttention-fwd(ms)",
+        record_property=record_property,
     )
 
     _run_phase_table(
