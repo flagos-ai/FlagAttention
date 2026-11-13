@@ -38,6 +38,11 @@ import torch
 import torch.nn.functional as F
 import triton.testing as triton_testing
 
+try:
+    from benchmark.recording import BenchmarkRecorder
+except ModuleNotFoundError:
+    from recording import BenchmarkRecorder
+
 from flag_attn.testing import backend as test_backend
 from flag_attn.inkling_fa4 import get_backend, tle_available
 
@@ -296,7 +301,7 @@ def resolve_backends(names: list[str], flash_root: str | None) -> dict[str, Back
 
 
 
-def run_benchmark(args) -> None:
+def run_benchmark(args, record_property=None) -> None:
     if not test_backend.supports_operator("inkling_fa4_rel_attention"):
         pytest.skip("this benchmark requires an available accelerator")
     if test_backend.is_nvidia() and test_backend.cuda_capability() < (8, 0):
@@ -347,12 +352,33 @@ def run_benchmark(args) -> None:
     print(f"GPU: {test_backend.get_device_name()} | dtype: bf16 | latency: median ms")
     print(f"warmup={args.warmup} ms | rep={args.rep} ms | relative logits={args.rel}")
     with torch.inference_mode():
-        bench_relative_attention.run(print_data=True, show_plots=False, save_path="")
+        dataframes = bench_relative_attention.run(
+            print_data=True, show_plots=False, save_path="", return_df=True,
+        )
+    if not isinstance(dataframes, (list, tuple)):
+        dataframes = [dataframes]
+    for config, dataframe in zip(configs, dataframes):
+        if "triton" not in backends:
+            continue
+        splits = config.args["num_splits"]
+        recorder = BenchmarkRecorder(
+            record_property, op_name="inkling_fa4_rel_attention",
+            dtype=str(DTYPE), baseline="official_cute" if "official_cute" in backends else None,
+        )
+        for _, row in dataframe.iterrows():
+            baseline_ms = (
+                float(row["official_cute (ms)"]) if "official_cute" in backends else None
+            )
+            recorder.add(
+                shape_detail={"case": row["case"], "num_splits": splits, "rel": args.rel},
+                latency=float(row["triton (ms)"]), latency_base=baseline_ms,
+            )
+        recorder.record()
 
 
-def test_inkling_fa4_rel_attention_benchmark():
+def test_inkling_fa4_rel_attention_benchmark(record_property):
     args = argparse.Namespace(
         cases=None, providers=list(BACKEND_NAMES), num_splits=[1],
         warmup=25, rep=100, rel="real", flash_attn_root=os.getenv("FLASH_ATTN_ROOT"),
     )
-    run_benchmark(args)
+    run_benchmark(args, record_property)

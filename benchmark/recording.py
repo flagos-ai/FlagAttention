@@ -15,10 +15,24 @@ from pathlib import Path
 from typing import Any
 
 
+try:
+    from benchmark.consts import lookup_base_record_ex, lookup_scaling_factor
+except ModuleNotFoundError:  # Execution from the benchmark directory.
+    from consts import lookup_base_record_ex, lookup_scaling_factor
+
+
 BENCHMARK_RESULT_PROPERTY = "flag_attn_benchmark_result"
 BENCHMARK_LOG_PATH_ENV = "FLAG_ATTN_BENCHMARK_LOG_PATH"
 RecordProperty = Callable[[str, object], None]
 _MULTIPHASE_LOG_OPERATORS = {"chunk_gla", "minimax_m3_sparse_attn"}
+_BASE_DATA: Mapping[str, Any] | None = None
+
+
+def configure_base_data(data: Mapping[str, Any] | None) -> None:
+    """Store the --base-data document for this pytest benchmark process."""
+    global _BASE_DATA
+    _BASE_DATA = data
+
 
 _METRIC_DEFAULTS = {
     "case_id": None,
@@ -34,6 +48,7 @@ _METRIC_DEFAULTS = {
     "tflops": None,
     "utilization": None,
     "compared_speedup": None,
+    "base_miss_reason": None,
     "error_msg": None,
 }
 
@@ -154,12 +169,69 @@ def record_benchmark_result(
 ) -> None:
     """Write a FlagGems record to the configured sink or pytest recorder."""
 
+    metrics = [dict(metric) for metric in result]
+    if _BASE_DATA is not None:
+        from flag_attn.testing import backend as test_backend
+
+        vendor = str(metadata.get("vendor") or test_backend.runtime.device.vendor_name)
+        chip_name = test_backend.get_device_name()
+        for metric in metrics:
+            if not metric.get("latency") or (
+                op_name == "flash_attention"
+                and metric.get("shape_detail", {}).get("mode") != "fwd"
+            ):
+                continue
+            base_record, miss_reason = lookup_base_record_ex(
+                _BASE_DATA, op_name, dtype, metric.get("shape_detail")
+            )
+            base_ms = base_record.get("latency_ms") if base_record else None
+            if isinstance(base_ms, (int, float)) and base_ms > 0:
+                speedup = base_ms / metric["latency"]
+                factor = lookup_scaling_factor(
+                    _BASE_DATA,
+                    vendor,
+                    base_record.get("bottle_neck_unit"),
+                    dtype,
+                    chip_name,
+                )
+                if factor:
+                    speedup /= factor
+                metric["compared_speedup"] = speedup
+                print(
+                    f"[vs Base] {op_name} shape={metric['shape_detail']} "
+                    f"base={base_ms:.6f}ms current={metric['latency']:.6f}ms "
+                    f"factor={factor} vs_base={speedup:.3f}"
+                )
+            else:
+                metric["base_miss_reason"] = miss_reason or (
+                    f"operator '{op_name}' has no valid baseline latency "
+                    f"(shape_detail={metric.get('shape_detail')}, dtype={dtype})"
+                )
+                print(f"[vs Base][unmatched] {metric['base_miss_reason']}")
+                if metric.get("latency_base") is None:
+                    raise RuntimeError(
+                        f"no baseline available for '{op_name}' (dtype={dtype}): "
+                        f"on-machine reference missing and NV baseline unmatched "
+                        f"({metric['base_miss_reason']})"
+                    )
+    if _BASE_DATA is None and any(
+        metric.get("latency_base") is None
+        and metric.get("compared_speedup") is None
+        and isinstance(metric.get("latency"), Real)
+        and not isinstance(metric.get("latency"), bool)
+        and math.isfinite(metric["latency"])
+        and metric["latency"] > 0
+        for metric in metrics
+    ):
+        metadata.setdefault(
+            "native_baseline_skip_reason", "no on-machine or NV baseline available"
+        )
     detail = {
         "level": level,
         "op_name": op_name,
         "dtype": dtype,
         "mode": mode,
-        "result": [dict(metric) for metric in result],
+        "result": metrics,
     }
     detail.update(metadata)
     log_detail = detail.copy()

@@ -44,7 +44,6 @@ from flag_attn.infllmv2.reference import (
 
 HAS_GPU = (test_backend.supports_operator("infllmv2_attention") or test_backend.supports_operator("infllmv2_decode")) and importlib.util.find_spec("triton") is not None
 pytestmark = [
-    pytest.mark.infllmv2_attention,
     pytest.mark.skipif(not HAS_GPU, reason="requires an available accelerator"),
 ]
 
@@ -141,6 +140,7 @@ def _reference_attention(
     )
 
 
+@pytest.mark.infllmv2_attention
 @pytest.mark.parametrize("d", [64, 128], ids=lambda value: f"d{value}")
 def test_selector_pipeline_matches_reference(d: int) -> None:
     q, k, _, cu_q, cu_k = _packed_inputs((96, 128), (192, 256), d=d)
@@ -197,6 +197,7 @@ ATTENTION_CASES = (
 )
 
 
+@pytest.mark.infllmv2_attention
 @pytest.mark.parametrize("q_lengths,kv_lengths,d,dtype", ATTENTION_CASES)
 @pytest.mark.skipif(not test_backend.supports_operator("infllmv2_attention"), reason=test_backend.skip_reason("infllmv2_attention"))
 def test_attention_full_prefix_chunk_varlen(
@@ -217,6 +218,7 @@ def test_attention_full_prefix_chunk_varlen(
     torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
 
 
+@pytest.mark.infllmv2_attention
 @pytest.mark.parametrize("d", [64, 128], ids=lambda value: f"d{value}")
 @pytest.mark.skipif(not test_backend.supports_operator("infllmv2_attention"), reason=test_backend.skip_reason("infllmv2_attention"))
 def test_attention_dense_path(d: int) -> None:
@@ -252,6 +254,7 @@ def test_attention_sparse_backward(dtype: torch.dtype) -> None:
     torch.testing.assert_close(v.grad, v_ref.grad, atol=7e-2, rtol=7e-2)
 
 
+@pytest.mark.infllmv2_attention
 @pytest.mark.parametrize("d", [64, 128], ids=lambda value: f"d{value}")
 @pytest.mark.parametrize("dense", [False, True], ids=["sparse", "dense"])
 @pytest.mark.skipif(not test_backend.supports_operator("infllmv2_decode"), reason=test_backend.skip_reason("infllmv2_decode"))
@@ -270,6 +273,7 @@ def test_decode_varlen_matches_reference(d: int, dense: bool) -> None:
     torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
 
 
+@pytest.mark.infllmv2_attention
 def test_wide_topk_tle_or_standard_matches_streaming() -> None:
     generator = torch.Generator(device=test_backend.device)
     generator.manual_seed(41)
@@ -287,6 +291,7 @@ def test_wide_topk_tle_or_standard_matches_streaming() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.infllmv2_attention
 @pytest.mark.parametrize("d", [64, 128], ids=lambda value: f"d{value}")
 def test_tle_stage1_matches_standard_when_available(d: int) -> None:
     if not HAS_TLE or test_backend.cuda_capability() != (9, 0):
@@ -301,6 +306,7 @@ def test_tle_stage1_matches_standard_when_available(d: int) -> None:
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.infllmv2_attention
 def test_tle_stage2_matches_standard_when_available() -> None:
     if not HAS_TLE or test_backend.cuda_capability() != (9, 0):
         pytest.skip("TLE Stage2 requires Hopper")
@@ -316,6 +322,7 @@ def test_tle_stage2_matches_standard_when_available() -> None:
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.infllmv2_attention
 @pytest.mark.skipif(not test_backend.is_nvidia(), reason="tests the generic NVIDIA implementation contract")
 def test_d64_tle_stage1_dispatch_and_standard_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     kernels = importlib.import_module("flag_attn.infllmv2.forward")
@@ -347,12 +354,14 @@ def test_d64_tle_stage1_dispatch_and_standard_fallback(monkeypatch: pytest.Monke
     assert launches
 
 
+@pytest.mark.infllmv2_attention
 def test_invalid_attention_input_is_rejected() -> None:
     q, k, v, cu_q, cu_k = _packed_inputs((32,), (64,), d=64)
     with pytest.raises(ValueError, match="maximum sequence lengths"):
         infllmv2_attention(q, k, v, cu_q, cu_k, 0, 64)
 
 
+@pytest.mark.infllmv2_attention
 @pytest.mark.skipif(not test_backend.supports_operator("infllmv2_decode"), reason=test_backend.skip_reason("infllmv2_decode"))
 def test_invalid_decode_batch_is_rejected() -> None:
     _, k, v, _, cu_k = _packed_inputs((1, 1), (32, 64), d=64)

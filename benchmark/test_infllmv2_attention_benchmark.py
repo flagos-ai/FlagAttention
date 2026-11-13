@@ -36,7 +36,6 @@ from flag_attn import InfLLMV2Config, infllmv2_attention
 
 
 pytestmark = [
-    pytest.mark.infllmv2_attention,
     pytest.mark.skipif(
         not test_backend.is_available(), reason="requires an available accelerator"
     ),
@@ -267,6 +266,7 @@ def _report(
     )
 
 
+@pytest.mark.infllmv2_attention
 @pytest.mark.parametrize("case", PREFILL_CASES, ids=lambda case: case.name)
 @pytest.mark.skipif(not test_backend.supports_operator("infllmv2_attention"), reason=test_backend.skip_reason("infllmv2_attention"))
 def test_infllmv2_attention_benchmark(
@@ -354,6 +354,7 @@ def test_infllmv2_attention_backward_benchmark(
     )
 
 
+@pytest.mark.infllmv2_attention
 @pytest.mark.parametrize("case", DECODE_CASES, ids=lambda case: case.name)
 @pytest.mark.skipif(not test_backend.supports_operator("infllmv2_decode"), reason=test_backend.skip_reason("infllmv2_decode"))
 def test_infllmv2_decode_benchmark(
@@ -381,7 +382,7 @@ def test_infllmv2_decode_benchmark(
     assert median_ms > 0
     _report(
         record_property,
-        operator="infllmv2_decode",
+        operator="infllmv2_attention",
         case=case.name,
         mode="decode",
         batch=case.batch,

@@ -24,6 +24,11 @@ import torch
 bsa_ops = import_module(
     "flag_attn.hpc_ops_attention.prefill.attention_blocksparse_prefill_fp8"
 )
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:
+    from recording import benchmark_metric, record_benchmark_result
+
 from flag_attn.testing import backend as test_backend
 from flag_attn import hy3_attention
 
@@ -350,9 +355,24 @@ def _bench_cuda_graph(call_fn, warmup, repetitions):
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("kv_layout", ["nhd", "hnd"])
 def test_attention_blocksparse_prefill_fp8_perf(
-    request, q_len, kv_len, quant_type, masked, kv_layout
+    request, q_len, kv_len, quant_type, masked, kv_layout, record_property
 ):
     inputs = _make_inputs(q_len, kv_len, quant_type, masked, kv_layout)
+
+    def record_result(flagattention_ms, hpc_ms):
+        record_benchmark_result(
+            record_property, op_name="hy3_attention",
+            dtype=str(torch.float8_e4m3fn),
+            result=[benchmark_metric(
+                shape_detail={
+                    "variant": "prefill_fp8", "q_len": q_len, "kv_len": kv_len,
+                    "quant_type": quant_type, "masked": masked,
+                    "kv_layout": kv_layout,
+                },
+                latency=flagattention_ms, latency_base=hpc_ms,
+            )],
+            baseline="hpc CUDA" if hpc_ms is not None else None,
+        )
     warmup = _requested_count(request, "--warmup", DEFAULT_GRAPH_WARMUP)
     repetitions = _requested_count(request, "--iter", DEFAULT_GRAPH_ITERS)
     if warmup < 0 or repetitions < 1:
@@ -396,6 +416,7 @@ def test_attention_blocksparse_prefill_fp8_perf(
                 "repetitions": repetitions,
             }
         )
+        record_result(flagattention_ms, None)
         return
 
     hpc_quant_type = (
@@ -423,6 +444,7 @@ def test_attention_blocksparse_prefill_fp8_perf(
         )
 
     hpc_ms = _bench_cuda_graph(run_hpc_cuda, warmup, repetitions)
+    record_result(flagattention_ms, hpc_ms)
     PERF_RESULTS.append(
         {
             "q_len": q_len,

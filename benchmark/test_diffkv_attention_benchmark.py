@@ -3,9 +3,8 @@
 
 """DiffKV Full Attention and SWA decode benchmarks, organized like chunk GLA.
 
-Run with pytest -v -s -m diffkv_attention from the repository root. There is
-currently no imported comparison baseline; all measured results are printed
-to the terminal. This module neither reads nor writes CSVs or loads extensions.
+Run with pytest -v -s -m diffkv_attention from the repository root. On NVIDIA,
+the vLLM FA3 extension provides the local comparison baseline when available.
 
 Generic 2D/3D paths retain preallocated buffers and the original timing
 protocol. Registered vendor implementations use their public API and report
@@ -13,9 +12,13 @@ full-call latency separately. FLAG_ATTN_DIFFKV_BACKEND selects the generic
 TLE/standard Triton implementation; runtime selects the device vendor.
 """
 
-from collections.abc import Callable
 import math
+import os
+import site
 import statistics
+import sys
+from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 import torch
@@ -38,13 +41,66 @@ STABILITY_CV_THRESHOLD_PCT = 5.0
 DEFAULT_SEED = 0
 PAGE_TABLE = "random"
 WINDOW_SIZE = 128
-TABLE_WIDTH = 105
+TABLE_WIDTH = 130
 
 # Preserve the original Full Attention/SWA matrix and production head layout.
 _SHAPES = [(batch, length) for batch in (1, 8, 16, 32) for length in (512, 2048, 8192, 32768)]
 _DTYPES = [torch.bfloat16]
 _MODES = ("full", "swa")
 _PATHS = ("2d", "3d")
+
+
+def _fa3_op_available() -> bool:
+    try:
+        namespace = getattr(torch.ops, "_vllm_fa3_C", None)
+        return namespace is not None and hasattr(namespace, "fwd")
+    except Exception:
+        return False
+
+
+def _load_fa3_provider() -> tuple[bool, str | None]:
+    """Load the vLLM FA3 extension from the active Python environment."""
+    if _fa3_op_available():
+        return True, "already registered"
+
+    environment = Path(sys.prefix).resolve()
+    configured = os.environ.get("VLLM_FLASH_ATTN_EXTENSION_DIR")
+    roots = (
+        [Path(configured).expanduser()]
+        if configured
+        else [
+            root
+            for directory in site.getsitepackages()
+            for root in (Path(directory) / "fa3_runtime", Path(directory))
+        ]
+    )
+    errors = []
+    for root in roots:
+        root = root.resolve()
+        if not root.is_relative_to(environment):
+            continue
+        if root.is_file():
+            candidates = [root]
+        elif root.is_dir():
+            candidates = [
+                root / "_vllm_fa3_C.abi3.so",
+                *sorted(root.glob("*_vllm_fa3_C*.so")),
+            ]
+        else:
+            continue
+        for candidate in dict.fromkeys(candidates):
+            if not candidate.is_file():
+                continue
+            try:
+                torch.ops.load_library(str(candidate))
+            except Exception as exc:  # The extension may have a different ABI.
+                errors.append(f"{candidate}: {type(exc).__name__}: {exc}")
+                continue
+            if _fa3_op_available():
+                return True, str(candidate)
+            errors.append(f"{candidate}: _vllm_fa3_C.fwd was not registered")
+    reason = "; ".join(errors) or "FA3 extension not found in the active Python environment"
+    return False, reason
 
 
 def shape_seed(base_seed: int, mode: str, batch: int, seq_len: int, num_kv_heads: int) -> int:
@@ -205,6 +261,94 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl):
     return run, impl_name
 
 
+def build_fa3_runner(inputs, window_size: int):
+    """Build the direct FA3 paged-cache call with preallocated buffers."""
+    query, key_cache, value_cache, context_lens, block_tables = inputs
+    batch, hq, dqk = query.shape
+    dv = value_cache.shape[-1]
+    seq_len = int(context_lens.max().item())
+    cu_seqlens_q = torch.arange(batch + 1, device=query.device, dtype=torch.int32)
+    out = torch.empty(batch, hq, dv, device=query.device, dtype=query.dtype)
+    scale = dqk**-0.5
+    window_left, window_right = (
+        (window_size - 1, 0) if window_size > 0 else (-1, -1)
+    )
+
+    scheduler_metadata = None
+    try:
+        scheduler_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata(
+            batch,
+            1,
+            seq_len,
+            hq,
+            key_cache.shape[2],
+            dqk,
+            dv,
+            query.dtype,
+            context_lens,
+            cu_seqlens_q,
+            None,
+            None,
+            None,
+            None,
+            key_cache.shape[1],
+            0,
+            True,
+            window_left,
+            window_right,
+            False,
+            0,
+            None,
+            0,
+        )
+    except (AttributeError, RuntimeError):
+        # Older extensions may choose their schedule in fwd.
+        pass
+
+    def run():
+        torch.ops._vllm_fa3_C.fwd(
+            query,
+            key_cache,
+            value_cache,
+            None,
+            None,
+            None,
+            out,
+            cu_seqlens_q,
+            None,
+            None,
+            None,
+            context_lens,
+            1,
+            seq_len,
+            block_tables,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            scale,
+            True,
+            window_left,
+            window_right,
+            0.0,
+            True,
+            scheduler_metadata,
+            0,
+            None,
+            0,
+            None,
+            1,
+            0,
+            None,
+        )
+
+    return run
+
+
 def _bench_ms(fn, warmup_ms: int, rep_ms: int, samples: int):
     """Measure a callable with the selected device timing helper.
 
@@ -231,27 +375,39 @@ def _bench_ms(fn, warmup_ms: int, rep_ms: int, samples: int):
     return median, min(values), max(values), cv_pct
 
 
-def _print_header(mode: str, scope: str, warmup: int, rep: int, samples: int) -> None:
+def _print_header(
+    mode: str, scope: str, warmup: int, rep: int, samples: int, fa3_available: bool
+) -> None:
     title = "Full Attention" if mode == "full" else "SWA"
     print(f"\n{'=' * TABLE_WIDTH}")
     print(f"  diffkv_attention benchmark - {title}")
     print(f"  device={test_backend.get_device_name()} scope={scope}")
-    print(f"  warmup={warmup}ms rep={rep}ms samples={samples}; baseline: none")
+    baseline = "FA3" if fa3_available else "none"
+    print(f"  warmup={warmup}ms rep={rep}ms samples={samples}; baseline: {baseline}")
     print(f"{'=' * TABLE_WIDTH}")
     print(
         f"{'B':>3} {'KV':>6} {'HQ':>4} {'HKV':>4} {'DQK':>4} {'DV':>4} "
         f"{'dtype':>8} {'path':>5} {'impl':>13} "
-        f"{'flag_attn(ms)':>14} {'min(ms)':>10} {'max(ms)':>10} {'CV(%)':>8}"
+        f"{'flag_attn(ms)':>14} {'min(ms)':>10} {'max(ms)':>10} {'CV(%)':>8} "
+        f"{'FA3(ms)':>10} {'FA3/flag':>10}"
     )
 
 
-def _print_row(batch, length, kv_heads, dtype, path, implementation, measurement) -> None:
+def _print_row(
+    batch, length, kv_heads, dtype, path, implementation, measurement, fa3_latency
+) -> None:
     latency, minimum, maximum, cv_pct = measurement
+    fa3_text = f"{fa3_latency:>10.6f}" if fa3_latency is not None else f"{'n/a':>10}"
+    speedup_text = (
+        f"{fa3_latency / latency:>10.3f}"
+        if fa3_latency is not None else f"{'n/a':>10}"
+    )
     print(
         f"{batch:>3} {length:>6} {DEFAULT_LAYOUT.num_query_heads:>4} {kv_heads:>4} "
         f"{DEFAULT_LAYOUT.head_size_qk:>4} {DEFAULT_LAYOUT.head_size_v:>4} "
         f"{str(dtype).removeprefix('torch.'):>8} {path.upper():>5} {implementation:>13} "
-        f"{latency:>14.6f} {minimum:>10.6f} {maximum:>10.6f} {cv_pct:>8.3f}",
+        f"{latency:>14.6f} {minimum:>10.6f} {maximum:>10.6f} {cv_pct:>8.3f} "
+        f"{fa3_text} {speedup_text}",
         flush=True,
     )
     if cv_pct > STABILITY_CV_THRESHOLD_PCT:
@@ -280,6 +436,13 @@ def run_benchmark(
         implementation_name = diffkv_impl.SELECTED_BACKEND
         print(f"DiffKV implementation: {implementation_name}")
 
+    fa3_available, fa3_info = (
+        _load_fa3_provider() if test_backend.is_nvidia() else (False, None)
+    )
+    if fa3_info is not None:
+        status = "provider" if fa3_available else "unavailable"
+        print(f"FA3 baseline {status}: {fa3_info}")
+
     # Full and SWA are both decode workloads. Submit one record per dtype so
     # summary readers that group by op_name/dtype retain every measured row.
     recorders = {
@@ -288,7 +451,7 @@ def run_benchmark(
             op_name=OP_NAME,
             dtype=str(dtype),
             mode=mode_name,
-            baseline=None,
+            baseline="FA3" if fa3_available else None,
             phase="decode",
             benchmark_scope=scope,
             vendor=test_backend.runtime.device.vendor_name,
@@ -299,7 +462,7 @@ def run_benchmark(
     for mode in _MODES:
         window = -1 if mode == "full" else WINDOW_SIZE
         kv_heads = diffkv_impl.num_kv_heads_for_mode(mode)
-        _print_header(mode, scope, warmup, rep, samples)
+        _print_header(mode, scope, warmup, rep, samples, fa3_available)
         for dtype in _DTYPES:
             recorder = recorders[dtype]
             for batch, length in _SHAPES:
@@ -316,13 +479,25 @@ def run_benchmark(
                     page_table=PAGE_TABLE,
                     device=test_backend.device,
                 )
+                fa3_latency = None
+                if fa3_available:
+                    fa3_latency = _bench_ms(
+                        build_fa3_runner(inputs, window), warmup, rep, samples
+                    )[0]
+                    if not math.isfinite(fa3_latency) or fa3_latency <= 0:
+                        raise RuntimeError(
+                            f"Invalid FA3 latency for {mode} B={batch} KV={length}"
+                        )
                 for path in _PATHS:
                     runner, _ = build_runner(inputs, path, window, diffkv_impl)
                     measurement = _bench_ms(runner, warmup, rep, samples)
                     latency, minimum, maximum, cv_pct = measurement
                     if not math.isfinite(latency) or latency <= 0:
                         raise RuntimeError(f"Invalid DiffKV latency for {mode} B={batch} KV={length} {path}")
-                    _print_row(batch, length, kv_heads, dtype, path, implementation_name, measurement)
+                    _print_row(
+                        batch, length, kv_heads, dtype, path,
+                        implementation_name, measurement, fa3_latency,
+                    )
                     recorder.add(
                         shape_detail={
                             "mode": mode,
@@ -336,7 +511,7 @@ def run_benchmark(
                             "path": path,
                         },
                         latency=latency,
-                        latency_base=None,
+                        latency_base=fa3_latency,
                         min_ms=minimum,
                         max_ms=maximum,
                         sample_cv_pct=cv_pct,

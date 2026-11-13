@@ -14,6 +14,7 @@
 
 """Log-Linear Attention performance tests for the selected implementation."""
 
+import importlib
 import math
 import statistics
 
@@ -62,17 +63,14 @@ def _make_inputs(batch, sequence, heads, dim):
     return q, k, v, g, level_scales
 
 
-def _prepare_runner(inputs):
-    if test_backend.has_specialization("log_linear_attn"):
-        def run():
-            return log_linear_attn(*inputs)
-
-        return run, None, "public_api_forward"
-
-    from flag_attn.FLA.log_linear_attn.chunk_tle import _prepare_tle_forward
-
-    run, output = _prepare_tle_forward(*inputs)
-    return run, output, "prepared_kernel_forward"
+def _load_fla_reference():
+    if not test_backend.is_nvidia():
+        return None, "FLA Log-Linear Attention requires NVIDIA CUDA"
+    try:
+        op = importlib.import_module("fla.ops.log_linear_attn").chunk_log_linear_attn
+    except (ImportError, AttributeError) as exc:
+        return None, str(exc)
+    return op, None
 
 
 @torch.inference_mode()
@@ -90,42 +88,83 @@ def run_benchmark(
         raise ValueError("rounds and rep must be positive; warmup must be nonnegative")
 
     shapes = BENCHMARK_SHAPES if shapes is None else shapes
+    fla_op, fla_error = _load_fla_reference()
+    if fla_op is None:
+        print(f"[baseline] FLA unavailable; measuring FlagAttention only: {fla_error}")
+
     print(f"Device={test_backend.get_device_name()} dtype=BF16", flush=True)
     print(f"rounds={rounds}, warmup={warmup} ms, rep={rep} ms", flush=True)
-    print("shape\tscope\tlatency_ms", flush=True)
+    print("shape\tlatency_ms\tfla_ms\tspeedup_vs_fla", flush=True)
     metrics = []
     for batch, sequence, heads, dim in shapes:
         torch.manual_seed(0)
         inputs = _make_inputs(batch, sequence, heads, dim)
-        run, output, scope = _prepare_runner(inputs)
-        initial = run()
+
+        def run_flag():
+            return log_linear_attn(*inputs)
+
+        output = run_flag()
         test_backend.device_fn.synchronize()
-        if output is None:
-            output = initial
         assert torch.isfinite(output).all(), "Log-Linear Attention produced NaN/Inf"
 
-        samples = [
-            test_backend.do_bench(run, warmup=warmup, rep=rep, return_mode="median")
-            for _ in range(rounds)
-        ]
-        latency = statistics.median(samples)
+        fla_rounds = []
+        if fla_op is not None:
+            def run_fla():
+                return fla_op(*inputs)[0]
+
+            baseline_output = run_fla()
+            test_backend.device_fn.synchronize()
+            assert torch.isfinite(baseline_output).all(), "FLA baseline produced NaN/Inf"
+            error = (baseline_output.float() - output.float()).square().mean().sqrt()
+            reference = output.float().square().mean().sqrt()
+            assert (error / (reference + 1e-8)).item() < 0.004, (
+                "FLA baseline differs from Log-Linear Attention"
+            )
+
+        flag_rounds = []
+        for round_index in range(rounds):
+            if fla_op is not None and round_index % 2 == 0:
+                fla_rounds.append(
+                    test_backend.do_bench(
+                        run_fla, warmup=warmup, rep=rep, return_mode="median"
+                    )
+                )
+            flag_rounds.append(
+                test_backend.do_bench(
+                    run_flag, warmup=warmup, rep=rep, return_mode="median"
+                )
+            )
+            if fla_op is not None and round_index % 2 == 1:
+                fla_rounds.append(
+                    test_backend.do_bench(
+                        run_fla, warmup=warmup, rep=rep, return_mode="median"
+                    )
+                )
+
+        latency = statistics.median(flag_rounds)
+        baseline_latency = statistics.median(fla_rounds) if fla_rounds else None
+        speedup = baseline_latency / latency if baseline_latency is not None else None
         shape = f"B{batch}_T{sequence}_H{heads}_D{dim}"
-        print(f"{shape}\t{scope}\t{latency:.6f}", flush=True)
+        baseline_text = f"{baseline_latency:.6f}" if baseline_latency is not None else "N/A"
+        speedup_text = f"{speedup:.3f}x" if speedup is not None else "N/A"
+        print(f"{shape}\t{latency:.6f}\t{baseline_text}\t{speedup_text}", flush=True)
         metrics.append(
             benchmark_metric(
                 shape_detail={"B": batch, "T": sequence, "H": heads, "D": dim},
                 latency=latency,
-                measurement_scope=scope,
+                latency_base=baseline_latency,
+                speedup=speedup,
+                measurement_scope="public_api_forward",
             )
         )
 
     record_benchmark_result(
         record_property,
         op_name="log_linear_attn",
-        dtype="bf16",
+        dtype=str(torch.bfloat16),
         result=metrics,
-        mode="api" if test_backend.has_specialization("log_linear_attn") else "kernel",
-        baseline=None,
+        mode="api",
+        baseline="FLA" if fla_op is not None else None,
         phase="forward",
         rounds=rounds,
         warmup_ms=warmup,

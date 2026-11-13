@@ -14,6 +14,11 @@ import statistics
 import pytest
 import torch
 
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:  # Execution from the benchmark directory.
+    from recording import benchmark_metric, record_benchmark_result
+
 from flag_attn.testing import backend as test_backend
 from test_forgetting_attention import (
     DEFAULT_CASES, case_id, make_inputs,
@@ -87,19 +92,27 @@ def print_row(row):
     print(f'{case["id"]:<5} {shape:<28} {case["dtype"]:<9} {case["reference_kind"]:<7} {baseline:>10} {row["latency"]:>10.6f} {speedup:>9}', flush=True)
 
 
-def detail_for(row):
+def metric_for(row):
     case = row["case"]
-    return {"op_name": "parallel_forgetting_attn", "dtype": case["dtype"], "mode": "forward", "level": "end_to_end",
-            "result": [{"shape_detail": [[case[k] for k in ("B", "M", "N", "HQ", "H", "D")],
-                                         {"scale": case["scale"], "threshold": -10.0,
-                                          "baseline_kind": row["baseline"]}],
-                        "latency_base": row["latency_base"], "latency": row["latency"],
-                        "speedup": row["speedup"], "accuracy": row["accuracy"]}]}
+    return benchmark_metric(
+        shape_detail=[
+            [case[k] for k in ("B", "M", "N", "HQ", "H", "D")],
+            {"scale": case["scale"], "threshold": -10.0},
+        ],
+        latency_base=row["latency_base"], latency=row["latency"],
+        speedup=row["speedup"], accuracy=row["accuracy"],
+    )
 
 
 @pytest.mark.parametrize("case", DEFAULT_CASES, ids=case_id)
 def test_forgetting_attention_benchmark(case, record_property):
     row = benchmark_case(case)
     print_row(row)
-    # Optional forward compatibility with PR #70+ recorders; PR #69 ignores this property.
-    record_property("flag_attn_benchmark_result", detail_for(row))
+    record_benchmark_result(
+        record_property,
+        op_name="parallel_forgetting_attn",
+        dtype=str(getattr(torch, case["dtype"])),
+        mode="forward",
+        level="end_to_end",
+        result=[metric_for(row)],
+    )
