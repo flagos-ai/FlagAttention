@@ -15,6 +15,7 @@ _OPERATOR_EXPORTS = {
         "fused_recurrent_gated_delta_rule_packed_decode",
     ),
     "chunk_gdn2": (".gdn2", "chunk_gdn2"),
+    "inkling_fa4_rel_attention": (".FLA.inkling_fa4", "inkling_fa4_rel_attention"),
     "parallel_parallax": (".parallax", "parallel_parallax"),
     "parallax_decode": (".parallax", "parallax_decode"),
     "parallax_attn_with_kvcache": (".parallax", "parallax_attn_with_kvcache"),
