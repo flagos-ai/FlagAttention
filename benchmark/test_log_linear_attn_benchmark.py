@@ -90,9 +90,18 @@ def run_benchmark(
         raise ValueError("rounds and rep must be positive; warmup must be nonnegative")
 
     shapes = BENCHMARK_SHAPES if shapes is None else shapes
+    tilelang_baseline = None
+    if test_backend.is_nvidia():
+        try:
+            from benchmark import log_linear_tilelang_baseline as tilelang_baseline
+        except ImportError:  # Execution from the benchmark directory.
+            import log_linear_tilelang_baseline as tilelang_baseline
+        if tilelang_baseline.tilelang is None:
+            tilelang_baseline = None
+
     print(f"Device={test_backend.get_device_name()} dtype=BF16", flush=True)
     print(f"rounds={rounds}, warmup={warmup} ms, rep={rep} ms", flush=True)
-    print("shape\tscope\tlatency_ms", flush=True)
+    print("shape\tscope\tlatency_ms\ttilelang_ms\tspeedup_vs_tilelang", flush=True)
     metrics = []
     for batch, sequence, heads, dim in shapes:
         torch.manual_seed(0)
@@ -104,17 +113,53 @@ def run_benchmark(
             output = initial
         assert torch.isfinite(output).all(), "Log-Linear Attention produced NaN/Inf"
 
+        baseline_run = None
+        if tilelang_baseline is not None:
+            baseline_run, _, baseline_output = (
+                tilelang_baseline._prepare_tilelang_forward(*inputs)
+            )
+            baseline_run()
+            test_backend.device_fn.synchronize()
+            assert torch.isfinite(baseline_output).all(), "TileLang baseline produced NaN/Inf"
+            error = (baseline_output.float() - output.float()).square().mean().sqrt()
+            reference = output.float().square().mean().sqrt()
+            assert (error / (reference + 1e-8)).item() < 0.004, (
+                "TileLang baseline differs from Log-Linear Attention"
+            )
+
+        baseline_samples = (
+            [
+                test_backend.do_bench(
+                    baseline_run, warmup=warmup, rep=rep, return_mode="median"
+                )
+                for _ in range(rounds)
+            ]
+            if baseline_run is not None
+            else []
+        )
         samples = [
             test_backend.do_bench(run, warmup=warmup, rep=rep, return_mode="median")
             for _ in range(rounds)
         ]
         latency = statistics.median(samples)
+        baseline_latency = statistics.median(baseline_samples) if baseline_samples else None
         shape = f"B{batch}_T{sequence}_H{heads}_D{dim}"
-        print(f"{shape}\t{scope}\t{latency:.6f}", flush=True)
+        baseline_text = f"{baseline_latency:.6f}" if baseline_latency is not None else "N/A"
+        speedup_text = (
+            f"{baseline_latency / latency:.3f}x"
+            if baseline_latency is not None
+            else "N/A"
+        )
+        print(f"{shape}\t{scope}\t{latency:.6f}\t{baseline_text}\t{speedup_text}", flush=True)
         metrics.append(
             benchmark_metric(
                 shape_detail={"B": batch, "T": sequence, "H": heads, "D": dim},
                 latency=latency,
+                latency_base=baseline_latency,
+                speedup=(
+                    baseline_latency / latency
+                    if baseline_latency is not None else None
+                ),
                 measurement_scope=scope,
             )
         )
@@ -122,10 +167,10 @@ def run_benchmark(
     record_benchmark_result(
         record_property,
         op_name="log_linear_attn",
-        dtype="bf16",
+        dtype=str(torch.bfloat16),
         result=metrics,
         mode="api" if test_backend.has_specialization("log_linear_attn") else "kernel",
-        baseline=None,
+        baseline="TileLang" if tilelang_baseline is not None else None,
         phase="forward",
         rounds=rounds,
         warmup_ms=warmup,
