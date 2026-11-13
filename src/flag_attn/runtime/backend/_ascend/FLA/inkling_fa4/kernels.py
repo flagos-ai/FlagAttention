@@ -5,8 +5,6 @@
 import triton
 import triton.language as tl
 
-_LOG2E = 1.4426950408889634
-
 
 @triton.jit
 def _rel_attn_paged_kernel(
@@ -15,6 +13,8 @@ def _rel_attn_paged_kernel(
     v_ptr,
     rel_ptr,
     out_ptr,
+    partial_out_ptr,
+    partial_lse_ptr,
     block_table_ptr,
     cache_seqlens_ptr,
     cu_seqlens_q_ptr,
@@ -35,13 +35,24 @@ def _rel_attn_paged_kernel(
     stride_out_t,
     stride_out_h,
     stride_out_d,
+    stride_po_s,
+    stride_po_t,
+    stride_po_h,
+    stride_pl_s,
+    stride_pl_t,
+    stride_pl_h,
     stride_bt_b,
     stride_bt_block,
     softmax_scale,
     NUM_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
+    H_GRID: tl.constexpr,
+    GROUP: tl.constexpr,
+    KV_GROUP: tl.constexpr,
+    PACK_GQA: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     REL_EXTENT: tl.constexpr,
@@ -51,51 +62,75 @@ def _rel_attn_paged_kernel(
     WINDOW_LEFT: tl.constexpr,
     HAS_RIGHT: tl.constexpr,
     WINDOW_RIGHT: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    SPLIT_KV: tl.constexpr,
 ):
-    """One query tile of one (sequence, query head); walks the paged KV cache.
+    """Packed-GQA relative attention over the paged KV cache.
 
-    Correctness-first form: no split-KV, no GQA packing, one row per query
-    token.  The KV tile is gathered through ``block_table`` page by page, the
-    relative bias is applied only inside ``[0, REL_EXTENT)`` (matching the
-    reference), and the sliding window / causal mask is applied on top.
+    One program covers ``TOKENS_PER_BLOCK`` query tokens of one sequence for one
+    KV head, with the ``GROUP`` query heads that share it packed into the tile
+    rows (BLOCK_M = TOKENS_PER_BLOCK * GROUP).  The KV range is clipped by the
+    causal bound and the sliding window before it is split across ``NUM_SPLITS``
+    programs, so short-window and long-cache shapes both get enough programs.
     """
     pid_m = tl.program_id(0)
-    pid_s = tl.program_id(1)
-    seq = pid_s // NUM_HEADS
-    head = pid_s - seq * NUM_HEADS
-    if NUM_KV_HEADS == NUM_HEADS:
-        kv_head = head
-    else:
-        kv_head = head // (NUM_HEADS // NUM_KV_HEADS)
+    pid_sh = tl.program_id(1)
+    pid_split = tl.program_id(2)
+    seq = pid_sh // H_GRID
+    head_slot = pid_sh - seq * H_GRID
 
     q_start = tl.load(cu_seqlens_q_ptr + seq)
     q_end = tl.load(cu_seqlens_q_ptr + seq + 1)
     k_len = tl.load(cache_seqlens_ptr + seq)
     q_len = q_end - q_start
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rows_valid = offs_m < q_len
-    q_pos = offs_m + (k_len - q_len)
-    rows = q_start + offs_m
+    rows = tl.arange(0, BLOCK_M)
+    t_idx = rows // GROUP
+    h_off = rows - t_idx * GROUP
+    token = pid_m * TOKENS_PER_BLOCK + t_idx
+    # Rows past the sequence end duplicate its last token so that the KV range
+    # stays exactly the range the valid rows need.
+    token_c = tl.minimum(token, tl.maximum(q_len - 1, 0))
+    row_valid = token < q_len
+    q_pos = (k_len - q_len) + token_c
+    q_glob = q_start + token_c
+    if PACK_GQA:
+        kv_head = head_slot
+    else:
+        kv_head = head_slot // KV_GROUP
+    head = head_slot * GROUP + h_off
+
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < HEAD_DIM
 
     q_tile = tl.load(
         q_ptr
-        + rows[:, None] * stride_q_t
-        + head * stride_q_h
+        + q_glob[:, None] * stride_q_t
+        + head[:, None] * stride_q_h
         + offs_d[None, :] * stride_q_d,
-        mask=rows_valid[:, None] & mask_d[None, :],
+        mask=row_valid[:, None] & mask_d[None, :],
         other=0.0,
     )
+
+    if SPLIT_KV:
+        per_split = (k_len + NUM_SPLITS - 1) // NUM_SPLITS
+        kv_lo = pid_split * per_split
+        kv_hi = tl.minimum(kv_lo + per_split, k_len)
+    else:
+        kv_lo = 0
+        kv_hi = k_len
+    if CAUSAL:
+        kv_hi = tl.minimum(kv_hi, tl.max(q_pos) + 1)
+    if HAS_LEFT:
+        kv_lo = tl.maximum(kv_lo, tl.min(q_pos) - WINDOW_LEFT)
 
     m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
 
-    for n0 in range(0, k_len, BLOCK_N):
+    for n0 in range(kv_lo, kv_hi, BLOCK_N):
         n = n0 + tl.arange(0, BLOCK_N)
-        k_valid = n < k_len
+        k_valid = n < kv_hi
         logical = n // BLOCK_SIZE
         offset = n - logical * BLOCK_SIZE
         physical = tl.load(
@@ -103,14 +138,15 @@ def _rel_attn_paged_kernel(
             mask=k_valid,
             other=0,
         )
-        k_ptrs = (
+        k_tile = tl.load(
             k_ptr
             + physical[:, None] * stride_k_block
             + offset[:, None] * stride_k_t
             + kv_head * stride_k_h
-            + offs_d[None, :] * stride_k_d
+            + offs_d[None, :] * stride_k_d,
+            mask=k_valid[:, None] & mask_d[None, :],
+            other=0.0,
         )
-        k_tile = tl.load(k_ptrs, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
         scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * softmax_scale
 
         rel_dist = q_pos[:, None] - n[None, :]
@@ -118,15 +154,15 @@ def _rel_attn_paged_kernel(
         safe_idx = tl.where(in_range, rel_dist, 0)
         rel_bias = tl.load(
             rel_ptr
-            + rows[:, None] * stride_rel_t
-            + head * stride_rel_h
+            + q_glob[:, None] * stride_rel_t
+            + head[:, None] * stride_rel_h
             + safe_idx * stride_rel_d,
-            mask=rows_valid[:, None] & k_valid[None, :] & in_range,
+            mask=row_valid[:, None] & k_valid[None, :] & in_range,
             other=0.0,
         ).to(tl.float32)
         scores = scores + rel_bias
 
-        keep = rows_valid[:, None] & k_valid[None, :]
+        keep = row_valid[:, None] & k_valid[None, :]
         if CAUSAL:
             keep = keep & (n[None, :] <= q_pos[:, None])
         if HAS_LEFT:
@@ -135,14 +171,15 @@ def _rel_attn_paged_kernel(
             keep = keep & (n[None, :] <= q_pos[:, None] + WINDOW_RIGHT)
         scores = tl.where(keep, scores, -float("inf"))
 
-        v_ptrs = (
+        v_tile = tl.load(
             v_ptr
             + physical[:, None] * stride_v_block
             + offset[:, None] * stride_v_t
             + kv_head * stride_v_h
-            + offs_d[None, :] * stride_v_d
+            + offs_d[None, :] * stride_v_d,
+            mask=k_valid[:, None] & mask_d[None, :],
+            other=0.0,
         )
-        v_tile = tl.load(v_ptrs, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
 
         tile_max = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, tile_max)
@@ -156,13 +193,116 @@ def _rel_attn_paged_kernel(
         )
         m_i = m_new
 
-    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
-    result = acc / l_safe[:, None]
+    if SPLIT_KV:
+        # Store the *normalised* partial output plus the log-sum-exp.  The combine
+        # weights are exp(lse - max_lse), which already contains the split's own
+        # sum, so the partial must be divided by it here (an unnormalised
+        # numerator would be scaled by sum_s a second time).
+        l_has = l_i > 0.0
+        l_safe = tl.where(l_has, l_i, 1.0)
+        lse = tl.where(l_has, m_i + tl.log(l_safe), -float("inf"))
+        tl.store(
+            partial_out_ptr
+            + pid_split * stride_po_s
+            + q_glob[:, None] * stride_po_t
+            + head[:, None] * stride_po_h
+            + offs_d[None, :],
+            acc / l_safe[:, None],
+            mask=row_valid[:, None] & mask_d[None, :],
+        )
+        tl.store(
+            partial_lse_ptr
+            + pid_split * stride_pl_s
+            + q_glob * stride_pl_t
+            + head * stride_pl_h,
+            lse,
+            mask=row_valid,
+        )
+    else:
+        result = acc / tl.where(l_i > 0.0, l_i, 1.0)[:, None]
+        tl.store(
+            out_ptr
+            + q_glob[:, None] * stride_out_t
+            + head[:, None] * stride_out_h
+            + offs_d[None, :] * stride_out_d,
+            result.to(out_ptr.dtype.element_ty),
+            mask=row_valid[:, None] & mask_d[None, :],
+        )
+
+
+@triton.jit
+def _combine_splits_kernel(
+    partial_out_ptr,
+    partial_lse_ptr,
+    out_ptr,
+    stride_po_s,
+    stride_po_t,
+    stride_po_h,
+    stride_pl_s,
+    stride_pl_t,
+    stride_pl_h,
+    stride_out_t,
+    stride_out_h,
+    stride_out_d,
+    total_rows,
+    NUM_HEADS: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    """Merge ``NUM_SPLITS`` partial attentions: out = sum_s w_s*acc_s / sum_s w_s."""
+    pid = tl.program_id(0)
+    rows = pid * ROWS + tl.arange(0, ROWS)
+    row_valid = rows < total_rows
+    q_idx = rows // NUM_HEADS
+    head = rows - q_idx * NUM_HEADS
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < HEAD_DIM
+
+    m_run = tl.full([ROWS], -float("inf"), tl.float32)
+    for s in tl.static_range(NUM_SPLITS):
+        m_run = tl.maximum(
+            m_run,
+            tl.load(
+                partial_lse_ptr
+                + s * stride_pl_s
+                + q_idx * stride_pl_t
+                + head * stride_pl_h,
+                mask=row_valid,
+                other=-float("inf"),
+            ),
+        )
+    den = tl.zeros([ROWS], tl.float32)
+    acc = tl.zeros([ROWS, BLOCK_D], tl.float32)
+    for s in tl.static_range(NUM_SPLITS):
+        lse_s = tl.load(
+            partial_lse_ptr
+            + s * stride_pl_s
+            + q_idx * stride_pl_t
+            + head * stride_pl_h,
+            mask=row_valid,
+            other=-float("inf"),
+        )
+        weight = tl.where(m_run == -float("inf"), 0.0, tl.exp(lse_s - m_run))
+        den += weight
+        part = tl.load(
+            partial_out_ptr
+            + s * stride_po_s
+            + q_idx[:, None] * stride_po_t
+            + head[:, None] * stride_po_h
+            + offs_d[None, :],
+            mask=row_valid[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        acc += weight[:, None] * part
+    den_safe = tl.where(den > 0.0, den, 1.0)
+    result = acc / den_safe[:, None]
     tl.store(
         out_ptr
-        + rows[:, None] * stride_out_t
-        + head * stride_out_h
+        + q_idx[:, None] * stride_out_t
+        + head[:, None] * stride_out_h
         + offs_d[None, :] * stride_out_d,
         result.to(out_ptr.dtype.element_ty),
-        mask=rows_valid[:, None] & mask_d[None, :],
+        mask=row_valid[:, None] & mask_d[None, :],
     )
