@@ -22,7 +22,7 @@ from flag_attn.FLA.wall_attn.parallel import RCP_LN2
 from .kernels import _wall_fwd_kernel
 
 _BT = 64
-_BS = 32
+_BS = 16
 _BK = 64
 _BV = 64
 _WARPS = 4
