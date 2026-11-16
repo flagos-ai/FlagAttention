@@ -34,6 +34,11 @@ from flag_attn.testing import backend as test_backend
 from flag_attn import parallel_parallax
 from flag_attn.FLA.parallax import HAS_TLE
 
+try:
+    from benchmark.recording import BenchmarkRecorder
+except ModuleNotFoundError:  # Execution from the benchmark directory.
+    from recording import BenchmarkRecorder
+
 
 pytestmark = pytest.mark.parallel_parallax
 
@@ -162,6 +167,7 @@ def test_perf_parallax_decode(
     num_kv_heads: int,
     head_dim: int,
     dtype: torch.dtype,
+    record_property,
 ) -> None:
     if not test_backend.supports_operator("parallax_decode", tle=True):
         pytest.skip("selected Parallax decode implementation is unavailable")
@@ -169,6 +175,15 @@ def test_perf_parallax_decode(
     assert WARMUP > 0
     assert CALLS_PER_GRAPH > 0
     assert SAMPLES > 0
+
+    recorder = BenchmarkRecorder(
+        record_property, op_name="parallel_parallax",
+        dtype=str(dtype), phase="decode",
+    )
+    shape_detail = {
+        "B": batch_size, "L": sequence_length, "HQ": num_query_heads,
+        "H": num_kv_heads, "D": head_dim,
+    }
 
     seed = (
         2026 + batch_size * 1_000_003 + sequence_length * 10_007 + num_query_heads * 101 + num_kv_heads * 17 + head_dim
@@ -208,6 +223,8 @@ def test_perf_parallax_decode(
         samples = [test_backend.do_bench(tle_fn, warmup=WARMUP, rep=100, return_mode="median") for _ in range(SAMPLES)]
         median_ms = statistics.median(samples)
         print(f"B={batch_size} L={sequence_length} dtype={dtype} latency={median_ms:.6f} ms (without graph capture)")
+        recorder.add(shape_detail=shape_detail, latency=median_ms)
+        recorder.record()
         return
 
     # Warm every lazy path before capture. Stable out/workspace tensors are
@@ -226,3 +243,5 @@ def test_perf_parallax_decode(
         f"HKV={num_kv_heads} D={head_dim} dtype={dtype} "
         f"TLE={tle_ms:.6f} ms MAD={tle_mad:.3f}% ref={tle_ref_error:.3e}"
     )
+    recorder.add(shape_detail=shape_detail, latency=tle_ms)
+    recorder.record()
