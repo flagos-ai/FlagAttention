@@ -8,9 +8,8 @@ relative logits are added only for ``0 <= q_pos - k_pos < rel_extent``, and the
 causal / sliding-window mask is applied on the shifted positions.
 
 Ascend layout choices:
-* the ``group_size`` query heads that share one KV head are packed into the tile
-  rows together with a token block, so the paged KV tile is loaded once per
-  group instead of once per query head;
+* each program handles one query head; single-token decode with contiguous
+  feature dimensions uses vector reductions, while other tiles use Cube products;
 * the KV range is clipped by the causal bound and the sliding window (past and
   future keys are never fetched);
 * the range is split across ``NUM_SPLITS`` programs and merged by a small fp32
@@ -83,14 +82,16 @@ _PLAN_CACHE: dict = {}
 
 def _plan(total_q, batch, num_heads, num_kv_heads, head_dim_q, head_dim_v, block_size,
           rel_extent, max_seqlen_q, num_splits, causal, window_left, window_right,
-          kv_upper):
+          kv_upper, contiguous_features):
     key = (total_q, batch, num_heads, num_kv_heads, head_dim_q, head_dim_v, block_size,
            rel_extent, max_seqlen_q, num_splits, causal, window_left, window_right,
-           kv_upper)
+           kv_upper, contiguous_features)
     plan = _PLAN_CACHE.get(key)
     if plan is not None:
         return plan
-    if max_seqlen_q <= _SMALL_Q:
+    if max_seqlen_q == 1 and max(head_dim_q, head_dim_v) <= 128 and contiguous_features:
+        block_m, block_n = 1, _SMALL_Q_BLOCK_N
+    elif max_seqlen_q <= _SMALL_Q:
         block_m, block_n = _SMALL_Q_BLOCK_M, _SMALL_Q_BLOCK_N
     else:
         block_m, block_n = _BLOCK_M, _BLOCK_N
@@ -234,6 +235,7 @@ def inkling_fa4_rel_attention(
         total_q, batch_size, num_heads, num_kv_heads, head_dim_q, head_dim_v, block_size,
         rel_extent, max_seqlen_q, num_splits, bool(causal), window_left, window_right,
         kv_upper,
+        q.stride(2) == 1 and key_cache.stride(3) == 1 and value_cache.stride(3) == 1,
     )
 
     if split_kv:

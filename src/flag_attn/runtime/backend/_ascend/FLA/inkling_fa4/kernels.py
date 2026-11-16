@@ -61,7 +61,7 @@ def _rel_attn_paged_kernel(
     num_splits,
     SPLIT_KV: tl.constexpr,
 ):
-    """Packed-GQA relative attention over the paged KV cache.
+    """Relative attention over the paged KV cache.
 
     One program covers up to ``BLOCK_M`` consecutive query tokens of one sequence
     for one query head (GQA heads are not packed: the per-row head index made the
@@ -146,7 +146,12 @@ def _rel_attn_paged_kernel(
             mask=k_valid[:, None] & mask_d[None, :],
             other=0.0,
         )
-        scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * softmax_scale
+        if BLOCK_M == 1:
+            # A single query uses vector reductions without padded Cube rows.
+            q_vec = tl.sum(q_tile.to(tl.float32), axis=0)
+            scores = tl.sum(k_tile.to(tl.float32) * q_vec[None, :], axis=1)[None, :] * softmax_scale
+        else:
+            scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * softmax_scale
 
         # Relative index of the first column of this tile; the index grows by one
         # per column, so the whole slice is one contiguous row run and the per-row
@@ -207,9 +212,13 @@ def _rel_attn_paged_kernel(
         alpha = tl.where(m_i == -float("inf"), 0.0, tl.exp(m_i - m_safe))
         probabilities = tl.exp(scores - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(probabilities, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(
-            probabilities.to(v_tile.dtype), v_tile, out_dtype=tl.float32
-        )
+        if BLOCK_M == 1:
+            weighted_v = tl.trans(probabilities) * v_tile.to(tl.float32)
+            acc = acc * alpha[:, None] + tl.sum(weighted_v, axis=0)[None, :]
+        else:
+            acc = acc * alpha[:, None] + tl.dot(
+                probabilities.to(v_tile.dtype), v_tile, out_dtype=tl.float32
+            )
         m_i = m_new
 
     if SPLIT_KV:
