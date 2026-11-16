@@ -60,6 +60,7 @@ def _rel_attn_paged_kernel(
     WINDOW_RIGHT: tl.constexpr,
     num_splits,
     SPLIT_KV: tl.constexpr,
+    PAGE_LOAD: tl.constexpr = False,
 ):
     """Relative attention over the paged KV cache.
 
@@ -117,46 +118,76 @@ def _rel_attn_paged_kernel(
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
 
-    kv_span = kv_hi - kv_lo
+    if PAGE_LOAD:
+        tl.static_assert(BLOCK_M == 1 and BLOCK_D == 128)
+        tl.static_assert(BLOCK_SIZE == 16 and BLOCK_N % BLOCK_SIZE == 0)
+        iter_hi = tl.cdiv(kv_hi, BLOCK_SIZE) * BLOCK_SIZE
+        kv_span = tl.where(kv_hi > kv_lo, iter_hi - kv_lo, 0)
+    else:
+        iter_hi = kv_hi
+        kv_span = kv_hi - kv_lo
     # Column offsets of the bias row slice: constant for the whole loop.
     bias_col = tl.arange(0, BLOCK_N) * stride_rel_d
     for j0 in range(0, kv_span, BLOCK_N):
-        j = j0 + tl.arange(0, BLOCK_N)
-        k_valid = j < kv_span
-        # Walk the KV window backwards: with ``pos = kv_hi - 1 - j`` the relative
-        # index ``q_pos - pos`` grows by one along the column axis, so the bias
-        # load becomes a contiguous ascending row slice.  With the forward walk
-        # it was a descending (negative-stride) address, which the compiler
-        # turned into one scalar gather per element - the dominant cost of the
-        # prefill shapes.
-        n = (kv_hi - 1) - j
-        logical = n // BLOCK_SIZE
-        offset = n - logical * BLOCK_SIZE
-        physical = tl.load(
-            block_table_ptr + seq * stride_bt_b + logical * stride_bt_block,
-            mask=k_valid,
-            other=0,
-        )
-        k_tile = tl.load(
-            k_ptr
-            + physical[:, None] * stride_k_block
-            + offset[:, None] * stride_k_t
-            + kv_head * stride_k_h
-            + offs_d[None, :] * stride_k_d,
-            mask=k_valid[:, None] & mask_d[None, :],
-            other=0.0,
-        )
-        if BLOCK_M == 1:
-            # A single query uses vector reductions without padded Cube rows.
+        if PAGE_LOAD:
+            # Load each physical page as a contiguous token/feature tile.
+            n = iter_hi - 1 - j0 - tl.arange(0, BLOCK_N)
+            k_valid = (n >= kv_lo) & (n < kv_hi)
+            page_start = (iter_hi - j0 - BLOCK_N) // BLOCK_SIZE
+            page = page_start + tl.arange(0, BLOCK_N // BLOCK_SIZE)
+            page_pos = page * BLOCK_SIZE
+            row = tl.arange(0, BLOCK_SIZE)
+            pos = page_pos[:, None] + row[None, :]
+            page_valid = (page_pos < kv_hi) & (page_pos + BLOCK_SIZE > kv_lo)
+            physical_page = tl.load(block_table_ptr + seq * stride_bt_b + page * stride_bt_block,
+                                    mask=page_valid, other=0)
+            k_fwd = tl.load(k_ptr + physical_page[:, None, None] * stride_k_block
+                            + row[None, :, None] * stride_k_t + kv_head * stride_k_h
+                            + offs_d[None, None, :] * stride_k_d,
+                            mask=((pos >= kv_lo) & (pos < kv_hi))[:, :, None]
+                            & mask_d[None, None, :], other=0.0)
+            k_tile = tl.reshape(k_fwd, [BLOCK_N, BLOCK_D])
             q_vec = tl.sum(q_tile.to(tl.float32), axis=0)
-            scores = tl.sum(k_tile.to(tl.float32) * q_vec[None, :], axis=1)[None, :] * softmax_scale
+            scores_fwd = tl.sum(k_tile.to(tl.float32) * q_vec[None, :], axis=1)
+            reverse = BLOCK_N - 1 - tl.arange(0, BLOCK_N)
+            scores = tl.gather(scores_fwd, reverse, 0)[None, :] * softmax_scale
         else:
-            scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * softmax_scale
+            j = j0 + tl.arange(0, BLOCK_N)
+            k_valid = j < kv_span
+            # Walk the KV window backwards: with ``pos = kv_hi - 1 - j`` the relative
+            # index ``q_pos - pos`` grows by one along the column axis, so the bias
+            # load becomes a contiguous ascending row slice.  With the forward walk
+            # it was a descending (negative-stride) address, which the compiler
+            # turned into one scalar gather per element - the dominant cost of the
+            # prefill shapes.
+            n = (kv_hi - 1) - j
+            logical = n // BLOCK_SIZE
+            offset = n - logical * BLOCK_SIZE
+            physical = tl.load(
+                block_table_ptr + seq * stride_bt_b + logical * stride_bt_block,
+                mask=k_valid,
+                other=0,
+            )
+            k_tile = tl.load(
+                k_ptr
+                + physical[:, None] * stride_k_block
+                + offset[:, None] * stride_k_t
+                + kv_head * stride_k_h
+                + offs_d[None, :] * stride_k_d,
+                mask=k_valid[:, None] & mask_d[None, :],
+                other=0.0,
+            )
+            if BLOCK_M == 1:
+                # A single query uses vector reductions without padded Cube rows.
+                q_vec = tl.sum(q_tile.to(tl.float32), axis=0)
+                scores = tl.sum(k_tile.to(tl.float32) * q_vec[None, :], axis=1)[None, :] * softmax_scale
+            else:
+                scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * softmax_scale
 
         # Relative index of the first column of this tile; the index grows by one
         # per column, so the whole slice is one contiguous row run and the per-row
         # base can be hoisted out of the elementwise address math.
-        bias_start = q_pos - ((kv_hi - 1) - j0)
+        bias_start = q_pos - ((iter_hi - 1) - j0)
         bias_row = (
             rel_ptr
             + q_glob * stride_rel_t
@@ -195,15 +226,23 @@ def _rel_attn_paged_kernel(
             keep = keep & (n[None, :] <= q_pos[:, None] + WINDOW_RIGHT)
         scores = tl.where(keep, scores, -float("inf"))
 
-        v_tile = tl.load(
-            v_ptr
-            + physical[:, None] * stride_v_block
-            + offset[:, None] * stride_v_t
-            + kv_head * stride_v_h
-            + offs_d[None, :] * stride_v_d,
-            mask=k_valid[:, None] & mask_d[None, :],
-            other=0.0,
-        )
+        if PAGE_LOAD:
+            v_fwd = tl.load(v_ptr + physical_page[:, None, None] * stride_v_block
+                            + row[None, :, None] * stride_v_t + kv_head * stride_v_h
+                            + offs_d[None, None, :] * stride_v_d,
+                            mask=((pos >= kv_lo) & (pos < kv_hi))[:, :, None]
+                            & mask_d[None, None, :], other=0.0)
+            v_tile = tl.reshape(v_fwd, [BLOCK_N, BLOCK_D])
+        else:
+            v_tile = tl.load(
+                v_ptr
+                + physical[:, None] * stride_v_block
+                + offset[:, None] * stride_v_t
+                + kv_head * stride_v_h
+                + offs_d[None, :] * stride_v_d,
+                mask=k_valid[:, None] & mask_d[None, :],
+                other=0.0,
+            )
 
         tile_max = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, tile_max)
@@ -212,7 +251,12 @@ def _rel_attn_paged_kernel(
         alpha = tl.where(m_i == -float("inf"), 0.0, tl.exp(m_i - m_safe))
         probabilities = tl.exp(scores - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(probabilities, axis=1)
-        if BLOCK_M == 1:
+        if PAGE_LOAD:
+            # Reverse only score/probability vectors to keep bias loads ascending.
+            p_reverse = tl.gather(tl.reshape(probabilities, [BLOCK_N]), reverse, 0)
+            weighted_v = p_reverse[:, None] * v_tile.to(tl.float32)
+            acc = acc * alpha[:, None] + tl.sum(weighted_v, axis=0)[None, :]
+        elif BLOCK_M == 1:
             weighted_v = tl.trans(probabilities) * v_tile.to(tl.float32)
             acc = acc * alpha[:, None] + tl.sum(weighted_v, axis=0)[None, :]
         else:

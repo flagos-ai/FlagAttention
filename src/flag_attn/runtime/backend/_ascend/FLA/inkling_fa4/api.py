@@ -98,6 +98,9 @@ def _plan(total_q, batch, num_heads, num_kv_heads, head_dim_q, head_dim_v, block
     num_q_blocks = triton.cdiv(max_seqlen_q, block_m)
     base_programs = num_q_blocks * batch * num_heads
     splits = _choose_splits(num_splits, base_programs, kv_upper, block_n, max_seqlen_q)
+    if (block_m == 1 and block_size == 16 and head_dim_q == head_dim_v == 128
+            and triton.cdiv(kv_upper, splits) >= 256):
+        block_n = 64
     split_kv = splits > 1
     has_left = window_left is not None and window_left >= 0
     has_right = window_right is not None and window_right >= 0
@@ -304,6 +307,7 @@ def inkling_fa4_rel_attention(
         WINDOW_RIGHT=window_right if has_right else 0,
         num_splits=splits,
         SPLIT_KV=split_kv,
+        PAGE_LOAD=block_m == 1 and block_n == 64,
         num_warps=_NUM_WARPS,
     )
 
