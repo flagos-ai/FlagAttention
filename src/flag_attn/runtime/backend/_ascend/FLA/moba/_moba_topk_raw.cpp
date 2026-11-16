@@ -3,12 +3,9 @@
 
 #include "Utils.h"
 
-// UB layouts: ids/gate [64, 128], pairs [16, 256], sorted [16, 64],
-// best [64, 16]. Gate and scratch are overwritten; best carries state.
-// All buffers are contiguous UB tiles. Each proposal is (FP32 score, uint32 id)
-// in two 32-bit fields. Inputs are ordered by chunk id; stable sorting and
-// merging keep the smaller id on ties. The historical list precedes the new
-// tile because its chunk ids are smaller.
+// Stable top-eight selection from a contiguous [64, 128] gate tile.
+// UB scratch: pairs [16, 256], sorted [16, 64]; best [64, 16] is in/out state.
+// Each proposal stores an FP32 score followed by uint32 id bits.
 extern "C" __aiv__ void _mlir_ciface_moba_sort_topk(
     memref_t<__ubuf__ uint32_t, 2> *ids,
     memref_t<__ubuf__ float, 2> *gate,
@@ -45,6 +42,7 @@ extern "C" __aiv__ void _mlir_ciface_moba_sort_topk(
     vmrgsort4(local, lists, group_tokens, 8, 8, 8, 8, false, 15);
     pipe_barrier(PIPE_V);
 
+    // Existing candidates precede the new tile so ties keep smaller chunk ids.
     for (int token = 0; token < group_tokens; ++token) {
       __ubuf__ float *merge[4] = {
           current + token * 16, local + token * 64,

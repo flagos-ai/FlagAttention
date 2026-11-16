@@ -553,7 +553,7 @@ def _chunk_metadata_from_host(
 
 
 def calc_chunks(cu_seqlen, moba_chunk_size):
-    """Prepare packed MoBA chunk metadata without CUDA-side PyTorch ops."""
+    """Build packed chunk metadata on the host and upload it to the device."""
     return _chunk_metadata_from_host(
         cu_seqlen.detach().cpu(),
         cu_seqlen.device,
@@ -678,17 +678,9 @@ def _chunk_means_gather_torch(
     chunk_size: int,
     valid_historical: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """Chunk means via one contiguous gather + CANN mean reduction.
+    """Gather contiguous chunk rows and reduce them with CANN mean.
 
-    The Triton variant is limited by the strided per-(chunk, head) reads on this
-    backend (hundreds of ms at S=4096).  A chunk is a contiguous run of
-    ``chunk_size`` token rows, so a single ``index_select`` of the chunk starts
-    (built on device, no host sync) yields a contiguous ``[num, C, H, D]``
-    tensor whose ``mean(dim=1)`` is a bandwidth-bound CANN kernel.  Extraction
-    of the ``[num, C]`` token index is the only extra traffic.
-
-    Returns ``None`` when the fast path does not apply (caller falls back to the
-    Triton kernel).
+    Return None when the input does not qualify for this path.
     """
     if chunk_size is None or chunk_size <= 0:
         return None
@@ -1282,15 +1274,10 @@ def _dense_slot_batch_end_kernel(
     MAX_CHUNKS_PER_SEQUENCE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Per-slot sequence end for the dense inference chunk metadata.
+    """Build per-slot sequence ends for dense inference metadata.
 
-    A dense slot is ``batch * MAX_CHUNKS_PER_SEQUENCE + local_chunk``.
-    ``_dense_chunk_metadata_kernel`` writes ``chunk_end == 0`` for every slot
-    that is not a historical chunk (the last chunk of a sequence and the
-    capacity padding); those slots get ``batch_end == 0`` so that the shared
-    masked-argmax top-k kernel's ``t < batch_end`` test excludes them.  Valid
-    slots get their own sequence end, which is what keeps the top-k from
-    picking chunks of another packed sequence.
+    Historical slots receive their sequence end; other slots receive zero.
+    The top-k mask uses this table to exclude slots from other sequences.
     """
     slots = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = slots < num_slots
@@ -1769,13 +1756,7 @@ _ROUTE_LINEAR_MIN_SEQLEN = 0
 
 
 def _route_tile_size(seqlen: int, num_chunks: int, topk: int) -> int:
-    """Tokens per bucket tile.
-
-    The tile governs the number of cells (and therefore the inverse pass
-    overhead) as well as the average run length, `topk * tile / num_chunks`.
-    Aim for ~32 slots per cell, capped by the raw-kernel UB budget and by the
-    sequence length itself.
-    """
+    """Choose a token tile targeting 32 route slots per cell, within the tile limits."""
     target = max(1, 32 * num_chunks // max(topk, 1))
     tile = _ROUTE_TILE_TOKENS
     while tile < target and tile < _ROUTE_TILE_TOKENS_MAX and tile * 2 <= seqlen:
@@ -1910,7 +1891,7 @@ def _route_inverse_expand(counts3, base3, start3, out_ids):
 
 
 def _route_bucket_tiles_torch(selected_chunks, start3, base3, tile):
-    """Reference bucket pass (slow; the raw kernel mirrors it exactly)."""
+    """Reference bucket pass using the same slot ordering as the Raw kernel."""
     topk, num_heads, seqlen = selected_chunks.shape
     n_blocks, _, num_chunks = start3.shape
     device = selected_chunks.device
@@ -1969,8 +1950,7 @@ def _route_expert_layout(counts3):
     device = counts3.device
     # Tile-local exclusive prefix over chunks: the run start inside a tile.
     start3 = torch.cumsum(counts3, -1, dtype=torch.int32) - counts3
-    # Expert ids are `chunk * num_heads + head`; `counts3` is head-major, so the
-    # sums are transposed once (8 MB, negligible next to the route arrays).
+    # Convert head-major counts to chunk-major expert ids: chunk * num_heads + head.
     expert_counts = (
         counts3.sum(0).transpose(0, 1).reshape(-1).contiguous()
     )
@@ -2455,11 +2435,7 @@ def _gather_moba_backward_inputs_kernel(
     num_heads: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """
-    Kernel to gather backward pass inputs for the MoBA branch.
-    Since MoBA works on a sparse subset of Q, we need to gather gradients (dout),
-    outputs (out), and LSE scores corresponding to those sparse indices.
-    """
+    """Gather dout, output, and LSE rows for the sparse MoBA branch."""
     pid = tl.program_id(0)
     stride = tl.num_programs(0)
     iters = (num_indices - pid + stride - 1) // stride

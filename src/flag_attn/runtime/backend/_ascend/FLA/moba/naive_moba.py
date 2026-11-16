@@ -1,4 +1,4 @@
-"""A clean version of moba implementation for educational purposes"""
+"""PyTorch reference for causal MoBA."""
 
 import torch
 import math

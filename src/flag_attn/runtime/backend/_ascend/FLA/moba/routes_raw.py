@@ -26,6 +26,8 @@ _MAX_TILE_TOKENS = 2048
 _MAX_CALL_TOKENS = 1024
 _CALL_TOKENS = tl.constexpr(_MAX_CALL_TOKENS)
 _BUCKET_BLOCK = 256
+# Cap flattened (tile, head) launch slices at the complex-kernel limit.
+_MAX_PROGRAMS = 32768
 
 try:  # FlagTree builds expose the TLE-Raw channel; plain Triton does not.
     import triton.experimental.tle as tle
@@ -69,18 +71,20 @@ def _raw_available(selected_chunks) -> bool:
 
 if _HAS_TLE_RAW:
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["program_offset"])
     def _route_hist_kernel(
         sel_ptr,
         counts_ptr,
         num_tokens,
+        program_offset,
         BT: tl.constexpr,
         NC: tl.constexpr,
         H: tl.constexpr,
         TOPK: tl.constexpr,
     ):
-        tile = tl.program_id(0)
-        head = tl.program_id(1)
+        program = program_offset + tl.program_id(0)
+        tile = program // H
+        head = program % H
         offs = tl.arange(0, BT)
         u0 = tle.dsa.alloc([BT], dtype=tl.int32, mem_addr_space=tle.dsa.ascend.UB)
         u1 = tle.dsa.alloc([BT], dtype=tl.int32, mem_addr_space=tle.dsa.ascend.UB)
@@ -92,9 +96,8 @@ if _HAS_TLE_RAW:
         u7 = tle.dsa.alloc([BT], dtype=tl.int32, mem_addr_space=tle.dsa.ascend.UB)
         src = sel_ptr + head * num_tokens + tile * BT + offs
         rank_stride = H * num_tokens
-        # Every staged buffer needs a producer (an undefined UB operand makes
-        # the planner emit a device-side malloc and the link fails), so unused
-        # ranks are filled with rank 0 and ignored by the kernel's `topk`.
+        # Give every staged buffer a producer. Unused ranks repeat the last
+        # valid rank and are ignored by the Raw kernel's topk bound.
         for rank in tl.static_range(_MAX_TOPK):
             use_rank = rank if rank < TOPK else TOPK - 1
             src_rank = src + use_rank * rank_stride
@@ -163,7 +166,7 @@ if _HAS_TLE_RAW:
             else:
                 tle.dsa.copy(src_rank, u7, [CALL])
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["program_offset"])
     def _route_bucket_kernel(
         sel_ptr,
         start_ptr,
@@ -171,6 +174,7 @@ if _HAS_TLE_RAW:
         out_rows_ptr,
         pos_ptr,
         num_tokens,
+        program_offset,
         BT: tl.constexpr,
         NC: tl.constexpr,
         H: tl.constexpr,
@@ -185,8 +189,9 @@ if _HAS_TLE_RAW:
         output is chained through the raw call and the per-call position buffers
         are stitched by the caller.
         """
-        tile = tl.program_id(0)
-        head = tl.program_id(1)
+        program = program_offset + tl.program_id(0)
+        tile = program // H
+        head = program % H
         cell = tile * H + head
         u0 = tle.dsa.alloc([CALL], dtype=tl.int32, mem_addr_space=tle.dsa.ascend.UB)
         u1 = tle.dsa.alloc([CALL], dtype=tl.int32, mem_addr_space=tle.dsa.ascend.UB)
@@ -276,35 +281,46 @@ _SMALL_SEQLEN = 32768
 
 
 def tile_tokens_for_raw(seqlen: int) -> int:
-    """Largest UB-safe token tile that still divides ``seqlen``."""
-    tile = _MAX_TILE_TOKENS if seqlen >= _SMALL_SEQLEN else _MAX_CALL_TOKENS
-    while tile > 1 and seqlen % tile != 0:
-        tile //= 2
-    return tile
+    """Choose a UB-safe power-of-two token tile."""
+    limit = _MAX_TILE_TOKENS if seqlen >= _SMALL_SEQLEN else _MAX_CALL_TOKENS
+    return min(limit, triton.next_power_of_2(max(seqlen, 1)))
+
+
+def _pad_route_tokens(selected_chunks, tile: int):
+    """Pad only route ids; -1 slots contribute neither counts nor query rows."""
+    padding = (-selected_chunks.shape[-1]) % tile
+    if padding == 0:
+        return selected_chunks
+    return torch.nn.functional.pad(selected_chunks, (0, padding), value=-1)
 
 
 def route_cell_hist(selected_chunks, num_chunks: int) -> torch.Tensor | None:
     """``counts[tile, head, chunk]`` via the raw histogram kernel."""
     topk, num_heads, num_tokens = selected_chunks.shape
-    tile = tile_tokens_for_raw(num_tokens)
-    if tile < 1 or not _raw_available(selected_chunks):
+    if num_tokens == 0 or not _raw_available(selected_chunks):
         return None
+    tile = tile_tokens_for_raw(num_tokens)
+    selected_chunks = _pad_route_tokens(selected_chunks, tile)
+    num_tokens = selected_chunks.shape[-1]
     n_blocks = num_tokens // tile
     counts = torch.empty(
         (n_blocks * num_heads * num_chunks,),
         device=selected_chunks.device,
         dtype=torch.int32,
     )
-    _route_hist_kernel[(n_blocks, num_heads)](
-        selected_chunks,
-        counts,
-        num_tokens,
-        BT=tile,
-        NC=num_chunks,
-        H=num_heads,
-        TOPK=topk,
-        num_warps=1,
-    )
+    num_programs = n_blocks * num_heads
+    for program_offset in range(0, num_programs, _MAX_PROGRAMS):
+        _route_hist_kernel[(min(_MAX_PROGRAMS, num_programs - program_offset),)](
+            selected_chunks,
+            counts,
+            num_tokens,
+            program_offset,
+            BT=tile,
+            NC=num_chunks,
+            H=num_heads,
+            TOPK=topk,
+            num_warps=1,
+        )
     return counts.view(n_blocks, num_heads, num_chunks)
 
 
@@ -312,12 +328,15 @@ def route_cell_bucket(selected_chunks, start3, base3) -> tuple | None:
     """Per-cell runs (``out_rows``) and compact per-slot positions."""
     topk, num_heads, num_tokens = selected_chunks.shape
     n_blocks = start3.shape[0]
-    tile = num_tokens // n_blocks
-    if not _raw_available(selected_chunks) or tile > _MAX_TILE_TOKENS:
+    if num_tokens == 0 or not _raw_available(selected_chunks):
         return None
+    tile = tile_tokens_for_raw(num_tokens)
+    selected_chunks = _pad_route_tokens(selected_chunks, tile)
+    staged_tokens = selected_chunks.shape[-1]
+    if n_blocks * tile != staged_tokens:
+        raise ValueError("Raw histogram and bucket tile layouts must match")
     device = selected_chunks.device
-    # tiles are powers of two, so the staged call is either the whole tile or
-    # exactly half of a 2*CALL tile: no partial sub-block ever reaches the kernel
+    # Tail route ids are -1, so each Raw call receives a full power-of-two tile.
     call = min(tile, _MAX_CALL_TOKENS)
     n_calls = tile // call
     out_rows = torch.empty(
@@ -327,26 +346,30 @@ def route_cell_bucket(selected_chunks, start3, base3) -> tuple | None:
         (n_blocks * num_heads, n_calls, topk * call),
         device=device, dtype=torch.int32,
     )
-    _route_bucket_kernel[(n_blocks, num_heads)](
-        selected_chunks,
-        start3,
-        base3,
-        out_rows,
-        pos_tile,
-        num_tokens,
-        BT=tile,
-        NC=start3.shape[2],
-        H=num_heads,
-        TOPK=topk,
-        CALL=call,
-        NCALL=n_calls,
-        num_warps=1,
-    )
+    num_programs = n_blocks * num_heads
+    for program_offset in range(0, num_programs, _MAX_PROGRAMS):
+        _route_bucket_kernel[(min(_MAX_PROGRAMS, num_programs - program_offset),)](
+            selected_chunks,
+            start3,
+            base3,
+            out_rows,
+            pos_tile,
+            staged_tokens,
+            program_offset,
+            BT=tile,
+            NC=start3.shape[2],
+            H=num_heads,
+            TOPK=topk,
+            CALL=call,
+            NCALL=n_calls,
+            num_warps=1,
+        )
     # [tile, head, call, rank, token] -> [rank, token * num_heads + head]
     positions = (
         pos_tile.view(n_blocks, num_heads, n_calls, topk, call)
         .permute(3, 0, 2, 4, 1)
         .contiguous()
-        .view(topk, num_heads * num_tokens)
+        .view(topk, num_heads * staged_tokens)
     )
+    positions = positions[:, :num_heads * num_tokens].contiguous()
     return out_rows, positions

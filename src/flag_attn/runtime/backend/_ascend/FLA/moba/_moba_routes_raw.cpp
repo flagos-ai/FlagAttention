@@ -1,30 +1,8 @@
 // Copyright 2026 FlagOS Contributors
 // SPDX-License-Identifier: Apache-2.0
-//
-// TLE-Raw (AscendC, vector core) kernels for MoBA route compaction.
-//
-// Triton cannot express this on Ascend: bucketing route slots by chunk needs
-// per-cell cursors (a scalar read-modify-write loop) and there is no GM scatter
-// primitive at all, so the compact layout has to be produced with UB-local
-// cursors and then written out as contiguous runs.
-//
-// A program owns one (token tile, head) cell group: the 8 rank segments of the
-// per-slot chunk routing are staged into separate UB buffers (one parent buffer
-// plus subviews loses the MTE2->V dependency in the IR sync pass and races; an
-// array of UB pointers makes ccec emit a device-side malloc reference that
-// fails to link).
-//
-// `topk` is a runtime argument (the routed top-k is `moba_topk - 1`): the rank
-// bodies are guarded so any 1..8 works with the same 8 staged buffers.
-//
-//   sel    : [TOPK, num_heads, num_tokens] int32, chunk id or -1
-//   counts : per-(tile, head) chunk histogram          [n_blocks, H, NC]
-//   start  : tile-local exclusive prefix of run starts [n_blocks, H, NC]
-//   base   : global compact base of each cell          [n_blocks, H, NC]
-//   out    : packed query rows `row_base + t * num_heads + h` grouped by chunk,
-//            runs (see `row_base` below),
-//            one (tile, head) row of TOPK * bt entries
-//   pos    : global compact position per slot, slot order i = rank * bt + t
+
+// Route histogram and bucket kernels for one (token tile, head) group.
+// Up to eight rank segments use separate UB buffers; -1 denotes no route.
 #include "Utils.h"
 
 #define INTRINSIC(NAME, ...) NAME(__VA_ARGS__)
@@ -54,12 +32,8 @@ vdup_i32(__ubuf__ int32_t *dst, int32_t value, int32_t n) {
     }                                                                          \
   }
 
-// Rank-unrolled bucket body.  `st` doubles as the run-destination cursor (a
-// run's first destination is its tile-local start) and `bs` as the compact
-// position cursor (its first value is the cell's global base), which removes the
-// separate cursor buffer (the raw channel silently drops the op at 19 operands).
-// Positions land in a per-call buffer at index rank * bt + t, so a tile streamed
-// through several calls needs no call offset.
+// st and bs are in/out cursors for tile-local destinations and compact positions.
+// Each call writes positions in rank-major order: rank * bt + token.
 #define BUCKET_RANK(P, RANK)                                                   \
   for (int32_t t = 0; t < bt; ++t) {                                           \
     const int32_t x = (P)[t];                                                  \

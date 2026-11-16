@@ -50,10 +50,7 @@ _SPARSE_ROUTE_OUT_BUDGET_BYTES = 8 * 1024 * 1024 * 1024
 
 
 class MixedAttention(torch.autograd.Function):
-    """
-    Custom Autograd Function handling the mixed attention mechanism.
-    Integrates Self-Attention and MoBA-Attention using Triton-optimized kernels.
-    """
+    """Combine chunk-local and routed attention with their backward passes."""
 
     @staticmethod
     def forward(
@@ -182,7 +179,7 @@ class MixedAttention(torch.autograd.Function):
         )
 
         # 2. Gather inputs for MoBA Backward
-        # Optimization: Triton kernel to sparsely gather gradients/outputs needed for MoBA backward
+        # Gather the sparse route rows needed by the backward kernels.
         num_selected = moba_q_sh_indices.numel()
         gathered_d_moba = torch.empty(
             (num_selected, q.shape[-1]),
@@ -271,19 +268,10 @@ def _moba_attn_varlen_inference(
     moba_chunk_size: int,
     moba_topk: int,
 ) -> torch.Tensor:
-    """Device-side forward path with native GQA and index-only sparse routes.
+    """Index-based inference with native GQA and dense chunk metadata.
 
-    The training path below intentionally retains the materialized autograd
-    implementation until direct routed backward kernels are available.  In
-    normal inference (`torch.no_grad` / `torch.inference_mode`) this path never
-    expands K/V, never copies routed Q/K/V payloads, and never reads a dynamic
-    route count back to the host.
-
-    Caller contract: ``cu_seqlens`` must start at zero, be strictly increasing,
-    and end at ``q.shape[0]``; ``max_seqlen`` must be at least the actual
-    maximum sequence length. These value-dependent conditions are deliberately
-    not checked here because reading CUDA metadata on the host would synchronize
-    the inference hot path and break CUDA Graph capture.
+    The caller supplies valid packed boundaries and max_seqlen; this helper
+    does not validate their values on the host.
     """
     seqlen, num_q_heads, head_dim = q.shape
     (
@@ -396,28 +384,16 @@ def parallel_moba(
     moba_chunk_size: int,
     moba_topk: int,
 ) -> torch.Tensor:
-    """
-    Triton implementation of causal variable-length MoBA.
+    """Causal MoBA for packed non-empty sequences with MHA/GQA/MQA.
 
-    ``moba_topk`` counts the current causal chunk, matching FlashMoBA. The
-    implementation supports packed non-empty sequences, MHA/GQA/MQA, head
-    dimensions up to 256, and top-k values up to 64.
+    Q has shape [tokens, query_heads, head_dim]; K/V use kv_heads instead.
+    The head dimension is at most 256 and moba_topk at most 64, including
+    the current chunk. Query heads must be divisible by KV heads.
 
-    Inference callers must provide a valid, strictly increasing ``cu_seqlens``
-    starting at zero and ending at the packed token count, and ``max_seqlen``
-    must be no smaller than the actual maximum sequence length. The inference
-    path intentionally does not synchronize CUDA metadata back to the host to
-    validate these value-dependent conditions. The autograd path retains its
-    existing host-side validation.
-
-    Args:
-        q (torch.Tensor): [seqlen, num_q_heads, head_dim]
-        k (torch.Tensor): [seqlen, num_kv_heads, head_dim]
-        v (torch.Tensor): [seqlen, num_kv_heads, head_dim]
-        cu_seqlens (torch.Tensor): Cumulative sequence length (FlashAttention format)
-        max_seqlen (int): Max sequence length in batch
-        moba_chunk_size (int): Size of chunks
-        moba_topk (int): Number of chunks to attend to
+    cu_seqlens contains strictly increasing int32 boundaries on the input
+    device, starting at zero and ending at the packed token count.
+    max_seqlen must cover the longest sequence. Inference callers provide
+    valid boundary values; the autograd path validates them on the host.
     """
 
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -471,9 +447,7 @@ def parallel_moba(
     if not v.is_contiguous():
         v = v.contiguous()
 
-    # Inference is the deployment target and uses a separate fully device-side
-    # dataflow.  Keeping the existing autograd path below avoids silently
-    # weakening backward correctness while direct routed backward is pending.
+    # Inference uses index-based routed attention; autograd gathers route data.
     if not torch.is_grad_enabled():
         return _moba_attn_varlen_inference(
             q,
@@ -488,11 +462,9 @@ def parallel_moba(
     if num_q_heads != num_kv_heads:
         k, v = _expand_kv_heads_triton(k, v, num_q_heads)
 
-    """ some basic variables """
     # qkv shape = [ S, H, D ]
     seqlen, num_head, head_dim = q.shape
 
-    """ prepare chunk meta """
     actual_max_seqlen, chunk_metadata = _validated_chunk_metadata(
         cu_seqlens,
         cu_seqlens._version,
@@ -510,7 +482,7 @@ def parallel_moba(
         chunk_to_batch,
     ) = chunk_metadata
 
-    # we will adjust selective topk to moba_topk - 1, as the last chunk is always chosen
+    # Reserve one top-k slot for the current chunk.
     max_historical_chunks = max(cdiv(actual_max_seqlen, moba_chunk_size) - 1, 0)
     moba_topk = min(
         moba_topk - 1,
@@ -548,7 +520,7 @@ def parallel_moba(
         cu_seqlens,
     )
 
-    # Optimization: Use compact Top-K chunk indices instead of a dense gate mask.
+    # Select compact chunk indices for the historical routes.
     selected_chunks = _compute_selected_chunks_streaming_triton(
         q,
         chunk_means,

@@ -822,16 +822,10 @@ def _fused_merge_softmax_kernel(
     NUM_ROUTES: tl.constexpr,
     ROWS_PER_PROGRAM: tl.constexpr,
 ):
-    """Fused online-softmax merge of self-attention and MoBA-attention results.
+    """Merge chunk-local and routed outputs using online softmax and their LSEs.
 
-    O = (O_self * exp(LSE_self - LSE_max) + sum(O_moba * exp(LSE_moba - LSE_max))) / exp(LSE_new - LSE_max)
-
-    Rows are mapped head-major: one program merges ROWS_PER_PROGRAM tokens of a
-    single head.  That makes the per-rank route positions of consecutive rows
-    nearly sequential (route rows of one expert are ordered by query token), and
-    the row-wise ``self_lse``/``final_lse`` accesses become contiguous, which is
-    far cheaper than the row-major layout on Ascend.  The merge itself uses an
-    online softmax so every routed vector is loaded exactly once.
+    Each program handles consecutive tokens of one head. Route outputs are
+    loaded once and merged in FP32 without materializing separate weights.
     """
     program = tl.program_id(0) + PROGRAM_OFFSET
     token_block = program // num_heads
