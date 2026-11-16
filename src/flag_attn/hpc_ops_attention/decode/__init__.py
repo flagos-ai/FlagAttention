@@ -27,12 +27,11 @@ import triton.language as tl
 try:
     import triton.experimental.tle.language as tle
     from triton.experimental.tle.language.gpu import types as gpu_types
+    HAS_TLE = hasattr(tle, "device_mesh")
 except (ImportError, AttributeError):
     tle = None
     gpu_types = None
     HAS_TLE = False
-else:
-    HAS_TLE = True
 
 USE_TLE = HAS_TLE
 
