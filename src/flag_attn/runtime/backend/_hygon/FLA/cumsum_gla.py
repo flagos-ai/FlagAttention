@@ -231,8 +231,7 @@ def chunk_global_cumsum_scalar_kernel(
         if REVERSE:
             b_o = -b_o + b_ss + b_s
         b_o += b_z
-        if i_c >= 0:
-            b_z += b_ss
+        b_z += b_ss
         if HAS_SCALE:
             b_o *= scale
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
