@@ -142,7 +142,6 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len):
         k_scale,
         attn_mask=attn_mask,
         return_lse=True,
-        maxnreg=168,
     )
     expected, expected_lse = _reference(
         q_int8,

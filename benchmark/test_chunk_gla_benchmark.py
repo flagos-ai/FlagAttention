@@ -174,6 +174,7 @@ def run_benchmark(
     warmup: int = DEFAULT_WARMUP,
     rep: int = DEFAULT_REP,
     record_property=None,
+    forward_only: bool = False,
 ) -> None:
     if not test_backend.supports_operator("chunk_gla"):
         raise RuntimeError("chunk_gla benchmark requires an available accelerator")
@@ -219,6 +220,9 @@ def run_benchmark(
                 latency=ms_flag_attn,
             )
         recorder.record()
+
+    if forward_only:
+        return
 
     # ============================================================
     # Part 2: forward + backward
@@ -287,5 +291,9 @@ def run_benchmark(
 @pytest.mark.skipif(
     not test_backend.supports_operator("chunk_gla"), reason=test_backend.skip_reason("chunk_gla")
 )
-def test_chunk_gla_benchmark(record_property) -> None:
-    run_benchmark(record_property=record_property)
+def test_chunk_gla_benchmark(record_property, pytestconfig) -> None:
+    # The shared optest runner selects this operator with `-m chunk_gla`.
+    run_benchmark(
+        record_property=record_property,
+        forward_only=pytestconfig.getoption("markexpr").strip() == "chunk_gla",
+    )

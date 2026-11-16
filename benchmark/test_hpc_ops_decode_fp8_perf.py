@@ -33,6 +33,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:
+    from recording import benchmark_metric, record_benchmark_result
+
 from flag_attn.testing import backend as test_backend
 from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_dynamic as fp8_qk_dynamic,
@@ -408,7 +413,7 @@ def report_performance_results():
 @pytest.mark.parametrize("case", BENCH_CASES)
 @pytest.mark.parametrize("layout", BENCH_LAYOUTS)
 def test_attention_decode_fp8_perf(
-    hpc_baseline, mtp, quant_type, schedule, case, layout,
+    hpc_baseline, mtp, quant_type, schedule, case, layout, record_property,
 ):
     variant = ("fp8_qk_" if quant_type == "qkpertoken_perhead_vperhead" else "fp8_kv_") + schedule
     if not test_backend.supports_operator(f"hy3_attention_decode_{variant}", min_sm=(9, 0)):
@@ -470,6 +475,19 @@ def test_attention_decode_fp8_perf(
         "flagattention_ms": flagattention_ms,
         "hpc_ms": hpc_ms,
     })
+
+    record_benchmark_result(
+        record_property, op_name="hy3_attention",
+        dtype=str(torch.float8_e4m3fn),
+        result=[benchmark_metric(
+            shape_detail={
+                "variant": "decode_fp8", "case": case, "mtp": mtp, "quant_type": quant_type,
+                "schedule": schedule, "layout": layout,
+            },
+            latency=flagattention_ms, latency_base=hpc_ms,
+        )],
+        baseline="hpc CUDA" if hpc_ms is not None else None,
+    )
 
     del panel, inputs, workspace, cuda_output, task_map
     gc.collect()
