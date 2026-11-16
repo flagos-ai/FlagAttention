@@ -74,7 +74,9 @@ def _wall_fwd_kernel(
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_pq = tl.load(p_pq, boundary_check=(0, 1)).to(tl.float32)
     b_R = tl.load(p_R, boundary_check=(0, 1)).to(tl.float32)
-    b_q_til = (b_q.to(tl.float32) * exp2(b_pq - b_R)).to(b_q.dtype)
+    # Fold the constant scale into the per-program Q rescale so the inner loop
+    # needs one multiply less per KV block.
+    b_q_til = (b_q.to(tl.float32) * exp2(b_pq - b_R) * (scale * RCP_LN2)).to(b_q.dtype)
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_m = tl.full([BT], float("-inf"), dtype=tl.float32)
@@ -102,7 +104,7 @@ def _wall_fwd_kernel(
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_pk = tl.load(p_pk, boundary_check=(0, 1)).to(tl.float32)
         b_k_til = (b_k.to(tl.float32) * exp2(b_R_t - b_pk)).to(b_k.dtype)
-        b_s = tl.dot(b_q_til, b_k_til) * scale * RCP_LN2
+        b_s = tl.dot(b_q_til, b_k_til)
 
         o_k = i_s + tl.arange(0, BS)
         m_k = o_k < T
@@ -137,11 +139,11 @@ def _wall_fwd_kernel(
 
         b_exp_k = b_R_local_t - b_pk
         b_exp_k = tl.where(b_exp_k > 110.0, tl.zeros_like(b_exp_k) + 110.0, b_exp_k)
-        b_k_til = b_k.to(tl.float32) * exp2(b_exp_k)
+        b_k_til = (b_k.to(tl.float32) * exp2(b_exp_k)).to(b_k.dtype)
 
         b_exp_q = tl.minimum(b_pq - b_R_local_bc, tl.zeros([BT, BK], dtype=tl.float32))
-        b_q_til_local = b_q.to(tl.float32) * exp2(b_exp_q)
-        b_s = tl.dot(b_q_til_local, b_k_til) * scale * RCP_LN2
+        b_q_til_local = (b_q.to(tl.float32) * exp2(b_exp_q) * (scale * RCP_LN2)).to(b_q.dtype)
+        b_s = tl.dot(b_q_til_local, b_k_til)
 
         if USE_SCALAR_G:
             b_ck = tl.load(g_scalar_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
