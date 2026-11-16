@@ -8,6 +8,7 @@ The benchmark imports the same inputs and reference adapters from this file.
 import gc
 import hashlib
 import importlib
+import math
 import weakref
 from functools import lru_cache
 
@@ -332,3 +333,57 @@ def test_forgetting_attention_explicit_async_and_hot_launch(id):
     _, compiled, _, _, cache_hit = attention[0]
     assert cache_hit
     assert ("wgmma.mma_async" in compiled.asm["ptx"]) == (case["M"] > 1)
+
+
+def _dense_d128_acp_reference(q, k, v, log_fgate, scale, threshold):
+    """Materialize the original ACP mask independently of the Hopper launchers."""
+    m, n = q.shape[1], k.shape[1]
+    dtype = q.dtype
+    groups = q.shape[2] // k.shape[2]
+    q = q.transpose(1, 2).double()
+    k = k.transpose(1, 2).repeat_interleave(groups, dim=1).double()
+    v = v.transpose(1, 2).repeat_interleave(groups, dim=1).double()
+    prefix = log_fgate.transpose(1, 2).double().cumsum(dim=-1)
+
+    qpos = torch.arange(n - m, n, device=q.device)
+    kpos = torch.arange(n, device=q.device)
+    group_size = 1 if m == 1 else 128
+    anchors = n - m + torch.arange(0, m, group_size, device=q.device)
+    tile_ends = torch.arange(127, n + 127, 128, device=q.device).clamp_max(n - 1)
+    tile_bias = prefix[..., anchors, None] - prefix[..., None, tile_ends]
+    starts = 128 * (tile_bias < threshold).sum(dim=-1)
+    starts = starts.repeat_interleave(group_size, dim=-1)[..., :m]
+
+    if m == 1:
+        # The decode kernel rounds each QK product before the FP32 reduction.
+        scores = (q.transpose(-1, -2) * k.transpose(-1, -2)).to(dtype)
+        scores = scores.double().sum(dim=-2, keepdim=True)
+    else:
+        scores = q @ k.transpose(-1, -2)
+    scores = scores * scale + prefix[..., qpos, None] - prefix[..., None, :]
+    valid = (kpos <= qpos[:, None]) & (kpos >= starts[..., None])
+    return (scores.masked_fill(~valid, -torch.inf).softmax(dim=-1) @ v).transpose(1, 2)
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="requires SM90 with TLE")
+@torch.inference_mode()
+def test_hopper_candidate_matches_dense_acp(dtype_name, mode):
+    m, n = (129, 384) if mode == "prefill" else (1, 2305)
+    scale = 1.0 / math.sqrt(128)
+    threshold = -1.75 if mode == "prefill" else -10.0
+    case = dict(B=2, M=m, N=n, HQ=4, H=2, D=128, dtype=dtype_name)
+    dtype = getattr(torch, dtype_name)
+    q, k, v, gate = make_inputs(case)
+    gate.fill_(-0.03125)
+    if mode == "decode":
+        # Exercise the split and direct-write paths in one launch.
+        gate[..., ::2] = 0
+
+    expected = _dense_d128_acp_reference(q, k, v, gate, scale, threshold).to(dtype)
+    actual = optimized_entry()(
+        q, k, v, gate, sm_scale=scale, adaptive_threshold=threshold, implementation="hopper",
+    )
+    atol, rtol = (4e-3, 2e-2) if dtype == torch.bfloat16 else (1e-3, 3e-3)
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
