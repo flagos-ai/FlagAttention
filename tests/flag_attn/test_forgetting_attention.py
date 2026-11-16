@@ -203,14 +203,24 @@ pytestmark = [
 @pytest.mark.parametrize("seed", [0, 1])
 @torch.inference_mode()
 def test_forgetting_attention_matches_official(case, seed):
+    from flag_attn.forgetting_attention.parallel import _tle_forgetting_attention, _use_h20_tiles
+
     inputs = make_inputs(case, seed)
     expected = call_official(inputs, case)
     cold = call_optimized(inputs, case)
     warm = call_optimized(inputs, case)
-    assert_bitwise(cold, expected)
-    assert_bitwise(warm, expected)
+    if CUDA_SM90 and TLE_AVAILABLE and _use_h20_tiles(*inputs[:2]):
+        baseline = _tle_forgetting_attention(*inputs, sm_scale=case["scale"], adaptive_threshold=-10.0)
+        assert_bitwise(baseline, expected)
+        atol, rtol = (6e-3, 2e-2) if warm.dtype == torch.bfloat16 else (2e-3, 5e-3)
+        torch.testing.assert_close(cold, expected, atol=atol, rtol=rtol)
+        assert_bitwise(warm, cold)
+    else:
+        assert_bitwise(cold, expected)
+        assert_bitwise(warm, expected)
+        baseline = warm
     if CUDA_SM90 and seed == 0 and torch.__version__.startswith("2.10."):
-        assert fingerprint(warm) == case["v66_frozen_sha256"], "V7.6 frozen-output regression"
+        assert fingerprint(baseline) == case["v66_frozen_sha256"], "V7.6 frozen-output regression"
 
 
 @pytest.mark.parametrize("case", [c for c in CASES if c["id"] in
@@ -370,7 +380,9 @@ def _dense_d128_acp_reference(q, k, v, log_fgate, scale, threshold):
 @pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="requires SM90 with TLE")
 @torch.inference_mode()
 def test_hopper_candidate_matches_dense_acp(dtype_name, mode):
-    m, n = (129, 384) if mode == "prefill" else (1, 2305)
+    from flag_attn.forgetting_attention.parallel import _hopper_forgetting_attention, _use_h20_tiles, capture
+
+    m, n = (129, 384) if mode == "prefill" else (1, 8193)
     scale = 1.0 / math.sqrt(128)
     threshold = -1.75 if mode == "prefill" else -10.0
     case = dict(B=2, M=m, N=n, HQ=4, H=2, D=128, dtype=dtype_name)
@@ -382,8 +394,21 @@ def test_hopper_candidate_matches_dense_acp(dtype_name, mode):
         gate[..., ::2] = 0
 
     expected = _dense_d128_acp_reference(q, k, v, gate, scale, threshold).to(dtype)
-    actual = optimized_entry()(
-        q, k, v, gate, sm_scale=scale, adaptive_threshold=threshold, implementation="hopper",
-    )
+    auto = _use_h20_tiles(q, k)
+    entry = optimized_entry() if auto else _hopper_forgetting_attention
+    kwargs = dict(sm_scale=scale, adaptive_threshold=threshold)
+    actual = entry(q, k, v, gate, **kwargs)
     atol, rtol = (4e-3, 2e-2) if dtype == torch.bfloat16 else (1e-3, 3e-3)
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+    if mode == "decode":
+        # Repeated calls on one stream can reuse the counter storage. Each call
+        # must run boundary preparation and decode without a separate merge.
+        with capture() as launches:
+            repeated = [entry(q, k, v, gate, **kwargs) for _ in range(3)]
+        assert len(launches) == 2 * len(repeated)
+        assert all(launch[3]["MAX_SPLITS"] > 1 for launch in launches[1::2])
+        if auto:
+            assert all(launch[0].__name__ == "_h100_exact_prepare" for launch in launches[::2])
+        for output in repeated:
+            torch.testing.assert_close(output, actual, atol=0, rtol=0)
