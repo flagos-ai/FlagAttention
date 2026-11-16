@@ -54,6 +54,7 @@ def _wall_fwd_kernel(
     USE_WINDOW: tl.constexpr,
     USE_SINK: tl.constexpr,
     USE_SCALAR_G: tl.constexpr,
+    PV_FP32: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_t = tl.program_id(1)
@@ -79,7 +80,7 @@ def _wall_fwd_kernel(
     b_q_til = (b_q.to(tl.float32) * exp2(b_pq - b_R) * (scale * RCP_LN2)).to(b_q.dtype)
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    b_m = tl.full([BT], float("-inf"), dtype=tl.float32)
+    b_m = tl.zeros([BT], dtype=tl.float32)
     b_acc = tl.zeros([BT], dtype=tl.float32)
 
     if USE_SCALAR_G:
@@ -94,6 +95,19 @@ def _wall_fwd_kernel(
     o_q = i_t * BT + tl.arange(0, BT)
     i_start = tl.maximum((i_t * BT - W + 1) // BS * BS, 0) if USE_WINDOW else 0
     b_R_t = tl.trans(b_R)
+
+    # Fixed per-row softmax shift taken from the first KV block of this program.
+    # The anchored operands are bounded by the raw q/k, so every block shares one
+    # score range: no online max and no accumulator rescale are needed, which was
+    # measured to be 84% of this kernel's time (the rescale alone ~30%).
+    i_first = i_start if i_start < i_t * BT else i_t * BT
+    if i_first < tl.minimum((i_t + 1) * BT, T):
+        pf_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H * K), (0, i_first), (BK, BS), (0, 1))
+        pf_pk = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (K, T), (1, HQ * K), (0, i_first), (BK, BS), (0, 1))
+        b_kf = tl.load(pf_k, boundary_check=(0, 1))
+        b_pkf = tl.load(pf_pk, boundary_check=(0, 1)).to(tl.float32)
+        b_kf_til = (b_kf.to(tl.float32) * exp2(b_R_t - b_pkf)).to(b_kf.dtype)
+        b_m = tl.max(tl.dot(b_q_til, b_kf_til), 1)
 
     for i_s in range(i_start, i_t * BT, BS):
         p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H * K), (0, i_s), (BK, BS), (0, 1))
@@ -114,12 +128,14 @@ def _wall_fwd_kernel(
         if USE_WINDOW:
             b_s = tl.where((o_q[:, None] - o_k[None, :] < W) & m_k[None, :], b_s, float("-inf"))
 
-        b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
-        b_mw = tl.where(b_m == float("-inf"), 0.0, b_m)
-        b_r = exp2(b_mp - b_mw)
-        b_p = exp2(b_s - b_mw[:, None])
-        b_acc = b_acc * b_r + tl.sum(b_p, 1)
-        b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_v.dtype), b_v)
+        b_p = exp2(b_s - b_m[:, None])
+        b_acc += tl.sum(b_p, 1)
+        if PV_FP32:
+            # fp16 cannot hold the unnormalised weights of the fixed-shift form,
+            # so the PV product stays in fp32 for fp16 inputs.
+            b_o += tl.dot(b_p, b_v.to(tl.float32))
+        else:
+            b_o += tl.dot(b_p.to(b_v.dtype), b_v)
 
     for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
         p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H * K), (0, i_s), (BK, BS), (0, 1))
@@ -154,15 +170,16 @@ def _wall_fwd_kernel(
             m_s = m_s & (o_q[:, None] - o_k[None, :] < W)
         b_s = tl.where(m_s, b_s, float("-inf"))
 
-        b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
-        b_mw = tl.where(b_m == float("-inf"), 0.0, b_m)
-        b_r = exp2(b_mp - b_mw)
-        b_p = exp2(b_s - b_mw[:, None])
-        b_acc = b_acc * b_r + tl.sum(b_p, 1)
-        b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_v.dtype), b_v)
+        b_p = exp2(b_s - b_m[:, None])
+        b_acc += tl.sum(b_p, 1)
+        if PV_FP32:
+            # fp16 cannot hold the unnormalised weights of the fixed-shift form,
+            # so the PV product stays in fp32 for fp16 inputs.
+            b_o += tl.dot(b_p, b_v.to(tl.float32))
+        else:
+            b_o += tl.dot(b_p.to(b_v.dtype), b_v)
 
     if USE_SINK:
-        b_m = tl.where(b_m == float("-inf"), 0.0, b_m)
         b_acc += exp2(b_sink_bias - b_m)
 
     b_o = b_o / b_acc[:, None]

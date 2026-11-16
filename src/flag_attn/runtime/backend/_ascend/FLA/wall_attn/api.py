@@ -21,8 +21,8 @@ from flag_attn.FLA.wall_attn.parallel import RCP_LN2
 
 from .kernels import _wall_fwd_kernel
 
-_BT = 128
-_BS = 64
+_BT = 64
+_BS = 32
 _BK = 64
 _BV = 64
 _WARPS = 4
@@ -110,6 +110,7 @@ class _WallAscendFunction(torch.autograd.Function):
             USE_WINDOW=window_size is not None,
             USE_SINK=sink_bias_scaled is not None,
             USE_SCALAR_G=c is not None,
+            PV_FP32=q.dtype == torch.float16,
             num_warps=_WARPS,
         )
         ctx.save_for_backward(
