@@ -61,6 +61,10 @@ def _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlen
         return False
     if sink_bias is not None and sink_bias.shape != (q.shape[2],):
         return False
+    if g_scalar is not None:
+        # the scalar-gate prefix kernel crashes the bishengir compiler on this
+        # CANN build, so keep that combination on the generic implementation.
+        return False
     if g_scalar is not None and g_scalar.shape != q.shape[:-1]:
         return False
     if window_size is not None and window_size <= 0:

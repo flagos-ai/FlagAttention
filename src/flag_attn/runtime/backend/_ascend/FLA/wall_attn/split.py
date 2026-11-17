@@ -308,7 +308,11 @@ def _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_sc
     B, T, HQ, K = q.shape
     H = k.shape[2]
     V = v.shape[-1]
-    if cu_seqlens is not None or sink_bias is not None or g_scalar is not None:
+    # the split kernels implement plain causal attention only: a sliding window
+    # or a sink/scalar gate must go to the generic fused kernel, which has the
+    # masking for them.
+    if (cu_seqlens is not None or sink_bias is not None or g_scalar is not None
+            or window_size is not None):
         return None
     if K != 64 or V != 64:
         return None
