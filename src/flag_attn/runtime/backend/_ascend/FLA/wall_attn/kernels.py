@@ -3,14 +3,16 @@
 """Ascend Triton kernel for the Wall attention forward pass.
 
 Score for pair (i, j) is ``sum_n q_in k_jn exp2(P_in - P_jn) * scale * log2(e)``
-with ``P`` the per-channel log2 prefix of the gate.  As in the upstream Triton
-kernel the decay is folded into the operands per BT block: with an anchor
-``R = P[i_t*BT]``, ``q_til = q*exp2(P_q - R)`` and ``k_til = k*exp2(R - P_k)``,
-so the score is a plain dot product of rescaled operands.  The diagonal blocks
-use their own local anchor to keep exp2 bounded.
+with ``P`` the per-channel log2 prefix of the gate.  The decay is folded into the
+operands per block: with an anchor ``R``, ``q_til = q*exp2(P_q - R)`` and
+``k_til = k*exp2(R - P_k)``, so the score is a plain dot product of rescaled
+operands.
 
-Note: ``BS <= BT`` is required so that an off-diagonal KV block never reaches
-into the query rows of the same program (those need the causal mask).
+A single KV loop covers both the fully-causal blocks (anchor = the program's
+first query row) and the diagonal block (local anchor, per-tile causal mask).
+The anchored operands are bounded by the raw q/k, so all blocks share one score
+range and no online max / accumulator rescale is needed: that bookkeeping was
+measured to be most of this kernel's time on Ascend.
 """
 
 import triton
@@ -66,123 +68,82 @@ def _wall_fwd_kernel(
 
     RCP_LN2: tl.constexpr = 1.4426950216
 
-    p_q = tl.make_block_ptr(q + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
-    p_o = tl.make_block_ptr(o + (bos * HQ + i_hq) * V, (T, V), (HQ * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-    p_lse = tl.make_block_ptr(lse + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,))
-    p_pq = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
-    p_R = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (i_t * BT, 0), (1, BK), (1, 0))
+    rm = i_t * BT + tl.arange(0, BT)
+    rn = tl.arange(0, BK)
+    rs = tl.arange(0, BS)
+    rv = i_v * BV + tl.arange(0, BV)
+    msk_m = rm < T
+    msk_n = rn < K
+    msk_v = rv < V
 
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_pq = tl.load(p_pq, boundary_check=(0, 1)).to(tl.float32)
-    b_R = tl.load(p_R, boundary_check=(0, 1)).to(tl.float32)
-    # Fold the constant scale into the per-program Q rescale so the inner loop
-    # needs one multiply less per KV block.
-    b_q_til = (b_q.to(tl.float32) * exp2(b_pq - b_R) * (scale * RCP_LN2)).to(b_q.dtype)
-
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    b_m = tl.zeros([BT], dtype=tl.float32)
-    b_acc = tl.zeros([BT], dtype=tl.float32)
+    q_row = ((bos + rm) * HQ + i_hq) * K
+    b_q = tl.load(q + q_row[:, None] + rn[None, :], mask=msk_m[:, None] & msk_n[None, :], other=0.0)
+    b_pq = tl.load(g_cumsum + q_row[:, None] + rn[None, :],
+                   mask=msk_m[:, None] & msk_n[None, :], other=0.0).to(tl.float32)
+    # Program anchor: the first query row of this block.
+    r_row = ((bos + i_t * BT) * HQ + i_hq) * K
+    b_R = tl.load(g_cumsum + r_row + rn, mask=msk_n, other=0.0).to(tl.float32)
+    b_qt = (b_q.to(tl.float32) * exp2(b_pq - b_R[None, :]) * (scale * RCP_LN2)).to(b_q.dtype)
 
     if USE_SCALAR_G:
-        p_cq = tl.make_block_ptr(g_scalar_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,))
-        b_cq = tl.load(p_cq, boundary_check=(0,)).to(tl.float32)
+        b_cq = tl.load(g_scalar_cumsum + (bos + rm) * HQ + i_hq, mask=msk_m, other=0.0).to(tl.float32)
 
-    if USE_SINK:
-        b_sink_bias = tl.load(sink_bias + i_hq).to(tl.float32)
-    else:
-        b_sink_bias = 0.0
-
-    o_q = i_t * BT + tl.arange(0, BT)
     i_start = tl.maximum((i_t * BT - W + 1) // BS * BS, 0) if USE_WINDOW else 0
-    b_R_t = tl.trans(b_R)
+    i_end = min((i_t + 1) * BT, T)
 
-    # Fixed per-row softmax shift taken from the first KV block of this program.
-    # The anchored operands are bounded by the raw q/k, so every block shares one
-    # score range: no online max and no accumulator rescale are needed, which was
-    # measured to be 84% of this kernel's time (the rescale alone ~30%).
-    i_first = i_start if i_start < i_t * BT else i_t * BT
-    if i_first < tl.minimum((i_t + 1) * BT, T):
-        pf_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H * K), (0, i_first), (BK, BS), (0, 1))
-        pf_pk = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (K, T), (1, HQ * K), (0, i_first), (BK, BS), (0, 1))
-        b_kf = tl.load(pf_k, boundary_check=(0, 1))
-        b_pkf = tl.load(pf_pk, boundary_check=(0, 1)).to(tl.float32)
-        b_kf_til = (b_kf.to(tl.float32) * exp2(b_R_t - b_pkf)).to(b_kf.dtype)
-        b_m = tl.max(tl.dot(b_q_til, b_kf_til), 1)
+    b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    b_acc = tl.zeros([BT], dtype=tl.float32)
 
-    for i_s in range(i_start, i_t * BT, BS):
-        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H * K), (0, i_s), (BK, BS), (0, 1))
-        p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
-        p_pk = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (K, T), (1, HQ * K), (0, i_s), (BK, BS), (0, 1))
+    for i_s in range(i_start, i_end, BS):
+        o_k = i_s + rs
+        msk_s = o_k < T
+        k_col = ((bos + o_k) * H + i_h) * K
+        pk_col = ((bos + o_k) * HQ + i_hq) * K
+        v_row = ((bos + o_k) * H + i_h) * V
+        b_k = tl.load(k + k_col[None, :] + rn[:, None],
+                      mask=msk_s[None, :] & msk_n[:, None], other=0.0)
+        b_v = tl.load(v + v_row[:, None] + rv[None, :],
+                      mask=msk_s[:, None] & msk_v[None, :], other=0.0)
+        b_pk = tl.load(g_cumsum + pk_col[None, :] + rn[:, None],
+                       mask=msk_s[None, :] & msk_n[:, None], other=0.0).to(tl.float32)
 
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_pk = tl.load(p_pk, boundary_check=(0, 1)).to(tl.float32)
-        b_k_til = (b_k.to(tl.float32) * exp2(b_R_t - b_pk)).to(b_k.dtype)
-        b_s = tl.dot(b_q_til, b_k_til)
-
-        o_k = i_s + tl.arange(0, BS)
-        m_k = o_k < T
-        if USE_SCALAR_G:
-            b_ck = tl.load(g_scalar_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
-            b_s += b_cq[:, None] - b_ck[None, :]
-        if USE_WINDOW:
-            b_s = tl.where((o_q[:, None] - o_k[None, :] < W) & m_k[None, :], b_s, float("-inf"))
-
-        b_p = exp2(b_s - b_m[:, None])
-        b_acc += tl.sum(b_p, 1)
-        if PV_FP32:
-            # fp16 cannot hold the unnormalised weights of the fixed-shift form,
-            # so the PV product stays in fp32 for fp16 inputs.
-            b_o += tl.dot(b_p, b_v.to(tl.float32))
+        if i_s >= i_t * BT:
+            # Diagonal block: local anchor keeps the exponents bounded and the
+            # within-block causal (and optional window) mask is applied.
+            rl_row = ((bos + i_s) * HQ + i_hq) * K
+            b_Rl = tl.load(g_cumsum + rl_row + rn, mask=msk_n, other=0.0).to(tl.float32)
+            b_q_use = (b_q.to(tl.float32) * exp2(tl.minimum(b_pq - b_Rl[None, :], 0.0))
+                       * (scale * RCP_LN2)).to(b_q.dtype)
+            b_k_use = (b_k.to(tl.float32)
+                       * exp2(tl.minimum(b_Rl[:, None] - b_pk, 110.0))).to(b_k.dtype)
+            b_s = tl.dot(b_q_use, b_k_use)
+            b_s = tl.where((rm[:, None] >= o_k[None, :]) & msk_s[None, :], b_s, float("-inf"))
+            if USE_WINDOW:
+                b_s = tl.where(rm[:, None] - o_k[None, :] < W, b_s, float("-inf"))
         else:
-            b_o += tl.dot(b_p.to(b_v.dtype), b_v)
-
-    for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
-        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H * K), (0, i_s), (BK, BS), (0, 1))
-        p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
-        p_pk = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (K, T), (1, HQ * K), (0, i_s), (BK, BS), (0, 1))
-        p_R_local = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (i_s, 0), (1, BK), (1, 0))
-
-        b_R_local = tl.load(p_R_local, boundary_check=(0, 1)).to(tl.float32)
-        b_R_local_bc = tl.broadcast_to(b_R_local, (BT, BK))
-        b_R_local_t = tl.trans(b_R_local)
-
-        o_k = i_s + tl.arange(0, BS)
-        m_k = o_k < T
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_pk = tl.load(p_pk, boundary_check=(0, 1)).to(tl.float32)
-
-        b_exp_k = b_R_local_t - b_pk
-        b_exp_k = tl.where(b_exp_k > 110.0, tl.zeros_like(b_exp_k) + 110.0, b_exp_k)
-        b_k_til = (b_k.to(tl.float32) * exp2(b_exp_k)).to(b_k.dtype)
-
-        b_exp_q = tl.minimum(b_pq - b_R_local_bc, tl.zeros([BT, BK], dtype=tl.float32))
-        b_q_til_local = (b_q.to(tl.float32) * exp2(b_exp_q) * (scale * RCP_LN2)).to(b_q.dtype)
-        b_s = tl.dot(b_q_til_local, b_k_til)
+            b_k_use = (b_k.to(tl.float32) * exp2(b_R[:, None] - b_pk)).to(b_k.dtype)
+            b_s = tl.dot(b_qt, b_k_use)
+            if USE_WINDOW:
+                b_s = tl.where((rm[:, None] - o_k[None, :] < W) & msk_s[None, :],
+                               b_s, float("-inf"))
 
         if USE_SCALAR_G:
-            b_ck = tl.load(g_scalar_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
+            b_ck = tl.load(g_scalar_cumsum + (bos + o_k) * HQ + i_hq,
+                           mask=msk_s, other=0.0).to(tl.float32)
             b_s += b_cq[:, None] - b_ck[None, :]
 
-        m_s = (o_q[:, None] >= o_k[None, :]) & m_k[None, :]
-        if USE_WINDOW:
-            m_s = m_s & (o_q[:, None] - o_k[None, :] < W)
-        b_s = tl.where(m_s, b_s, float("-inf"))
-
-        b_p = exp2(b_s - b_m[:, None])
+        b_p = exp2(b_s)
         b_acc += tl.sum(b_p, 1)
         if PV_FP32:
-            # fp16 cannot hold the unnormalised weights of the fixed-shift form,
-            # so the PV product stays in fp32 for fp16 inputs.
+            # fp16 cannot hold the unnormalised exponential weights.
             b_o += tl.dot(b_p, b_v.to(tl.float32))
         else:
             b_o += tl.dot(b_p.to(b_v.dtype), b_v)
 
     if USE_SINK:
-        b_acc += exp2(b_sink_bias - b_m)
+        b_acc += exp2(tl.load(sink_bias + i_hq).to(tl.float32))
 
     b_o = b_o / b_acc[:, None]
-    b_m += log2(b_acc)
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_lse, b_m.to(p_lse.dtype.element_ty), boundary_check=(0,))
+    tl.store(o + q_row[:, None] + rv[None, :], b_o.to(o.dtype.element_ty),
+             mask=msk_m[:, None] & msk_v[None, :])
+    tl.store(lse + bos * HQ + i_hq + rm * HQ, log2(b_acc), mask=msk_m)
