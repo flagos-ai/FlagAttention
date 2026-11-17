@@ -66,9 +66,9 @@ def _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlen
 
 def _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar):
     """Run the Ascend kernel and return ``(o, P, lse, sink_scaled, c)``."""
-    P = torch.cumsum(g, dim=1, dtype=torch.float32) * RCP_LN2
+    P = gate_prefix_sum(g) * RCP_LN2
     c = (
-        torch.cumsum(g_scalar, dim=1, dtype=torch.float32) * RCP_LN2
+        gate_prefix_sum_scalar(g_scalar) * RCP_LN2
         if g_scalar is not None
         else None
     )
@@ -115,10 +115,7 @@ class _WallAscendFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar=None):
-        # Fast path is non-varlen only, so the prefix is a plain cumsum over T.
-        # The generic Triton chunked scan costs 1.1 ms at T=512 and 6.7 ms at
-        # T=4096 on Ascend (measured), which dominated the whole operator; the
-        # native torch scan is ~10x cheaper and numerically equivalent.
+        # The dense fast path uses the dedicated Triton gate prefix kernel.
         P = gate_prefix_sum(g) * RCP_LN2
         c = (
             gate_prefix_sum_scalar(g_scalar) * RCP_LN2
