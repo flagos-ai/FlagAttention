@@ -21,6 +21,7 @@ from flag_attn.FLA.wall_attn.parallel import RCP_LN2
 
 from .cumsum import gate_prefix_sum, gate_prefix_sum_scalar
 from .kernels import _wall_fwd_kernel
+from .split import _wall_split_impl
 
 _BT = 128
 _BS = 128
@@ -30,6 +31,9 @@ _WARPS = 4
 #: Route names reported through the generic module's ``get_last_route()`` so the
 #: repo benchmark keeps reporting something meaningful on Ascend.
 _ROUTE_FAST = "ascend_fast"
+#: No-grad benchmark path: QK and PV in separate kernels with the scores in GM
+#: (measured faster than the fused kernel at every benchmark length).
+_ROUTE_FAST_SPLIT = "ascend_fast_split"
 _ROUTE_FALLBACK = "official_fallback"
 
 
@@ -218,9 +222,14 @@ def parallel_wall_attn(
     if sink_bias is not None and sink_bias.shape != (q.shape[2],):
         raise ValueError(f"`sink_bias` must be [HQ]; got {sink_bias.shape}")
     if _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlens):
-        _route(_ROUTE_FAST)
         if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v, g)):
+            _route(_ROUTE_FAST)
             return _WallAscendFunction.apply(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
+        split = _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
+        if split is not None:
+            _route(_ROUTE_FAST_SPLIT)
+            return split[0]
+        _route(_ROUTE_FAST)
         o, _, _, _, _ = _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
         return o
     _route(_ROUTE_FALLBACK)
