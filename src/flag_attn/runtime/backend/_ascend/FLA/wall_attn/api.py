@@ -23,7 +23,7 @@ from .cumsum import gate_prefix_sum, gate_prefix_sum_scalar
 from .kernels import _wall_fwd_kernel
 
 _BT = 128
-_BS = 64
+_BS = 128
 _BK = 64
 _BV = 64
 _WARPS = 4
