@@ -70,6 +70,7 @@ def _wall_qk_kernel(
     BS: tl.constexpr,
     BK: tl.constexpr,
     LD_S: tl.constexpr,
+    COV: tl.constexpr,
     EVEN: tl.constexpr,
 ):
     i_t = tl.program_id(0)
@@ -101,7 +102,9 @@ def _wall_qk_kernel(
     # rm is already the global row, so the tile start must not be added again
     s_base = scores + (i_b * HQ + i_hq) * (T * LD_S)
     o_rs = tl.arange(0, BS)
-    n_tiles = (i_t * BT + BT + BS - 1) // BS  # kv tiles that reach the diagonal
+    # the PV kernel reads whole PV_BT-wide tiles, so the diagonal over-cover
+    # must be written too (all of those columns are future rows -> -inf)
+    n_tiles = (((i_t * BT + BT + COV - 1) // COV) * COV) // BS
     if EVEN:
         # bulk: every column of these tiles is <= the first query row, so the
         # causal mask is a no-op and nothing can be out of bounds.
@@ -203,7 +206,7 @@ def _wall_pv_kernel(
                           mask=msk_m[:, None] & msk_s[None, :], other=float("-inf"))
             b_p = tl.exp2(b_s.to(scores.dtype.element_ty))
             b_den += tl.sum(b_p.to(tl.float32), 1)
-            b_v = tl.load(v + ((bos + o_k) * H + i_h) * V + rv[None, :],
+            b_v = tl.load(v + (((bos + o_k) * H + i_h) * V)[:, None] + rv[None, :],
                           mask=msk_s[:, None] & msk_v[None, :], other=0.0)
             b_o += tl.dot(b_p, b_v.to(b_p.dtype))
 
@@ -234,16 +237,17 @@ def _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_sc
     scores = torch.empty((B * HQ * T, ld_s), dtype=torch.float16, device=q.device)
     o = torch.empty((B, T, HQ, V), dtype=q.dtype, device=q.device)
     lse = torch.empty((B, T, HQ), dtype=torch.float32, device=q.device)
-    # Tile choices measured at T=4096 (see S0_REPORT.md): the QK kernel is
-    # cheapest with long query tiles (256x64), the PV kernel with wide KV tiles
-    # (128x128).
-    qk_bt, qk_bs, qk_bk = 256, 64, 64
-    pv_bt, pv_bs, pv_bv = 128, 128, 64
-    even = (T % qk_bt) == 0
+    # Tile choices measured on card 7 (see S0_REPORT.md): once the inner loops
+    # are mask-free the per-iteration overhead dominates, so both kernels want
+    # fewer, wider KV tiles -- QK 128x128, PV 128x256 (a wider PV tile would
+    # need more UB than the 192 KiB available).
+    qk_bt, qk_bs, qk_bk = 128, 128, 64
+    pv_bt, pv_bs, pv_bv = 128, 256, 64
+    even = (T % qk_bt == 0) and (T % pv_bs == 0)
     qk_grid = (triton.cdiv(T, qk_bt), HQ, B)
     _wall_qk_kernel[qk_grid](q, k, P, scores, o, scale, T,
                              B=B, H=H, HQ=HQ, K=K, BT=qk_bt, BS=qk_bs, BK=qk_bk,
-                             LD_S=ld_s, EVEN=even)
+                             LD_S=ld_s, COV=pv_bs, EVEN=even)
     pv_grid = (triton.cdiv(T, pv_bt), HQ, B)
     _wall_pv_kernel[pv_grid](scores, v, o, lse, scale, T,
                              B=B, H=H, HQ=HQ, K=K, V=V, BT=pv_bt, BS=pv_bs, BV=pv_bv,
