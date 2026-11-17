@@ -63,6 +63,52 @@ def _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlen
     return True
 
 
+def _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar):
+    """Run the Ascend kernel and return ``(o, P, lse, sink_scaled, c)``."""
+    P = torch.cumsum(g, dim=1, dtype=torch.float32) * RCP_LN2
+    c = (
+        torch.cumsum(g_scalar, dim=1, dtype=torch.float32) * RCP_LN2
+        if g_scalar is not None
+        else None
+    )
+    sink_bias_scaled = sink_bias * RCP_LN2 if sink_bias is not None else None
+
+    B, T, HQ, K = q.shape
+    V = v.shape[-1]
+    H = k.shape[2]
+    o = torch.empty((B, T, HQ, V), dtype=q.dtype, device=q.device)
+    lse = torch.empty((B, T, HQ), dtype=torch.float32, device=q.device)
+    grid = (triton.cdiv(V, _BV), triton.cdiv(T, _BT), B * HQ)
+    _wall_fwd_kernel[grid](
+        q,
+        k,
+        v,
+        o,
+        P,
+        c if c is not None else q,
+        sink_bias_scaled if sink_bias_scaled is not None else q,
+        lse,
+        scale,
+        T,
+        window_size if window_size is not None else 0,
+        B=B,
+        H=H,
+        HQ=HQ,
+        K=K,
+        V=V,
+        BT=_BT,
+        BS=_BS,
+        BK=_BK,
+        BV=_BV,
+        USE_WINDOW=window_size is not None,
+        USE_SINK=sink_bias_scaled is not None,
+        USE_SCALAR_G=c is not None,
+        PV_FP32=q.dtype == torch.float16,
+        num_warps=_WARPS,
+    )
+    return o, P, lse, sink_bias_scaled, c
+
+
 class _WallAscendFunction(torch.autograd.Function):
     """Forward on the Ascend kernel; backward on the generic Triton kernels."""
 
@@ -72,9 +118,9 @@ class _WallAscendFunction(torch.autograd.Function):
         # The generic Triton chunked scan costs 1.1 ms at T=512 and 6.7 ms at
         # T=4096 on Ascend (measured), which dominated the whole operator; the
         # native torch scan is ~10x cheaper and numerically equivalent.
-        P = torch.cumsum(g.float(), dim=1) * RCP_LN2
+        P = torch.cumsum(g, dim=1, dtype=torch.float32) * RCP_LN2
         c = (
-            torch.cumsum(g_scalar.float(), dim=1) * RCP_LN2
+            torch.cumsum(g_scalar, dim=1, dtype=torch.float32) * RCP_LN2
             if g_scalar is not None
             else None
         )
@@ -175,7 +221,10 @@ def parallel_wall_attn(
         raise ValueError(f"`sink_bias` must be [HQ]; got {sink_bias.shape}")
     if _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlens):
         _route(_ROUTE_FAST)
-        return _WallAscendFunction.apply(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
+        if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v, g)):
+            return _WallAscendFunction.apply(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
+        o, _, _, _, _ = _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
+        return o
     _route(_ROUTE_FALLBACK)
     return _generic._parallel_wall_attn_default(
         q,
