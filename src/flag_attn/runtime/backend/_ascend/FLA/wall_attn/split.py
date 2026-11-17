@@ -233,6 +233,7 @@ def _wall_pv_kernel(
     BV: tl.constexpr,
     LD_S: tl.constexpr,
     EVEN: tl.constexpr,
+    DOTDEN: tl.constexpr,
 ):
     i_t = tl.program_id(0)
     i_hq = tl.program_id(1)
@@ -247,6 +248,13 @@ def _wall_pv_kernel(
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_den = tl.zeros([BT], dtype=tl.float32)
+    # The fp32 row sum of the probability tile is the most expensive vector op
+    # in this loop (315 us at T=4096), and the cube can do it for free:
+    # dot(p, ones[BS,16]) yields 16 identical copies of sum_j p_ij.  Whether
+    # that is a win is dtype dependent on this backend (measured: bf16 -12%,
+    # fp16 +25% at T=4096, 3 interleaved reps each), so the wrapper picks.
+    b_den16 = tl.zeros([BT, 16], dtype=tl.float32)
+    b_ones = tl.full([BS, 16], 1.0, dtype=tl.float16)
 
     # rm is already the global row, so the tile start must not be added again
     s_base = scores + (i_b * HQ + i_hq) * (T * LD_S)
@@ -258,7 +266,10 @@ def _wall_pv_kernel(
             o_k = i_s * BS + o_rs
             b_s = tl.load(s_base + rm[:, None] * LD_S + o_k[None, :])
             b_p = tl.exp2(b_s)
-            b_den += tl.sum(b_p.to(tl.float32), 1)
+            if DOTDEN:
+                b_den16 += tl.dot(b_p, b_ones)
+            else:
+                b_den += tl.sum(b_p.to(tl.float32), 1)
             b_v = tl.load(v + (((bos + o_k) * H + i_h) * V)[:, None] + rv[None, :])
             b_o += tl.dot(b_p, b_v.to(b_p.dtype))
     else:
@@ -269,11 +280,16 @@ def _wall_pv_kernel(
             b_s = tl.load(s_base + rm[:, None] * LD_S + o_k[None, :],
                           mask=msk_m[:, None] & msk_s[None, :], other=float("-inf"))
             b_p = tl.exp2(b_s.to(scores.dtype.element_ty))
-            b_den += tl.sum(b_p.to(tl.float32), 1)
+            if DOTDEN:
+                b_den16 += tl.dot(b_p, b_ones)
+            else:
+                b_den += tl.sum(b_p.to(tl.float32), 1)
             b_v = tl.load(v + (((bos + o_k) * H + i_h) * V)[:, None] + rv[None, :],
                           mask=msk_s[:, None] & msk_v[None, :], other=0.0)
             b_o += tl.dot(b_p, b_v.to(b_p.dtype))
 
+    if DOTDEN:
+        b_den = tl.sum(b_den16, 1) * 0.0625  # the 16 columns are identical
     b_o = b_o / tl.where(b_den[:, None] > 0.0, b_den[:, None], 1.0)
     q_row = ((bos + rm) * HQ + i_hq) * V
     if EVEN:
@@ -322,5 +338,5 @@ def _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_sc
     pv_grid = (triton.cdiv(T, pv_bt), HQ, B)
     _wall_pv_kernel[pv_grid](scores, v, o, lse, scale, T,
                              B=B, H=H, HQ=HQ, K=K, V=V, BT=pv_bt, BS=pv_bs, BV=pv_bv,
-                             LD_S=ld_s, EVEN=even)
+                             LD_S=ld_s, EVEN=even, DOTDEN=q.dtype == torch.bfloat16)
     return o, lse
