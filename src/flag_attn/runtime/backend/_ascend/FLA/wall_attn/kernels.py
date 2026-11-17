@@ -107,25 +107,16 @@ def _wall_fwd_kernel(
         b_pk = tl.load(g_cumsum + pk_col[None, :] + rn[:, None],
                        mask=msk_s[None, :] & msk_n[:, None], other=0.0).to(tl.float32)
 
-        if i_s >= i_t * BT:
-            # Diagonal block: local anchor keeps the exponents bounded and the
-            # within-block causal (and optional window) mask is applied.
-            rl_row = ((bos + i_s) * HQ + i_hq) * K
-            b_Rl = tl.load(g_cumsum + rl_row + rn, mask=msk_n, other=0.0).to(tl.float32)
-            b_q_use = (b_q.to(tl.float32) * exp2(tl.minimum(b_pq - b_Rl[None, :], 0.0))
-                       * (scale * RCP_LN2)).to(b_q.dtype)
-            b_k_use = (b_k.to(tl.float32)
-                       * exp2(tl.minimum(b_Rl[:, None] - b_pk, 110.0))).to(b_k.dtype)
-            b_s = tl.dot(b_q_use, b_k_use)
-            b_s = tl.where((rm[:, None] >= o_k[None, :]) & msk_s[None, :], b_s, float("-inf"))
-            if USE_WINDOW:
-                b_s = tl.where(rm[:, None] - o_k[None, :] < W, b_s, float("-inf"))
-        else:
-            b_k_use = (b_k.to(tl.float32) * exp2(b_R[:, None] - b_pk)).to(b_k.dtype)
-            b_s = tl.dot(b_qt, b_k_use)
-            if USE_WINDOW:
-                b_s = tl.where((rm[:, None] - o_k[None, :] < W) & msk_s[None, :],
-                               b_s, float("-inf"))
+        # One anchor for every block (the program's first query row): q is
+        # rescaled once outside the loop, only k is rescaled per block.  The
+        # decay over one block keeps the exponent small for realistic gates, and
+        # is clamped so pathological gates cannot overflow.
+        b_k_use = (b_k.to(tl.float32)
+                   * exp2(tl.minimum(b_R[:, None] - b_pk, 76.0))).to(b_k.dtype)
+        b_s = tl.dot(b_qt, b_k_use)
+        b_s = tl.where((rm[:, None] >= o_k[None, :]) & msk_s[None, :], b_s, float("-inf"))
+        if USE_WINDOW:
+            b_s = tl.where(rm[:, None] - o_k[None, :] < W, b_s, float("-inf"))
 
         if USE_SCALAR_G:
             b_ck = tl.load(g_scalar_cumsum + (bos + o_k) * HQ + i_hq,
