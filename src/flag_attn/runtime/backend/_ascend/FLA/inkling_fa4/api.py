@@ -17,19 +17,13 @@ Ascend layout choices:
   programs.  ``num_splits`` from the caller wins when it is greater than one.
 """
 
-import os
-
 import torch
 import triton
 
 from .kernels import _combine_splits_kernel, _rel_attn_paged_kernel
 
-#: Ascend tile shapes.  Two shapes are worth keeping: a 16x128 tile for short-query
-#: (decode-like) shapes, where most rows of a 64-row tile are masked and the wider
-#: KV tile halves the number of loop iterations (decode_8k 827 -> 586 us), and a
-#: 64x64 tile for longer queries, where a 16-row tile would make every program walk
-#: the whole KV window (long_prefill 454 -> 739 us).  Wider than 128 keys does not
-#: fit the 192 KiB UB together with the fp32 score tile.
+# Short queries use fewer rows and wider KV tiles; longer queries use 64x64
+# tiles to keep the fp32 scores and working state within the Ascend UB.
 _BLOCK_M = 64
 _BLOCK_N = 64
 _SMALL_Q_BLOCK_M = 16
@@ -37,58 +31,16 @@ _SMALL_Q_BLOCK_N = 128
 #: Query length up to which the short-query tile is used.
 _SMALL_Q = 64
 _NUM_WARPS = 4
-#: ``INKLING_FA4_SPLITS`` pins the split-KV count for A/B runs; resolved once because
-#: reading the environment on every call cost a measurable slice of the budget.
-_SPLITS_OVERRIDE = os.environ.get("INKLING_FA4_SPLITS")
 _COMBINE_ROWS = 16
 _MAX_HEAD_DIM = 256
 _MAX_SPLITS = 32
 #: Programs we want in flight (roughly three waves of the 40 AI cores).
 _TARGET_PROGRAMS = 128
-#: ``INKLING_FA4_SPLITS`` overrides the automatic split choice for A/B runs.
-_SPLITS_ENV = "INKLING_FA4_SPLITS"
-
-#: Split-KV scratch buffers, kept alive between calls.  Allocating them per call
-#: lets the caching allocator hand the block to the next allocation while the
-#: combine kernel is still reading it: under ``torch.inference_mode()`` the
-#: buffers have no autograd reference, so that reuse really happens and the
-#: result is silently corrupted.  Keying by shape also removes the per-call
-#: allocation from the decode latency.
-_PARTIAL_CACHE: dict = {}
-_PARTIAL_CACHE_MAX = 16
 
 
-def _partial_buffers(splits, total_q, num_heads, head_dim_v, device):
-    key = (device.index, splits, total_q, num_heads, head_dim_v)
-    buffers = _PARTIAL_CACHE.get(key)
-    if buffers is None:
-        if len(_PARTIAL_CACHE) >= _PARTIAL_CACHE_MAX:
-            # Drop the oldest entry; the caller-side kernels are long finished by
-            # the time a new shape shows up in practice.
-            _PARTIAL_CACHE.pop(next(iter(_PARTIAL_CACHE)))
-        buffers = (
-            torch.empty((splits, total_q, num_heads, head_dim_v), dtype=torch.float32, device=device),
-            torch.empty((splits, total_q, num_heads), dtype=torch.float32, device=device),
-        )
-        _PARTIAL_CACHE[key] = buffers
-    return buffers
-
-
-#: Per-call launch decisions keyed by the input geometry.  The benchmark cases are
-#: ~200-900 us per call, of which ~50-60 us was Python: caching the plan keeps the
-#: hot path to a dict lookup plus the stride reads.
-_PLAN_CACHE: dict = {}
-
-
-def _plan(total_q, batch, num_heads, num_kv_heads, head_dim_q, head_dim_v, block_size,
+def _plan(batch, num_heads, head_dim_q, head_dim_v, block_size,
           rel_extent, max_seqlen_q, num_splits, causal, window_left, window_right,
           kv_upper, contiguous_features):
-    key = (total_q, batch, num_heads, num_kv_heads, head_dim_q, head_dim_v, block_size,
-           rel_extent, max_seqlen_q, num_splits, causal, window_left, window_right,
-           kv_upper, contiguous_features)
-    plan = _PLAN_CACHE.get(key)
-    if plan is not None:
-        return plan
     if max_seqlen_q == 1 and max(head_dim_q, head_dim_v) <= 128 and contiguous_features:
         block_m, block_n = 1, _SMALL_Q_BLOCK_N
     elif max_seqlen_q <= _SMALL_Q:
@@ -104,7 +56,7 @@ def _plan(total_q, batch, num_heads, num_kv_heads, head_dim_q, head_dim_v, block
     split_kv = splits > 1
     has_left = window_left is not None and window_left >= 0
     has_right = window_right is not None and window_right >= 0
-    plan = (
+    return (
         splits,
         split_kv,
         num_q_blocks,
@@ -115,22 +67,14 @@ def _plan(total_q, batch, num_heads, num_kv_heads, head_dim_q, head_dim_v, block
         has_right,
         bool(causal) and kv_upper <= rel_extent,
     )
-    if len(_PLAN_CACHE) >= 64:
-        _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
-    _PLAN_CACHE[key] = plan
-    return plan
 
 
-#: Long prefill already gives every program plenty of work, and the combine
-#: launch costs more than the extra parallelism buys (measured: long_prefill
-#: 0.45 ms with one split vs 0.54 ms with two), so only short-query shapes split.
+# Long queries use query-tile parallelism without an additional combine launch.
 _MAX_SPLIT_QLEN = 64
 
 
 def _choose_splits(num_splits, base_programs, kv_upper, block_n, max_seqlen_q):
     max_splits = max(1, min(_MAX_SPLITS, triton.cdiv(max(kv_upper, 1), block_n)))
-    if _SPLITS_OVERRIDE is not None:
-        return max(1, min(int(_SPLITS_OVERRIDE), max_splits))
     if num_splits > 1:
         return max(1, min(num_splits, max_splits))
     if max_seqlen_q > _MAX_SPLIT_QLEN:
@@ -235,15 +179,18 @@ def inkling_fa4_rel_attention(
         has_right,
         bias_all_in_range,
     ) = _plan(
-        total_q, batch_size, num_heads, num_kv_heads, head_dim_q, head_dim_v, block_size,
+        batch_size, num_heads, head_dim_q, head_dim_v, block_size,
         rel_extent, max_seqlen_q, num_splits, bool(causal), window_left, window_right,
         kv_upper,
         q.stride(2) == 1 and key_cache.stride(3) == 1 and value_cache.stride(3) == 1,
     )
 
     if split_kv:
-        partial_out, partial_lse = _partial_buffers(
-            splits, total_q, num_heads, head_dim_v, q.device
+        partial_out = torch.empty(
+            (splits, total_q, num_heads, head_dim_v), dtype=torch.float32, device=q.device
+        )
+        partial_lse = torch.empty(
+            (splits, total_q, num_heads), dtype=torch.float32, device=q.device
         )
         po_strides = partial_out.stride()
         pl_strides = partial_lse.stride()
