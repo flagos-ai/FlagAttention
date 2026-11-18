@@ -46,12 +46,9 @@ try:
         )
     from parallax import parallax_attn_with_kvcache as cute_kvcache
     from parallax import parallax_decode as cute_decode
-except Exception as exc:  # parallax-kernel is an optional test baseline.
+except Exception:  # parallax-kernel is an optional test baseline.
     cute_kvcache = None
     cute_decode = None
-    CUTE_IMPORT_ERROR = exc
-else:
-    CUTE_IMPORT_ERROR = None
 
 
 def _rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -95,7 +92,7 @@ def _decode_reference(q, r, k, v, scale, window_size_left=-1):
 
 
 def _inputs(B, L, HQ, H, D, dtype, seed=0):
-    generator = torch.Generator(device=test_backend.device).manual_seed(seed)
+    generator = torch.Generator(device="cpu" if test_backend.device == "gcu" else test_backend.device).manual_seed(seed)
     q = torch.randn(B, 1, HQ, D, device=test_backend.device, dtype=dtype, generator=generator)
     r = torch.randn(B, 1, HQ, D, device=test_backend.device, dtype=dtype, generator=generator) * 0.5
     k = torch.randn(B, L, H, D, device=test_backend.device, dtype=dtype, generator=generator)
@@ -106,14 +103,6 @@ def _inputs(B, L, HQ, H, D, dtype, seed=0):
 def _require_tle():
     if not test_backend.supports_operator("parallax_decode", tle=True):
         pytest.skip("selected Parallax decode implementation is unavailable")
-
-
-@pytest.mark.sm90
-def test_cute_baseline_importable():
-    """Report the exact optional-baseline import failure without hiding TLE tests."""
-    _require_tle()
-    if cute_decode is None:
-        pytest.skip(f"CuTeDSL baseline is unavailable: {CUTE_IMPORT_ERROR!r}")
 
 
 @pytest.mark.sm90
@@ -204,7 +193,7 @@ def test_tle_noncontiguous_decode_inputs():
     """Decode commonly receives q[:, -1:], which need not be contiguous."""
     _require_tle()
     B, L, H, D = 2, 1024, 8, 128
-    generator = torch.Generator(device=test_backend.device).manual_seed(7)
+    generator = torch.Generator(device="cpu" if test_backend.device == "gcu" else test_backend.device).manual_seed(7)
     q_full = torch.randn(B, 3, H, D, device=test_backend.device, dtype=torch.bfloat16, generator=generator)
     r_full = torch.randn(B, 3, H, D, device=test_backend.device, dtype=torch.bfloat16, generator=generator)
     k = torch.randn(B, L, H, D, device=test_backend.device, dtype=torch.bfloat16, generator=generator)

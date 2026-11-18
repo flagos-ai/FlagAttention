@@ -21,8 +21,8 @@ except ImportError:
 
 from ..chunk_h import chunk_bwd_dh, chunk_fwd_h
 from ..cumsum import chunk_local_cumsum
-from flag_attn.gated_linear_attention.index import prepare_chunk_indices
-from flag_attn.gated_linear_attention.utils import check_shared_mem, input_guard
+from flag_attn.FLA.index import prepare_chunk_indices
+from flag_attn.utils import check_shared_mem, input_guard
 
 RCP_LN2 = 1.4426950216
 
@@ -1441,7 +1441,7 @@ def chunk_gla_fwd_o_gk(
     def grid_tle(meta):
         return (triton.cdiv(V, meta["BV"] * meta.get("B_VCHUNK", 1)), NT, B * HV)
 
-    _use_tle = HAS_TLE and os.environ.get("FLAG_ATTN_GLA_TLE", "1") != "0"
+    _use_tle = HAS_TLE and os.environ.get("FLAG_ATTN_GLA_TLE", "0") != "0"
     if _use_tle:
         kernel = chunk_gla_fwd_kernel_o_tle
         grid_fn = grid_tle

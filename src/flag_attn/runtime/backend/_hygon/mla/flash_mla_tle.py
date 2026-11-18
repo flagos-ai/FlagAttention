@@ -24,7 +24,7 @@ import triton.language as tl
 
 from flag_attn.runtime.backend._hygon import device, error, torch_device_fn  # noqa: E402
 from flag_attn.runtime.backend._hygon.device_info import get_device_capability  # noqa: E402
-from flag_attn.gated_delta_rule.compat import has_triton_tle  # noqa: E402
+from flag_attn.runtime.backend._hygon.utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
     try:

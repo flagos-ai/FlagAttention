@@ -32,7 +32,7 @@ import triton
 import triton.language as tl
 from triton.errors import TritonError
 
-from ..utils import current_platform, has_triton_tle, round_up
+from flag_attn.runtime.backend._hygon.utils import current_platform, has_triton_tle, round_up
 
 if has_triton_tle(3, 6, 0):
     try:
@@ -725,7 +725,7 @@ def _decode_index_score_kernel(
     hq_offsets = tl.arange(0, BLOCK_SIZE_HQ)
     h_offsets = hq_offsets // BLOCK_SIZE_Q
     q_offsets = hq_offsets % BLOCK_SIZE_Q
-    q_mask = q_offsets < decode_query_len
+    q_mask = (q_offsets < decode_query_len) & (h_offsets < num_idx_heads)
     q_ids = pid_r * decode_query_len + q_offsets
 
     if USE_PDL:
@@ -760,7 +760,8 @@ def _decode_index_score_kernel(
         + off_d[:, None] * stride_q_d,
         mask=q_mask[None, :],
         other=0.0,
-    ).to(tl.float32)  # [D,HQ]
+    )  # [D,HQ]
+    q = q.to(tl.float32)
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
@@ -773,10 +774,9 @@ def _decode_index_score_kernel(
             + page * stride_ik_blk
             + off_k[:, None] * stride_ik_pos
             + off_d * stride_ik_d,
-        ).to(tl.float32)  # [N,D]
-        # fp32 accumulation is required for the fp8 (e4m3) index cache: q/k are
-        # loaded in their stored dtype (bf16 or e4m3) and the MMA accumulates in
-        # fp32 so the per-block max score is exact for the fp8 indexer too.
+        )  # [N,D]
+        k = k.to(tl.float32)
+        # Preserve FP32 index-score computation and accumulation.
         kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
         kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [HQ]
@@ -1117,7 +1117,8 @@ def minimax_m3_index_score(
         device=idx_q.device,
     )
     BLOCK_SIZE_Q = 64
-    grid_score = (triton.cdiv(max_query_len, BLOCK_SIZE_Q), batch * num_idx_heads)
+    query_programs = triton.cdiv(max_query_len, BLOCK_SIZE_Q)
+    grid_score = (query_programs, batch * num_idx_heads)
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,

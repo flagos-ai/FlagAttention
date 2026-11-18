@@ -1,0 +1,143 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+chunk_fwd_kernel_h:
+- {META: {BK: 16, BV: 16}, num_warps: 1, num_stages: 2}
+- {META: {BK: 16, BV: 16}, num_warps: 2, num_stages: 2}
+- {META: {BK: 16, BV: 16}, num_warps: 4, num_stages: 2}
+- {META: {BK: 16, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 16, BV: 32}, num_warps: 1, num_stages: 2}
+- {META: {BK: 16, BV: 32}, num_warps: 2, num_stages: 2}
+- {META: {BK: 16, BV: 32}, num_warps: 4, num_stages: 2}
+- {META: {BK: 16, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 32}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 16}, num_warps: 1, num_stages: 2}
+- {META: {BK: 32, BV: 16}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 16}, num_warps: 4, num_stages: 2}
+- {META: {BK: 32, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 32}, num_warps: 1, num_stages: 2}
+- {META: {BK: 32, BV: 32}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 32}, num_warps: 4, num_stages: 2}
+- {META: {BK: 32, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 32}, num_warps: 8, num_stages: 4}
+chunk_bwd_kernel_dh:
+- {META: {BK: 16, BV: 16}, num_warps: 1, num_stages: 2}
+- {META: {BK: 16, BV: 16}, num_warps: 2, num_stages: 2}
+- {META: {BK: 16, BV: 16}, num_warps: 4, num_stages: 2}
+- {META: {BK: 16, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 16, BV: 32}, num_warps: 1, num_stages: 2}
+- {META: {BK: 16, BV: 32}, num_warps: 2, num_stages: 2}
+- {META: {BK: 16, BV: 32}, num_warps: 4, num_stages: 2}
+- {META: {BK: 16, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 32}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 16}, num_warps: 1, num_stages: 2}
+- {META: {BK: 32, BV: 16}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 16}, num_warps: 4, num_stages: 2}
+- {META: {BK: 32, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 32}, num_warps: 1, num_stages: 2}
+- {META: {BK: 32, BV: 32}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 32}, num_warps: 4, num_stages: 2}
+- {META: {BK: 32, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 32}, num_warps: 8, num_stages: 4}
+chunk_gla_fwd_A_kernel_intra_sub_inter:
+- {META: {BK: 32}, num_warps: 1, num_stages: 2}
+- {META: {BK: 32}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32}, num_warps: 2, num_stages: 3}
+- {META: {BK: 32}, num_warps: 4, num_stages: 2}
+- {META: {BK: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32}, num_warps: 8, num_stages: 4}
+- {META: {BK: 64}, num_warps: 1, num_stages: 2}
+- {META: {BK: 64}, num_warps: 2, num_stages: 2}
+- {META: {BK: 64}, num_warps: 2, num_stages: 3}
+- {META: {BK: 64}, num_warps: 4, num_stages: 2}
+- {META: {BK: 64}, num_warps: 4, num_stages: 3}
+- {META: {BK: 64}, num_warps: 8, num_stages: 4}
+chunk_gla_fwd_kernel_o:
+- {META: {BK: 32, BV: 64}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 64}, num_warps: 4, num_stages: 2}
+- {META: {BK: 32, BV: 64}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 64}, num_warps: 8, num_stages: 3}
+- {META: {BK: 32, BV: 64}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 128}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 128}, num_warps: 4, num_stages: 2}
+- {META: {BK: 32, BV: 128}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 128}, num_warps: 8, num_stages: 3}
+- {META: {BK: 32, BV: 128}, num_warps: 8, num_stages: 4}
+- {META: {BK: 64, BV: 64}, num_warps: 2, num_stages: 2}
+- {META: {BK: 64, BV: 64}, num_warps: 4, num_stages: 2}
+- {META: {BK: 64, BV: 64}, num_warps: 4, num_stages: 3}
+- {META: {BK: 64, BV: 64}, num_warps: 8, num_stages: 3}
+- {META: {BK: 64, BV: 64}, num_warps: 8, num_stages: 4}
+- {META: {BK: 64, BV: 128}, num_warps: 2, num_stages: 2}
+- {META: {BK: 64, BV: 128}, num_warps: 4, num_stages: 2}
+- {META: {BK: 64, BV: 128}, num_warps: 4, num_stages: 3}
+- {META: {BK: 64, BV: 128}, num_warps: 8, num_stages: 3}
+- {META: {BK: 64, BV: 128}, num_warps: 8, num_stages: 4}
+chunk_gla_bwd_kernel_inter:
+- {META: {BK: 16, BV: 16}, num_warps: 2, num_stages: 2}
+- {META: {BK: 16, BV: 16}, num_warps: 4, num_stages: 2}
+- {META: {BK: 16, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 16}, num_warps: 8, num_stages: 3}
+- {META: {BK: 16, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 16, BV: 32}, num_warps: 2, num_stages: 2}
+- {META: {BK: 16, BV: 32}, num_warps: 4, num_stages: 2}
+- {META: {BK: 16, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 16, BV: 32}, num_warps: 8, num_stages: 3}
+- {META: {BK: 16, BV: 32}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 16}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 16}, num_warps: 4, num_stages: 2}
+- {META: {BK: 32, BV: 16}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 16}, num_warps: 8, num_stages: 3}
+- {META: {BK: 32, BV: 16}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 32}, num_warps: 2, num_stages: 2}
+- {META: {BK: 32, BV: 32}, num_warps: 4, num_stages: 2}
+- {META: {BK: 32, BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 32}, num_warps: 8, num_stages: 3}
+- {META: {BK: 32, BV: 32}, num_warps: 8, num_stages: 4}
+chunk_gla_fwd_kernel_o_tle:
+- {META: {BK: 32, BV: 64, B_VCHUNK: 1}, num_warps: 4, num_stages: 3}
+- {META: {BK: 32, BV: 64, B_VCHUNK: 1}, num_warps: 8, num_stages: 3}
+- {META: {BK: 32, BV: 64, B_VCHUNK: 1}, num_warps: 4, num_stages: 4}
+- {META: {BK: 32, BV: 64, B_VCHUNK: 1}, num_warps: 8, num_stages: 4}
+- {META: {BK: 64, BV: 64, B_VCHUNK: 1}, num_warps: 4, num_stages: 2}
+- {META: {BK: 64, BV: 64, B_VCHUNK: 1}, num_warps: 8, num_stages: 2}
+- {META: {BK: 64, BV: 64, B_VCHUNK: 1}, num_warps: 8, num_stages: 3}
+- {META: {BK: 64, BV: 64, B_VCHUNK: 1}, num_warps: 8, num_stages: 4}
+- {META: {BK: 32, BV: 32, B_VCHUNK: 4}, num_warps: 8, num_stages: 2}
+- {META: {BK: 32, BV: 64, B_VCHUNK: 2}, num_warps: 4, num_stages: 2}
+- {META: {BK: 32, BV: 64, B_VCHUNK: 2}, num_warps: 8, num_stages: 2}
+- {META: {BK: 32, BV: 64, B_VCHUNK: 2}, num_warps: 8, num_stages: 3}
+- {META: {BK: 64, BV: 64, B_VCHUNK: 2}, num_warps: 4, num_stages: 2}
+- {META: {BK: 64, BV: 64, B_VCHUNK: 2}, num_warps: 8, num_stages: 2}
+- {META: {BK: 64, BV: 64, B_VCHUNK: 2}, num_warps: 8, num_stages: 3}
+- {META: {BK: 64, BV: 128, B_VCHUNK: 1}, num_warps: 4, num_stages: 2}
+- {META: {BK: 64, BV: 128, B_VCHUNK: 1}, num_warps: 8, num_stages: 2}
+- {META: {BK: 64, BV: 128, B_VCHUNK: 1}, num_warps: 8, num_stages: 3}
+- {META: {BK: 32, BV: 128, B_VCHUNK: 1}, num_warps: 8, num_stages: 2}
+- {META: {BK: 32, BV: 128, B_VCHUNK: 1}, num_warps: 8, num_stages: 3}
+
+# Native GDN2 reference state update; supplies its required BV tile.
+chunk_gated_delta_rule_fwd_kernel_h_blockdim64:
+- {META: {BV: 32}, num_warps: 2, num_stages: 2}
+- {META: {BV: 32}, num_warps: 2, num_stages: 3}
+- {META: {BV: 32}, num_warps: 4, num_stages: 2}
+- {META: {BV: 32}, num_warps: 4, num_stages: 3}
+- {META: {BV: 64}, num_warps: 2, num_stages: 2}
+- {META: {BV: 64}, num_warps: 2, num_stages: 3}
+- {META: {BV: 64}, num_warps: 4, num_stages: 3}
+- {META: {BV: 64}, num_warps: 4, num_stages: 4}

@@ -57,6 +57,7 @@ def test_unknown_attribute():
         ("hygon", "cuda"),
         ("iluvatar", "cuda"),
         ("metax", "cuda"),
+        ("thead", "cuda"),
         ("enflame", "gcu"),
         ("ascend", "npu"),
         ("cambricon", "mlu"),
@@ -121,6 +122,8 @@ def test_available_native_backend(automatic_vendor, monkeypatch, available, vend
         ("MetaX C550", "cuda", None, "metax"),
         ("CUDA-compatible accelerator", "maca", None, "metax"),
         ("Iluvatar BI150", "cuda", None, "iluvatar"),
+        ("PPU-ZW810E", "cuda", None, "thead"),
+        ("Alixpu", "cuda", None, "thead"),
     ],
 )
 def test_cuda_compatible_vendors(

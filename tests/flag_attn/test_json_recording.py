@@ -27,6 +27,7 @@ FLAGGEMS_METRIC_FIELDS = {
     "tflops",
     "utilization",
     "compared_speedup",
+    "base_miss_reason",
     "error_msg",
 }
 UPLOAD_SUMMARY_FIELDS = {"timestamp", "env", "result"}
@@ -84,6 +85,28 @@ def _invoke_pytest(tmp_path, test_names, *extra_args):
         text=True,
         timeout=30,
     )
+
+
+def test_collect_marks_does_not_execute_tests(tmp_path):
+    executed = tmp_path / "executed"
+    marks = tmp_path / "marks.json"
+    completed = _run_pytest(
+        tmp_path,
+        "test_collect_marks.py",
+        (
+            "from pathlib import Path\n"
+            "def test_must_not_run():\n"
+            f"    Path({str(executed)!r}).write_text('executed', encoding='utf-8')\n"
+        ),
+        "--collect-marks",
+        str(marks),
+    )
+
+    assert completed.returncode == 5, completed.stdout + completed.stderr
+    assert not executed.exists()
+    assert _load_strict_json(marks) == [
+        {"nodeid": "test_collect_marks.py::test_must_not_run", "marks": []}
+    ]
 
 
 def test_record_json_outcomes_params_markers_and_merge(tmp_path):

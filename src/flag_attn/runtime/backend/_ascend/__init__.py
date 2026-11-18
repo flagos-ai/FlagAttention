@@ -4,7 +4,21 @@
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "chunk_gated_delta_rule": (".FLA.gated_delta_rule.api", "chunk_gated_delta_rule"),
+    "chunk_gated_delta_rule_fwd": (".FLA.gated_delta_rule.chunk", "chunk_gated_delta_rule_fwd"),
+    "fused_recurrent_gated_delta_rule_fwd": (
+        ".FLA.gated_delta_rule.fused_recurrent",
+        "fused_recurrent_gated_delta_rule_fwd",
+    ),
+    "fused_recurrent_gated_delta_rule_packed_decode": (
+        ".FLA.gated_delta_rule.fused_recurrent",
+        "fused_recurrent_gated_delta_rule_packed_decode",
+    ),
     "chunk_gdn2": (".gdn2", "chunk_gdn2"),
+    "chunk_gla": (".FLA.gated_linear_attention.api", "chunk_gla"),
+    "parallel_parallax": (".parallax", "parallel_parallax"),
+    "parallax_decode": (".parallax", "parallax_decode"),
+    "parallax_attn_with_kvcache": (".parallax", "parallax_attn_with_kvcache"),
     "forward": (".attn_qk_int8_per_block", "forward"),
     "hy3_attention": (
         ".hpc_ops_attention.prefill.attention_blocksparse_prefill_bf16",
@@ -15,6 +29,7 @@ _OPERATOR_EXPORTS = {
     "hy3_attention_decode_bf16_dynamic": (
         ".hpc_ops_attention.decode.dynamic.bf16_dynamic", "attention_decode_bf16_dynamic"),
     "hy3_attention_prepare": (".hpc_ops_attention.api", "hy3_attention_prepare"),
+    "fused_attnres": (".FLA.attnres", "fused_attnres"),
     "per_block_int8": (".ops", "quant_per_block_int8"),
     "quant_per_block_int8": (".ops", "quant_per_block_int8"),
     "sage_attention": (".attn_qk_int8_per_block", "forward"),

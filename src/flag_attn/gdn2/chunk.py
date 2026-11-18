@@ -27,7 +27,7 @@ from .triton_ops_helper import autotune_cache_kwargs, exp2
 LN2 = 0.6931471805599453
 RCP_LN2 = 1.4426950408889634
 
-if has_triton_tle(3, 6, 0):
+if torch.version.cuda is not None and has_triton_tle(3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
 

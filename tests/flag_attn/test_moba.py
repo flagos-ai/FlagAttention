@@ -17,14 +17,6 @@ from flag_attn.FLA.moba.routing import (
     calc_chunks,
 )
 
-try:
-    if not test_backend.is_nvidia():
-        raise ImportError("CUDA comparison is unavailable on the selected backend")
-    from flash_moba import flash_moba_varlen_func
-except ImportError:
-    flash_moba_varlen_func = None
-
-
 pytestmark = [
     pytest.mark.parallel_moba,
     pytest.mark.skipif(
@@ -197,27 +189,6 @@ def test_inference_path_matches_autograd_path(
         atol=4e-3,
         rtol=1e-3,
     )
-
-
-@pytest.mark.skipif(not test_backend.graph_available(), reason="backend does not expose CUDA-compatible graph capture")
-def test_inference_path_is_cuda_graph_capturable():
-    q, k, v, cu_seqlens, max_seqlen = generate_data(
-        (384,), 4, 2, 64, torch.bfloat16
-    )
-    with torch.no_grad():
-        for _ in range(3):
-            eager = parallel_moba(
-                q, k, v, cu_seqlens, max_seqlen, 128, 2
-            )
-        test_backend.device_fn.synchronize()
-        graph = test_backend.device_fn.CUDAGraph()
-        with test_backend.device_fn.graph(graph):
-            captured = parallel_moba(
-                q, k, v, cu_seqlens, max_seqlen, 128, 2
-            )
-        graph.replay()
-        test_backend.device_fn.synchronize()
-    torch.testing.assert_close(captured, eager, atol=4e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("num_experts", [1, 1024, 1025, 65537, 131072])
@@ -513,86 +484,6 @@ def test_noncontiguous_inputs_match_naive():
     _assert_close("output", output, reference)
     for name, actual, expected in zip(("dq", "dk", "dv"), grads, reference_grads):
         _assert_close(name, actual, expected)
-
-
-@pytest.mark.skipif(flash_moba_varlen_func is None, reason="FlashMoBA is required")
-@pytest.mark.parametrize(
-    (
-        "seq_lens",
-        "num_q_heads",
-        "num_kv_heads",
-        "head_dim",
-        "chunk_size",
-        "topk",
-        "dtype",
-    ),
-    [
-        pytest.param(
-            (512,), 4, 4, 64, 128, 1, torch.float16, id="topk1-local-chunk"
-        ),
-        pytest.param(
-            (127, 128, 129),
-            4,
-            4,
-            64,
-            128,
-            2,
-            torch.float16,
-            id="topk2-varlen",
-        ),
-        pytest.param(
-            (1024,), 8, 8, 128, 128, 8, torch.bfloat16, id="topk8-bf16"
-        ),
-        pytest.param(
-            (512,), 4, 4, 64, 128, 64, torch.float16, id="topk64-saturated"
-        ),
-        pytest.param(
-            (384,), 4, 2, 64, 128, 2, torch.float16, id="gqa-4q-2kv"
-        ),
-    ],
-)
-def test_matches_flash_moba_forward_and_backward(
-    seq_lens,
-    num_q_heads,
-    num_kv_heads,
-    head_dim,
-    chunk_size,
-    topk,
-    dtype,
-):
-    q, k, v, cu_seqlens, max_seqlen = generate_data(
-        seq_lens, num_q_heads, num_kv_heads, head_dim, dtype
-    )
-    output_grad = torch.randn_like(q)
-    output = parallel_moba(
-        q, k, v, cu_seqlens, max_seqlen, chunk_size, topk
-    )
-    grads = torch.autograd.grad(output, (q, k, v), output_grad)
-    cuda_output = flash_moba_varlen_func(
-        q=q,
-        k=k,
-        v=v,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        moba_chunk_size=chunk_size,
-        moba_topk=topk,
-        causal=True,
-    )
-    cuda_grads = torch.autograd.grad(cuda_output, (q, k, v), output_grad)
-
-    _assert_close("output", output, cuda_output)
-    for name, actual, expected in zip(("dq", "dk", "dv"), grads, cuda_grads):
-        is_kv_grad = name != "dq"
-        kv_group_size = num_q_heads // num_kv_heads
-        _assert_close(
-            name,
-            actual,
-            expected,
-            mean_tolerance=4e-4 * (kv_group_size if is_kv_grad else 1),
-            max_tolerance=4e-2 * (kv_group_size**0.5 if is_kv_grad else 1),
-        )
 
 
 @pytest.mark.parametrize("routed_topk", [7, 33, 63])

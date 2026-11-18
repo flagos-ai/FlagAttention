@@ -19,15 +19,18 @@ Three Triton forward paths with identical semantics share one public entry,
 
 * Strict TLE path (``chunk_kda_fwd_infer_strict_tle``): optimized for the
   production KDA shape and its narrower input constraints.
-* Generic TLE path (``chunk_kda_fwd_infer``): asynchronous TLE loads in K1
+* Generic TLE path (``_chunk_kda_fwd_infer_tle``): asynchronous TLE loads in K1
   plus an S60-compatible sequential state/output kernel for the wider input set.
-* Triton fallback (``chunk_kda_fwd_infer_triton``): portable plain-Triton
-  kernels used when TLE is unavailable (e.g. CI).
+* Triton fallback (``chunk_kda_fwd_infer_triton``): plain-Triton GCU kernels
+  used when TLE is unavailable or explicitly disabled.
 
 ``chunk_kda`` validates inputs first, then dispatches: strict TLE when its
 constraints are satisfied, generic TLE otherwise, and finally Triton. Set
 ``FLAG_ATTN_CHUNK_KDA_BACKEND`` to ``strict_tle``, ``tle``, or ``triton`` to
 force a backend; the default is ``auto``.
+
+``chunk_kda_fwd_infer`` preserves the legacy inference signature and delegates
+to the same validated dispatcher.
 """
 
 from __future__ import annotations
@@ -40,11 +43,7 @@ import triton.language as tl
 
 from ..compat import exp2, has_triton_tle
 from ..index import prepare_chunk_indices, prepare_chunk_offsets
-
-try:
-    from triton.tools.tensor_descriptor import TensorDescriptor
-except ImportError:
-    TensorDescriptor = None
+from ..utils import input_guard
 
 if has_triton_tle(3, 6, 0):
     try:
@@ -58,7 +57,7 @@ else:
     tle = None
     HAS_TLE_KDA = False
 
-__all__ = ["chunk_kda"]
+__all__ = ["chunk_kda", "chunk_kda_fwd_infer"]
 
 # =============================================================================
 # Shared helpers
@@ -91,16 +90,12 @@ def _chunk_kda_backend() -> str:
 _FP16_DOT_PRECISION = tl.constexpr("ieee")
 
 
-def _refresh_fp16_dot_precision() -> None:
-    """S60 uses fixed IEEE dot precision."""
-
-
-def _allocate_triton_workspace(size: int, _alignment: int, _stream) -> torch.Tensor:
+def _allocate_triton_workspace(size: int, _alignment: int, _stream: object) -> torch.Tensor:
     return torch.empty(size, device="gcu", dtype=torch.int8)
 
 
 # =============================================================================
-# Generic TLE path adapted for the Enflame S60 -- default when available
+# Generic TLE path for inputs outside the strict S60 constraints
 # =============================================================================
 
 if HAS_TLE_KDA:
@@ -111,13 +106,7 @@ if HAS_TLE_KDA:
         }
     )
     @triton.autotune(
-        configs=[
-            triton.Config(
-                {}, num_warps=num_warps, num_stages=num_stages
-            )
-            for num_warps in [2]
-            for num_stages in [2]
-        ],
+        configs=[triton.Config({}, num_warps=2, num_stages=2)],
         key=["H", "HV", "K", "BT"],
     )
     @triton.jit(do_not_specialize=["T"])
@@ -208,7 +197,7 @@ if HAS_TLE_KDA:
         b_gq = tl.where(m_c[:, None], exp2(b_gc), 0.0)
         b_gk = tl.where(m_c[:, None], exp2(-b_gc), 0.0)
 
-        # Keep b_gq/b_gk in fp32: exp2(±cumsum) can exceed fp16 max (65504), casting would overflow.
+        # Keep b_gq/b_gk in fp32: exp2(+/-cumsum) can exceed fp16 max (65504).
         # For bfloat16, bf16 range (3.4e38) is sufficient, so cast is safe.
         if q.dtype.element_ty == tl.float16:
             b_kgt = tl.trans(b_kf * b_gk)
@@ -297,18 +286,18 @@ if HAS_TLE_KDA:
         tl.store(p_kg, b_kg_val.to(ws.dtype.element_ty), boundary_check=(0, 1))
 
     def _kda_fwd_intra(
-        q,
-        k,
-        g,
-        beta,
-        scale,
-        cu_seqlens=None,
-        chunk_indices=None,
-        chunk_size=16,
-        lower_bound=None,
-        A_log=None,
-        dt_bias=None,
-    ):
+        q: torch.Tensor,
+        k: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        scale: float,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_size: int = 16,
+        lower_bound: float | None = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T_len, H, K = q.shape
         HV = g.shape[2]
         BT = chunk_size
@@ -318,7 +307,7 @@ if HAS_TLE_KDA:
         NT = triton.cdiv(T_len, BT) if cu_seqlens is None else len(chunk_indices)
         grid = (NT, B * HV)
 
-        # Pad the workspace T dimension so TMA descriptors can read full BT tiles.
+        # Pad the workspace T dimension to a whole number of BT tiles.
         T_padded = NT * BT
         g_out = torch.empty(B, T_padded, HV, K, device=q.device, dtype=torch.float32)
         ws = torch.empty(B, T_padded, HV, 3 * K, device=q.device, dtype=q.dtype)
@@ -362,7 +351,7 @@ if HAS_TLE_KDA:
         }
     )
     @triton.autotune(
-        configs=[triton.Config({"BV": BV}, num_warps=4) for BV in [64]],
+        configs=[triton.Config({"BV": 64}, num_warps=4)],
         key=["HV", "K", "V", "BT"],
     )
     @triton.jit(do_not_specialize=["T"])
@@ -869,8 +858,9 @@ if HAS_TLE_KDA:
             else kg.new_empty(1, dtype=torch.float32)
         )
 
-        def grid(meta):
+        def grid(meta: dict[str, int]) -> tuple[int]:
             return (triton.cdiv(V, meta["BV"]) * N * HV,)
+
         _kda_fwd_state_output_s60_kernel[grid](
             kg=kg,
             v=v,
@@ -895,7 +885,7 @@ if HAS_TLE_KDA:
         return o, final_state
 
 
-def chunk_kda_fwd_infer(
+def _chunk_kda_fwd_infer_tle(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -912,10 +902,10 @@ def chunk_kda_fwd_infer(
     lower_bound: float | None = None,
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
-    **kwargs,
+    **kwargs: object,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the TLE implementation for inputs validated by the public dispatcher."""
     triton.set_allocator(_allocate_triton_workspace)
-    _refresh_fp16_dot_precision()
 
     if scale is None:
         scale = q.shape[-1] ** -0.5
@@ -926,8 +916,7 @@ def chunk_kda_fwd_infer(
     # The generic TLE entry covers wider K/V/GVA/layout combinations, but its
     # legacy kernels split K into 64-wide state tiles and keep the small
     # triangular inverse inside K1.  For the production-compatible subset,
-    # reuse the independently validated S60 core kernels while retaining this
-    # generic host entry.  Inputs outside that subset continue through the
+    # reuse the S60 core kernels. Inputs outside that subset continue through the
     # wider generic kernels below.
     core_reason = strict_tle_input_error(
         q=q,
@@ -1035,6 +1024,7 @@ def strict_tle_input_error(
     chunk_size: int,
     require_tle: bool = True,
 ) -> str | None:
+    """Return the first strict-path constraint violation, or None when supported."""
     if require_tle and not HAS_STRICT_TLE_KDA:
         return "strict TLE KDA requires Triton TLE >= 3.6.0"
 
@@ -1142,13 +1132,7 @@ if HAS_STRICT_TLE_KDA:
         }
     )
     @triton.autotune(
-        configs=[
-            triton.Config(
-                {}, num_warps=num_warps, num_stages=num_stages
-            )
-            for num_warps in [1]
-            for num_stages in [2]
-        ],
+        configs=[triton.Config({}, num_warps=1, num_stages=2)],
         key=["H", "HV", "K", "BT", "IS_VARLEN"],
     )
     @triton.jit(do_not_specialize=["T"])
@@ -1176,277 +1160,298 @@ if HAS_STRICT_TLE_KDA:
         HV: tl.constexpr,
         K: tl.constexpr,
         BT: tl.constexpr,
+        CHUNKS_PER_PROGRAM: tl.constexpr,
         IS_VARLEN: tl.constexpr,
         K1_DIAG_MODE: tl.constexpr,
     ):
-        i_tg, i_bh = tl.program_id(0), tl.program_id(1)
-        i_t = i_tg
-        i_hv = i_bh % HV
-        i_h = i_hv // (HV // H)
-
-        if IS_VARLEN:
-            i_b = 0
-            i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
-            i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-            bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-            T = eos - bos
-        else:
-            i_b = i_bh // HV
-            bos = i_b.to(tl.int32) * T
-            i_tg = i_b * tl.cdiv(T, BT) + i_t
-
-        if i_t * BT >= T:
-            return
+        q_base = q
+        k_base = k
+        g_base = g
+        beta_base = beta
+        ws_base = ws
+        Aqk_base = Aqk
+        Akk_raw_base = Akk_raw
+        Akk_base = Akk
+        g_last_base = g_last
         if K1_DIAG_MODE == 31:
             return
+        for i_local in tl.range(CHUNKS_PER_PROGRAM):
+            i_tg = tl.program_id(0) * CHUNKS_PER_PROGRAM + i_local
+            i_bh = tl.program_id(1)
+            if i_tg < NT_TOTAL:
+                q = q_base
+                k = k_base
+                g = g_base
+                beta = beta_base
+                ws = ws_base
+                Aqk = Aqk_base
+                Akk_raw = Akk_raw_base
+                Akk = Akk_base
+                g_last = g_last_base
+                i_t = i_tg
+                i_hv = i_bh % HV
+                i_h = i_hv // (HV // H)
 
-        q += (bos * H + i_h) * K
-        k += (bos * H + i_h) * K
-        g += (bos * HV + i_hv) * K
-        g_last += (i_tg * HV + i_hv).to(tl.int32) * K
-        if IS_VARLEN:
-            a_chunk = i_hv * NT_TOTAL + i_tg
-        else:
-            a_chunk = (i_b * HV + i_hv) * NT_TOTAL + i_t
-        Aqk += a_chunk.to(tl.int32) * BT * BT
-        Akk_raw += a_chunk.to(tl.int32) * BT * BT
-        Akk += a_chunk.to(tl.int32) * BT * BT
-        ws += (bos * HV + i_hv) * 3 * K
-        beta += bos * HV + i_hv
+                if IS_VARLEN:
+                    i_b = 0
+                    i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+                    i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+                    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+                    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+                    T = eos - bos
+                else:
+                    i_b = i_bh // HV
+                    bos = i_b.to(tl.int32) * T
+                    i_tg = i_b * tl.cdiv(T, BT) + i_t
 
-        o_i = tl.arange(0, BT)
-        token_start = i_t * BT
-        o_c = token_start + o_i
-        m_c = o_c < T
 
-        p_q = tl.make_block_ptr(
-            q, (T, K), (H * K, 1), (token_start, 0), (BT, K), (1, 0)
-        )
-        p_k = tl.make_block_ptr(
-            k, (T, K), (H * K, 1), (token_start, 0), (BT, K), (1, 0)
-        )
-        p_g = tl.make_block_ptr(
-            g, (T, K), (HV * K, 1), (token_start, 0), (BT, K), (1, 0)
-        )
-        b_q = tle.load(p_q, boundary_check=(0, 1), is_async=True)
-        b_k = tle.load(p_k, boundary_check=(0, 1), is_async=True)
-        b_q = tl.where(m_c[:, None], b_q, 0.0)
-        b_k = tl.where(m_c[:, None], b_k, 0.0)
+                q += (bos * H + i_h) * K
+                k += (bos * H + i_h) * K
+                g += (bos * HV + i_hv) * K
+                g_last += (i_tg * HV + i_hv).to(tl.int32) * K
+                if IS_VARLEN:
+                    a_chunk = i_hv * NT_TOTAL + i_tg
+                else:
+                    a_chunk = (i_b * HV + i_hv) * NT_TOTAL + i_t
+                Aqk += a_chunk.to(tl.int32) * BT * BT
+                Akk_raw += a_chunk.to(tl.int32) * BT * BT
+                Akk += a_chunk.to(tl.int32) * BT * BT
+                ws += (bos * HV + i_hv) * 3 * K
+                beta += bos * HV + i_hv
 
-        b_qf = b_q.to(tl.float32)
-        b_kf = b_k.to(tl.float32)
+                o_i = tl.arange(0, BT)
+                token_start = i_t * BT
+                o_c = token_start + o_i
+                m_c = o_c < T
 
-        b_q_rstd = 1.0 / tl.sqrt(tl.sum(b_qf * b_qf, 1) + l2norm_eps)
-        b_k_rstd = 1.0 / tl.sqrt(tl.sum(b_kf * b_kf, 1) + l2norm_eps)
-
-        if K1_DIAG_MODE < 15:
-            b_g = tle.load(p_g, boundary_check=(0, 1), is_async=True).to(tl.float32)
-            b_A = exp2(tl.load(A_log + i_hv).to(tl.float32) * g_scale)
-            p_dt = tl.make_block_ptr(
-                dt_bias + i_hv * K, (K,), (1,), (0,), (K,), (0,)
-            )
-            b_bias = tl.load(p_dt, boundary_check=(0,)).to(tl.float32)
-            b_g = b_g + b_bias[None, :]
-            b_g = (lower_bound * g_scale) * tl.sigmoid(b_A * b_g)
-            b_gc = tl.cumsum(tl.where(m_c[:, None], b_g, 0.0), axis=0)
-        else:
-            b_gc = tl.zeros([BT, K], dtype=tl.float32)
-
-        if K1_DIAG_MODE < 3:
-            # Aqk and Akk share the same gated-k tile. For BT=16, compute
-            # their transposes together so GCU300 sees one N=32 matrix
-            # primitive instead of two poorly utilized N=16 primitives.
-            if BT == 16:
-                b_gq = tl.where(m_c[:, None], exp2(b_gc), 0.0)
-                b_gk = tl.where(m_c[:, None], exp2(-b_gc), 0.0)
-                b_k_left = (b_kf * b_gk).to(b_k.dtype)
-                b_q_right = tl.trans((b_qf * b_gq).to(b_q.dtype))
-                b_k_right = tl.trans((b_kf * b_gq).to(b_k.dtype))
-                b_qk_right = tl.reshape(
-                    tl.join(b_q_right, b_k_right), (K, 2 * BT)
+                p_q = tl.make_block_ptr(
+                    q, (T, K), (H * K, 1), (token_start, 0), (BT, K), (1, 0)
                 )
-                b_Aqk_Akk_t = tl.dot(
-                    b_k_left, b_qk_right, out_dtype=tl.float32
+                p_k = tl.make_block_ptr(
+                    k, (T, K), (H * K, 1), (token_start, 0), (BT, K), (1, 0)
                 )
-                b_Aqk_t, b_Akk_t = tl.split(
-                    tl.reshape(b_Aqk_Akk_t, (BT, BT, 2))
+                p_g = tl.make_block_ptr(
+                    g, (T, K), (HV * K, 1), (token_start, 0), (BT, K), (1, 0)
                 )
-            else:
-                # With 32 rows, exp2(-b_gc) can exceed the fp32/bf16
-                # exponent range even though every retained triangular
-                # product is finite. Shift both operands by the cumulative
-                # gate at the 16-row boundary, then form only the three
-                # blocks that survive the lower-triangular output mask. The
-                # omitted bottom-left transpose block is both unused and the
-                # one whose positive exponent difference can overflow.
-                split_row: tl.constexpr = BT // 2
-                b_shift = tl.sum(
-                    tl.where(
-                        o_i[:, None] == split_row - 1,
-                        b_gc,
-                        0.0,
-                    ),
-                    axis=0,
+                b_q = tle.load(p_q, boundary_check=(0, 1), is_async=True)
+                b_k = tle.load(p_k, boundary_check=(0, 1), is_async=True)
+                b_q = tl.where(m_c[:, None], b_q, 0.0)
+                b_k = tl.where(m_c[:, None], b_k, 0.0)
+
+                b_qf = b_q.to(tl.float32)
+                b_kf = b_k.to(tl.float32)
+
+                b_q_rstd = 1.0 / tl.sqrt(tl.sum(b_qf * b_qf, 1) + l2norm_eps)
+                b_k_rstd = 1.0 / tl.sqrt(tl.sum(b_kf * b_kf, 1) + l2norm_eps)
+
+                if K1_DIAG_MODE < 15:
+                    b_g = tle.load(p_g, boundary_check=(0, 1), is_async=True).to(tl.float32)
+                    b_A = exp2(tl.load(A_log + i_hv).to(tl.float32) * g_scale)
+                    p_dt = tl.make_block_ptr(
+                        dt_bias + i_hv * K, (K,), (1,), (0,), (K,), (0,)
+                    )
+                    b_bias = tl.load(p_dt, boundary_check=(0,)).to(tl.float32)
+                    b_g = b_g + b_bias[None, :]
+                    b_g = (lower_bound * g_scale) * tl.sigmoid(b_A * b_g)
+                    b_gc = tl.cumsum(tl.where(m_c[:, None], b_g, 0.0), axis=0)
+                else:
+                    b_gc = tl.zeros([BT, K], dtype=tl.float32)
+
+                if K1_DIAG_MODE < 3:
+                    # Aqk and Akk share the same gated-k tile. For BT=16, compute
+                    # their transposes together so GCU300 sees one N=32 matrix
+                    # primitive instead of two poorly utilized N=16 primitives.
+                    if BT == 16:
+                        b_gq = tl.where(m_c[:, None], exp2(b_gc), 0.0)
+                        b_gk = tl.where(m_c[:, None], exp2(-b_gc), 0.0)
+                        b_k_left = (b_kf * b_gk).to(b_k.dtype)
+                        b_q_right = tl.trans((b_qf * b_gq).to(b_q.dtype))
+                        b_k_right = tl.trans((b_kf * b_gq).to(b_k.dtype))
+                        b_qk_right = tl.reshape(
+                            tl.join(b_q_right, b_k_right), (K, 2 * BT)
+                        )
+                        b_Aqk_Akk_t = tl.dot(
+                            b_k_left, b_qk_right, out_dtype=tl.float32
+                        )
+                        b_Aqk_t, b_Akk_t = tl.split(
+                            tl.reshape(b_Aqk_Akk_t, (BT, BT, 2))
+                        )
+                    else:
+                        # With 32 rows, exp2(-b_gc) can exceed the fp32/bf16
+                        # exponent range even though every retained triangular
+                        # product is finite. Shift both operands by the cumulative
+                        # gate at the 16-row boundary, then form only the three
+                        # blocks that survive the lower-triangular output mask. The
+                        # omitted bottom-left transpose block is both unused and the
+                        # one whose positive exponent difference can overflow.
+                        split_row: tl.constexpr = BT // 2
+                        b_shift = tl.sum(
+                            tl.where(
+                                o_i[:, None] == split_row - 1,
+                                b_gc,
+                                0.0,
+                            ),
+                            axis=0,
+                        )[None, :]
+                        b_gq = tl.where(
+                            m_c[:, None], exp2(b_gc - b_shift), 0.0
+                        )
+                        b_gk = tl.where(
+                            m_c[:, None], exp2(b_shift - b_gc), 0.0
+                        )
+                        b_k_left = (b_kf * b_gk).to(b_k.dtype)
+                        b_q_scaled = (b_qf * b_gq).to(b_q.dtype)
+                        b_k_scaled = (b_kf * b_gq).to(b_k.dtype)
+                        m_lo = o_i < split_row
+                        b_k_left_lo = tl.where(m_lo[:, None], b_k_left, 0.0)
+                        b_k_left_hi = tl.where(~m_lo[:, None], b_k_left, 0.0)
+                        b_q_right = tl.trans(b_q_scaled)
+                        b_q_right_hi = tl.trans(
+                            tl.where(~m_lo[:, None], b_q_scaled, 0.0)
+                        )
+                        b_k_right = tl.trans(b_k_scaled)
+                        b_k_right_hi = tl.trans(
+                            tl.where(~m_lo[:, None], b_k_scaled, 0.0)
+                        )
+
+                        # Low rows can cover both column halves in one product.
+                        # Keep high rows separate to exclude the overflowing block.
+                        b_Aqk_t = tl.dot(
+                            b_k_left_lo, b_q_right, out_dtype=tl.float32
+                        )
+                        b_Aqk_t += tl.dot(
+                            b_k_left_hi, b_q_right_hi, out_dtype=tl.float32
+                        )
+                        b_Akk_t = tl.dot(
+                            b_k_left_lo, b_k_right, out_dtype=tl.float32
+                        )
+                        b_Akk_t += tl.dot(
+                            b_k_left_hi, b_k_right_hi, out_dtype=tl.float32
+                        )
+                    b_Aqk = tl.trans(b_Aqk_t)
+                    b_Akk = tl.trans(b_Akk_t)
+
+                    b_Aqk = b_Aqk * b_q_rstd[:, None] * b_k_rstd[None, :]
+                    b_Akk = b_Akk * b_k_rstd[:, None] * b_k_rstd[None, :]
+                else:
+                    b_Aqk = tl.zeros([BT, BT], dtype=tl.float32)
+                    b_Akk = tl.zeros([BT, BT], dtype=tl.float32)
+
+                if K1_DIAG_MODE < 7:
+                    p_beta = tl.make_block_ptr(
+                        beta, (T,), (HV,), (token_start,), (BT,), (0,)
+                    )
+                    b_beta = tl.sigmoid(
+                        tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+                    )
+                    b_beta = tl.where(m_c, b_beta, 0.0)
+                else:
+                    b_beta = tl.zeros([BT], dtype=tl.float32)
+
+                m_valid = m_c[:, None] & m_c[None, :]
+                m_Aqk = (o_i[:, None] >= o_i[None, :]) & m_valid
+                m_Akk = (o_i[:, None] > o_i[None, :]) & m_valid
+                m_I = o_i[:, None] == o_i[None, :]
+
+                b_Aqk = tl.where(m_Aqk, b_Aqk * scale, 0.0)
+                b_Akk = tl.where(m_Akk, b_Akk * b_beta[:, None], 0.0)
+
+                p_Aqk = tl.make_block_ptr(Aqk, (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0))
+                tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty))
+
+                if K1_DIAG_MODE < 7:
+                    # Finish every use of the large q/k/g tiles before the triangular
+                    # inverse below. On S60 these tiles live in registers because the
+                    # current lowering cannot parse the TLE shared-memory/local_ptr
+                    # objects used by the Hopper path.
+                    b_q3 = b_qf * b_q_rstd[:, None]
+                    if BT == 32 and K1_DIAG_MODE < 3:
+                        # Reuse bounded shifted exponents before the bf16 stores.
+                        b_exp_gc = b_gq * exp2(b_shift)
+                    else:
+                        b_exp_gc = exp2(b_gc)
+                    b_qg_val = b_q3 * b_exp_gc
+                    p_qg = tl.make_block_ptr(
+                        ws,
+                        (T, 3 * K),
+                        (HV * 3 * K, 1),
+                        (token_start, K),
+                        (BT, K),
+                        (1, 0),
+                    )
+                    tl.store(
+                        p_qg, b_qg_val.to(ws.dtype.element_ty), boundary_check=(0, 1)
+                    )
+
+                    b_k3 = b_kf * b_k_rstd[:, None]
+                    b_kb = b_k3 * b_beta[:, None] * b_exp_gc
+                    p_w = tl.make_block_ptr(
+                        ws,
+                        (T, 3 * K),
+                        (HV * 3 * K, 1),
+                        (token_start, 0),
+                        (BT, K),
+                        (1, 0),
+                    )
+                    tl.store(
+                        p_w, b_kb.to(ws.dtype.element_ty), boundary_check=(0, 1)
+                    )
+
+                last_local = (tl.minimum(BT, T - token_start) - 1).to(tl.int32)
+                b_gn = tl.sum(
+                    tl.where(o_i[:, None] == last_local, b_gc, 0.0), axis=0
                 )[None, :]
-                b_gq = tl.where(
-                    m_c[:, None], exp2(b_gc - b_shift), 0.0
+                p_g_last = tl.make_block_ptr(
+                    g_last, (1, K), (K, 1), (0, 0), (1, K), (1, 0)
                 )
-                b_gk = tl.where(
-                    m_c[:, None], exp2(b_shift - b_gc), 0.0
-                )
-                b_k_left = (b_kf * b_gk).to(b_k.dtype)
-                b_q_scaled = (b_qf * b_gq).to(b_q.dtype)
-                b_k_scaled = (b_kf * b_gq).to(b_k.dtype)
-                m_lo = o_i < split_row
-                b_k_left_lo = tl.where(m_lo[:, None], b_k_left, 0.0)
-                b_k_left_hi = tl.where(~m_lo[:, None], b_k_left, 0.0)
-                b_q_right_lo = tl.trans(
-                    tl.where(m_lo[:, None], b_q_scaled, 0.0)
-                )
-                b_q_right_hi = tl.trans(
-                    tl.where(~m_lo[:, None], b_q_scaled, 0.0)
-                )
-                b_k_right_lo = tl.trans(
-                    tl.where(m_lo[:, None], b_k_scaled, 0.0)
-                )
-                b_k_right_hi = tl.trans(
-                    tl.where(~m_lo[:, None], b_k_scaled, 0.0)
-                )
+                tl.store(p_g_last, b_gn.to(g_last.dtype.element_ty), boundary_check=(0, 1))
+                if K1_DIAG_MODE < 7:
+                    if BT == 32 and K1_DIAG_MODE < 3:
+                        b_kg_scale = exp2(b_gn - b_shift) * b_gk
+                    else:
+                        b_kg_scale = exp2(b_gn - b_gc)
+                    b_kg_val = b_k3 * tl.where(m_c[:, None], b_kg_scale, 0)
+                    p_kg = tl.make_block_ptr(
+                        ws,
+                        (T, 3 * K),
+                        (HV * 3 * K, 1),
+                        (token_start, 2 * K),
+                        (BT, K),
+                        (1, 0),
+                    )
+                    tl.store(
+                        p_kg, b_kg_val.to(ws.dtype.element_ty), boundary_check=(0, 1)
+                    )
 
-                b_Aqk_t = tl.dot(
-                    b_k_left_lo, b_q_right_lo, out_dtype=tl.float32
-                )
-                b_Aqk_t += tl.dot(
-                    b_k_left_lo, b_q_right_hi, out_dtype=tl.float32
-                )
-                b_Aqk_t += tl.dot(
-                    b_k_left_hi, b_q_right_hi, out_dtype=tl.float32
-                )
-                b_Akk_t = tl.dot(
-                    b_k_left_lo, b_k_right_lo, out_dtype=tl.float32
-                )
-                b_Akk_t += tl.dot(
-                    b_k_left_lo, b_k_right_hi, out_dtype=tl.float32
-                )
-                b_Akk_t += tl.dot(
-                    b_k_left_hi, b_k_right_hi, out_dtype=tl.float32
-                )
-            b_Aqk = tl.trans(b_Aqk_t)
-            b_Akk = tl.trans(b_Akk_t)
+                if K1_DIAG_MODE < 1 and BT != 16:
+                    # qf/kf/gc and their large derived tiles are dead at this point,
+                    # so only the small triangular matrices remain live.
+                    b_L = b_Akk.to(tl.float16)
+                    b_Ai = m_I.to(tl.float16) - b_L
+                    b_L2 = tl.dot(b_L, b_L, out_dtype=tl.float16)
+                    b_Ai = b_Ai + tl.dot(b_Ai, b_L2, out_dtype=tl.float16)
+                    b_L4 = tl.dot(b_L2, b_L2, out_dtype=tl.float16)
+                    b_Ai = b_Ai + tl.dot(b_Ai, b_L4, out_dtype=tl.float16)
+                    b_L8 = tl.dot(b_L4, b_L4, out_dtype=tl.float16)
+                    b_Ai = b_Ai + tl.dot(b_Ai, b_L8, out_dtype=tl.float16)
+                    if BT == 32:
+                        # (I-L)(I+L^2)(I+L^4)(I+L^8)(I+L^16)
+                        # equals I-L^32, which is I for a strictly lower 32x32 L.
+                        b_L16 = tl.dot(b_L8, b_L8, out_dtype=tl.float16)
+                        b_Ai = b_Ai + tl.dot(b_Ai, b_L16, out_dtype=tl.float16)
+                else:
+                    b_Ai = b_Akk.to(tl.float16)
 
-            b_Aqk = b_Aqk * b_q_rstd[:, None] * b_k_rstd[None, :]
-            b_Akk = b_Akk * b_k_rstd[:, None] * b_k_rstd[None, :]
-        else:
-            b_Aqk = tl.zeros([BT, BT], dtype=tl.float32)
-            b_Akk = tl.zeros([BT, BT], dtype=tl.float32)
-
-        if K1_DIAG_MODE < 7:
-            p_beta = tl.make_block_ptr(
-                beta, (T,), (HV,), (token_start,), (BT,), (0,)
-            )
-            b_beta = tl.sigmoid(
-                tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
-            )
-            b_beta = tl.where(m_c, b_beta, 0.0)
-        else:
-            b_beta = tl.zeros([BT], dtype=tl.float32)
-
-        m_valid = m_c[:, None] & m_c[None, :]
-        m_Aqk = (o_i[:, None] >= o_i[None, :]) & m_valid
-        m_Akk = (o_i[:, None] > o_i[None, :]) & m_valid
-        m_I = o_i[:, None] == o_i[None, :]
-
-        b_Aqk = tl.where(m_Aqk, b_Aqk * scale, 0.0)
-        b_Akk = tl.where(m_Akk, b_Akk * b_beta[:, None], 0.0)
-
-        p_Aqk = tl.make_block_ptr(Aqk, (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0))
-        tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty))
-
-        if K1_DIAG_MODE < 7:
-            # Finish every use of the large q/k/g tiles before the triangular
-            # inverse below. On S60 these tiles live in registers because the
-            # current lowering cannot parse the TLE shared-memory/local_ptr
-            # objects used by the Hopper path.
-            b_q3 = b_qf * b_q_rstd[:, None]
-            b_qg_val = b_q3 * exp2(b_gc)
-            p_qg = tl.make_block_ptr(
-                ws,
-                (T, 3 * K),
-                (HV * 3 * K, 1),
-                (token_start, K),
-                (BT, K),
-                (1, 0),
-            )
-            tl.store(
-                p_qg, b_qg_val.to(ws.dtype.element_ty), boundary_check=(0, 1)
-            )
-
-            b_k3 = b_kf * b_k_rstd[:, None]
-            b_kb = b_k3 * b_beta[:, None] * exp2(b_gc)
-            p_w = tl.make_block_ptr(
-                ws,
-                (T, 3 * K),
-                (HV * 3 * K, 1),
-                (token_start, 0),
-                (BT, K),
-                (1, 0),
-            )
-            tl.store(
-                p_w, b_kb.to(ws.dtype.element_ty), boundary_check=(0, 1)
-            )
-
-        last_local = (tl.minimum(BT, T - token_start) - 1).to(tl.int32)
-        b_gn = tl.sum(
-            tl.where(o_i[:, None] == last_local, b_gc, 0.0), axis=0
-        )[None, :]
-        p_g_last = tl.make_block_ptr(
-            g_last, (1, K), (K, 1), (0, 0), (1, K), (1, 0)
-        )
-        tl.store(p_g_last, b_gn.to(g_last.dtype.element_ty), boundary_check=(0, 1))
-        if K1_DIAG_MODE < 7:
-            b_kg_val = b_k3 * tl.where(m_c[:, None], exp2(b_gn - b_gc), 0)
-            p_kg = tl.make_block_ptr(
-                ws,
-                (T, 3 * K),
-                (HV * 3 * K, 1),
-                (token_start, 2 * K),
-                (BT, K),
-                (1, 0),
-            )
-            tl.store(
-                p_kg, b_kg_val.to(ws.dtype.element_ty), boundary_check=(0, 1)
-            )
-
-        if K1_DIAG_MODE < 1 and BT != 16:
-            # qf/kf/gc and their large derived tiles are dead at this point,
-            # so only the small triangular matrices remain live.
-            b_L = b_Akk.to(tl.float16)
-            b_Ai = m_I.to(tl.float16) - b_L
-            b_L2 = tl.dot(b_L, b_L, out_dtype=tl.float16)
-            b_Ai = b_Ai + tl.dot(b_Ai, b_L2, out_dtype=tl.float16)
-            b_L4 = tl.dot(b_L2, b_L2, out_dtype=tl.float16)
-            b_Ai = b_Ai + tl.dot(b_Ai, b_L4, out_dtype=tl.float16)
-            b_L8 = tl.dot(b_L4, b_L4, out_dtype=tl.float16)
-            b_Ai = b_Ai + tl.dot(b_Ai, b_L8, out_dtype=tl.float16)
-            if BT == 32:
-                # (I-L)(I+L^2)(I+L^4)(I+L^8)(I+L^16)
-                # equals I-L^32, which is I for a strictly lower 32x32 L.
-                b_L16 = tl.dot(b_L8, b_L8, out_dtype=tl.float16)
-                b_Ai = b_Ai + tl.dot(b_Ai, b_L16, out_dtype=tl.float16)
-        else:
-            b_Ai = b_Akk.to(tl.float16)
-
-        if K1_DIAG_MODE < 1 and BT == 16:
-            p_Akk_raw = tl.make_block_ptr(
-                Akk_raw, (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0)
-            )
-            tl.store(p_Akk_raw, b_Ai)
-        else:
-            p_Akk_out = tl.make_block_ptr(
-                Akk, (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0)
-            )
-            tl.store(p_Akk_out, b_Ai.to(Akk.dtype.element_ty))
+                if K1_DIAG_MODE < 1 and BT == 16:
+                    p_Akk_raw = tl.make_block_ptr(
+                        Akk_raw, (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0)
+                    )
+                    tl.store(p_Akk_raw, b_Ai)
+                else:
+                    p_Akk_out = tl.make_block_ptr(
+                        Akk, (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0)
+                    )
+                    tl.store(p_Akk_out, b_Ai.to(Akk.dtype.element_ty))
 
     @triton.jit
     def _strict_kda_inverse_pair_s60_kernel(
@@ -1489,19 +1494,19 @@ if HAS_STRICT_TLE_KDA:
         )
 
     def _strict_kda_fwd_intra(
-        q,
-        k,
-        g,
-        beta,
-        scale,
-        cu_seqlens=None,
-        chunk_indices=None,
-        chunk_size=16,
-        lower_bound=None,
-        A_log=None,
-        dt_bias=None,
-        diagnostic_mode=0,
-    ):
+        q: torch.Tensor,
+        k: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        scale: float,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_size: int = 16,
+        lower_bound: float | None = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        diagnostic_mode: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T_len, H, K = q.shape
         HV = g.shape[2]
         BT = chunk_size
@@ -1509,7 +1514,8 @@ if HAS_STRICT_TLE_KDA:
         if chunk_indices is None and cu_seqlens is not None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
         NT = triton.cdiv(T_len, BT) if cu_seqlens is None else len(chunk_indices)
-        grid = (NT, B * HV)
+        chunks_per_program = 2 if BT == 32 else 1
+        grid = (triton.cdiv(NT, chunks_per_program), B * HV)
 
         T_padded = NT * BT
         g_last = torch.empty(B * NT, HV, K, device=q.device, dtype=torch.float32)
@@ -1548,6 +1554,7 @@ if HAS_STRICT_TLE_KDA:
             K=K,
             BT=BT,
             K1_DIAG_MODE=diagnostic_mode,
+            CHUNKS_PER_PROGRAM=chunks_per_program,
         )
         if diagnostic_mode < 1 and BT == 16:
             n_matrices = B * HV * NT
@@ -1560,379 +1567,6 @@ if HAS_STRICT_TLE_KDA:
                 num_stages=2,
             )
         return ws, Aqk, Akk, g_last
-
-    @triton.jit
-    def _strict_kda_state_output_load_producer(
-        writer,
-        ws_desc,
-        v_ptr,
-        beta_ptr,
-        gk_desc,
-        Aqk_desc,
-        Akk_desc,
-        K: tl.constexpr,
-        T,
-        HV: tl.constexpr,
-        V: tl.constexpr,
-        BT: tl.constexpr,
-        BV: tl.constexpr,
-        NT,
-        i_v,
-        USE_HOST_DESCRIPTORS: tl.constexpr,
-        state_row_start,
-        chunk_start,
-        i_h,
-    ):
-        for i_t in tl.range(NT):
-            slot = writer.acquire(i_t)
-
-            ws_row = i_t * BT
-            ws_col = 0
-            A_row = i_t * BT
-            A_col = 0
-            gk_row = i_t
-            gk_col = 0
-            if USE_HOST_DESCRIPTORS:
-                ws_row += state_row_start
-                ws_col = i_h * 3 * K
-                A_row = state_row_start * HV + i_h * NT * BT + i_t * BT
-                gk_row += chunk_start
-                gk_col = i_h * K
-
-            ws_row = ws_row.to(tl.int32)
-            ws_col = ws_col.to(tl.int32)
-            A_row = A_row.to(tl.int32)
-            A_col = A_col.to(tl.int32)
-            gk_row = gk_row.to(tl.int32)
-            gk_col = gk_col.to(tl.int32)
-
-            tle.gpu.copy(ws_desc, slot.w, [BT, K], [ws_row, ws_col])
-            tle.gpu.copy(ws_desc, slot.qg, [BT, K], [ws_row, ws_col + K])
-            tle.gpu.copy(ws_desc, slot.kg, [BT, K], [ws_row, ws_col + 2 * K])
-            tle.gpu.copy(Aqk_desc, slot.Aqk, [BT, BT], [A_row, A_col])
-            tle.gpu.copy(Akk_desc, slot.Akk, [BT, BT], [A_row, A_col])
-            tle.gpu.copy(gk_desc, slot.gk, [1, K], [gk_row, gk_col])
-
-            p_v = tl.make_block_ptr(
-                v_ptr,
-                (T, V),
-                (HV * V, 1),
-                (i_t * BT, i_v * BV),
-                (BT, BV),
-                (1, 0),
-            )
-            b_v_raw = tl.load(p_v, boundary_check=(0, 1))
-            p_beta = tl.make_block_ptr(beta_ptr, (T,), (HV,), (i_t * BT,), (BT,), (0,))
-            b_beta = tl.load(p_beta, boundary_check=(0,))
-            b_beta_f = tl.sigmoid(b_beta.to(tl.float32))
-            b_v = (b_v_raw.to(tl.float32) * b_beta_f[:, None]).to(b_v_raw.dtype)
-            tl.store(tle.gpu.local_ptr(slot.v), b_v)
-
-            writer.commit(i_t)
-
-    @triton.jit
-    def _strict_kda_state_output_mma_consumer(
-        load_reader,
-        store_writer,
-        h0,
-        ht,
-        scale,
-        i_v,
-        i_nh,
-        K: tl.constexpr,
-        V: tl.constexpr,
-        BV: tl.constexpr,
-        NT,
-        USE_INITIAL_STATE: tl.constexpr,
-        STORE_FINAL_STATE: tl.constexpr,
-    ):
-        state_dtype: tl.constexpr = tl.bfloat16
-        if USE_INITIAL_STATE:
-            p_h0 = tl.make_block_ptr(
-                h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, K), (1, 0)
-            )
-            b_h = tl.trans(tl.load(p_h0, boundary_check=(0, 1))).to(tl.float32)
-        else:
-            b_h = tl.zeros([K, BV], dtype=tl.float32)
-
-        for i_t in tl.range(NT):
-            wait = load_reader.wait(i_t)
-            slot = wait.slot
-
-            b_w = tl.load(tle.gpu.local_ptr(slot.w))
-            b_v_raw = tl.load(tle.gpu.local_ptr(slot.v))
-            b_qg = tl.load(tle.gpu.local_ptr(slot.qg))
-            b_kg = tl.load(tle.gpu.local_ptr(slot.kg))
-            b_Aqk = tl.load(tle.gpu.local_ptr(slot.Aqk))
-            b_Akk = tl.load(tle.gpu.local_ptr(slot.Akk))
-            b_gk = tl.load(tle.gpu.local_ptr(slot.gk)).reshape([K])
-
-            b_h_bf = b_h.to(state_dtype)
-
-            b_kh = tl.dot(b_w, b_h_bf).to(tl.float32)
-            b_diff = b_v_raw.to(tl.float32) - b_kh
-            b_v = tl.dot(b_Akk, b_diff.to(state_dtype)).to(tl.float32)
-
-            b_qh = tl.dot(b_qg, b_h_bf).to(tl.float32)
-            b_o = scale * b_qh
-            b_v_cast = b_v.to(state_dtype)
-            b_o += tl.dot(b_Aqk, b_v_cast).to(tl.float32)
-
-            out_slot = store_writer.acquire(i_t)
-            tl.store(tle.gpu.local_ptr(out_slot.output), b_o)
-            store_writer.commit(i_t)
-
-            load_reader.release(i_t)
-
-            b_h = b_h * exp2(b_gk)[:, None] + tl.dot(tl.trans(b_kg), b_v_cast).to(
-                tl.float32
-            )
-
-        if STORE_FINAL_STATE:
-            p_ht = tl.make_block_ptr(
-                ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, K), (1, 0)
-            )
-            tl.store(
-                p_ht, tl.trans(b_h).to(p_ht.dtype.element_ty), boundary_check=(0, 1)
-            )
-
-    @triton.jit
-    def _strict_kda_state_output_store_consumer(
-        store_reader,
-        store_target,
-        BT: tl.constexpr,
-        BV: tl.constexpr,
-        NT,
-        i_v,
-        USE_HOST_DESCRIPTORS: tl.constexpr,
-        output_row_start,
-        output_col_start,
-    ):
-        for i_t in tl.range(NT):
-            store_wait = store_reader.wait(i_t)
-            slot = store_wait.slot
-            output_row = i_t * BT
-            output_col = i_v * BV
-            if USE_HOST_DESCRIPTORS:
-                output_row += output_row_start
-                output_col += output_col_start
-            output_row = output_row.to(tl.int32)
-            output_col = output_col.to(tl.int32)
-            tle.gpu.copy(slot.output, store_target, [BT, BV], [output_row, output_col])
-            store_reader.release(i_t)
-
-    STRICT_PIPE_STAGES = tl.constexpr(4)
-
-    @triton.heuristics(
-        {
-            "USE_INITIAL_STATE": lambda args: args["h0"].numel() > 1,
-            "STORE_FINAL_STATE": lambda args: args["ht"].numel() > 1,
-            "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        }
-    )
-    @triton.jit(do_not_specialize=["T"])
-    def _strict_kda_fwd_state_output_kernel(
-        v,
-        beta,
-        gk,
-        Aqk,
-        Akk,
-        o,
-        ws,
-        h0,
-        ht,
-        ws_host_desc,
-        gk_host_desc,
-        Aqk_host_desc,
-        Akk_host_desc,
-        output_host_desc,
-        cu_seqlens,
-        chunk_offsets,
-        scale,
-        T,
-        NT_TOTAL,
-        HV: tl.constexpr,
-        K: tl.constexpr,
-        V: tl.constexpr,
-        BT: tl.constexpr,
-        BV: tl.constexpr,
-        USE_HOST_DESCRIPTORS: tl.constexpr,
-        USE_INITIAL_STATE: tl.constexpr,
-        STORE_FINAL_STATE: tl.constexpr,
-        IS_VARLEN: tl.constexpr,
-    ):
-        i_v, i_nh = tl.program_id(0), tl.program_id(1)
-
-        if IS_VARLEN:
-            i_n = i_nh // HV
-            i_h = i_nh % HV
-            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
-            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-            T = (eos - bos).to(tl.int32)
-            NT = tl.cdiv(T, BT)
-            chunk_start = tl.load(chunk_offsets + i_n).to(tl.int32)
-        else:
-            i_n = i_nh // HV
-            i_h = i_nh % HV
-            bos = i_n.to(tl.int64) * T
-            NT = tl.cdiv(T, BT)
-            chunk_start = i_n * NT
-
-        v += (bos * HV + i_h) * V
-        beta += bos * HV + i_h
-        gk += (chunk_start * HV + i_h).to(tl.int64) * K
-        o += (bos * HV + i_h) * V
-        ws_base = ws + (bos * HV + i_h) * 3 * K
-
-        if IS_VARLEN:
-            state_row_start = bos.to(tl.int64)
-        else:
-            state_row_start = i_n.to(tl.int64) * NT * BT
-        if USE_HOST_DESCRIPTORS:
-            ws_desc = ws_host_desc
-            gk_desc = gk_host_desc
-            Aqk_desc = Aqk_host_desc
-            Akk_desc = Akk_host_desc
-        else:
-            if IS_VARLEN:
-                a_chunk = (i_h * NT_TOTAL + chunk_start) * BT * BT
-            else:
-                a_chunk = (i_n * HV + i_h) * NT_TOTAL * BT * BT
-            Aqk += a_chunk.to(tl.int64)
-            Akk += a_chunk.to(tl.int64)
-            ws_desc = tl.make_tensor_descriptor(
-                ws_base,
-                shape=[T, 3 * K],
-                strides=[HV * 3 * K, 1],
-                block_shape=[BT, K],
-            )
-            gk_desc = tl.make_tensor_descriptor(
-                gk, shape=[NT, K], strides=[HV * K, 1], block_shape=[1, K]
-            )
-            Aqk_desc = tl.make_tensor_descriptor(
-                Aqk,
-                shape=[NT * BT, BT],
-                strides=[BT, 1],
-                block_shape=[BT, BT],
-            )
-            Akk_desc = tl.make_tensor_descriptor(
-                Akk,
-                shape=[NT * BT, BT],
-                strides=[BT, 1],
-                block_shape=[BT, BT],
-            )
-
-        w_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, K], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        v_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, BV], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        qg_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, K], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        kg_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, K], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        Aqk_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, BT], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        Akk_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, BT], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        gk_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, 1, K], dtype=tl.float32, scope=tle.gpu.smem
-        )
-        out_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, BV], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        if USE_HOST_DESCRIPTORS:
-            output_store_target = output_host_desc
-        else:
-            output_store_target = tl.make_tensor_descriptor(
-                o, shape=[T, V], strides=[HV * V, 1], block_shape=[BT, BV]
-            )
-
-        load_pipe = tle.pipe(
-            capacity=STRICT_PIPE_STAGES,
-            scope="cta",
-            name="kda_load",
-            w=w_smem,
-            v=v_smem,
-            qg=qg_smem,
-            kg=kg_smem,
-            Aqk=Aqk_smem,
-            Akk=Akk_smem,
-            gk=gk_smem,
-        )
-        store_pipe = tle.pipe(
-            capacity=STRICT_PIPE_STAGES,
-            scope="cta",
-            name="kda_store",
-            output=out_smem,
-        )
-        tle.gpu.warp_specialize(
-            [
-                (
-                    _strict_kda_state_output_load_producer,
-                    (
-                        load_pipe.writer(),
-                        ws_desc,
-                        v,
-                        beta,
-                        gk_desc,
-                        Aqk_desc,
-                        Akk_desc,
-                        K,
-                        T,
-                        HV,
-                        V,
-                        BT,
-                        BV,
-                        NT,
-                        i_v,
-                        USE_HOST_DESCRIPTORS,
-                        state_row_start,
-                        chunk_start,
-                        i_h,
-                    ),
-                ),
-                (
-                    _strict_kda_state_output_mma_consumer,
-                    (
-                        load_pipe.reader(),
-                        store_pipe.writer(),
-                        h0,
-                        ht,
-                        scale,
-                        i_v,
-                        i_nh,
-                        K,
-                        V,
-                        BV,
-                        NT,
-                        USE_INITIAL_STATE,
-                        STORE_FINAL_STATE,
-                    ),
-                ),
-                (
-                    _strict_kda_state_output_store_consumer,
-                    (
-                        store_pipe.reader(),
-                        output_store_target,
-                        BT,
-                        BV,
-                        NT,
-                        i_v,
-                        USE_HOST_DESCRIPTORS,
-                        bos.to(tl.int64),
-                        i_h.to(tl.int64) * V,
-                    ),
-                ),
-            ],
-            [4, 1],
-            [240, 32],
-        )
 
     @triton.heuristics(
         {
@@ -2224,7 +1858,7 @@ if HAS_STRICT_TLE_KDA:
             BT=BT,
             BV=BV,
             K2_DIAG_MODE=diagnostic_mode,
-            num_warps=4,
+            num_warps=1,
             num_stages=2,
         )
         return o, final_state
@@ -2248,6 +1882,7 @@ def chunk_kda_fwd_infer_strict_tle(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the strict S60 path after checking its narrower input constraints."""
     reason = strict_tle_input_error(
         q=q,
         k=k,
@@ -2712,18 +2347,18 @@ def _kda_fwd_state_output_core_triton_kernel(
 
 
 def _kda_fwd_intra_core_triton(
-    q,
-    k,
-    g,
-    beta,
-    scale,
-    cu_seqlens=None,
-    chunk_indices=None,
-    chunk_size=32,
-    lower_bound=None,
-    A_log=None,
-    dt_bias=None,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = 32,
+    lower_bound: float | None = None,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T_len, H, K = q.shape
     HV = g.shape[2]
     BT = chunk_size
@@ -2769,18 +2404,18 @@ def _kda_fwd_intra_core_triton(
 
 
 def _kda_fwd_state_output_core_triton(
-    v,
-    beta,
-    Akk,
-    gk,
-    Aqk,
-    ws,
-    scale,
-    initial_state=None,
-    output_final_state=False,
-    cu_seqlens=None,
-    chunk_size=32,
-):
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    Akk: torch.Tensor,
+    gk: torch.Tensor,
+    Aqk: torch.Tensor,
+    ws: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     B, _, HV, packed_K = ws.shape
     K = packed_K // 3
     T_actual = v.shape[1]
@@ -2856,13 +2491,7 @@ def _softplus(x):
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32]
-        for BV in [32]
-        for num_warps in [1]
-        for num_stages in [1]
-    ],
+    configs=[triton.Config({"BK": 32, "BV": 32}, num_warps=1, num_stages=1)],
     key=["H", "HV", "K", "V", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -3101,21 +2730,21 @@ def _kda_fwd_intra_triton_kernel(
 
 
 def _kda_fwd_intra_triton(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    scale,
-    cu_seqlens=None,
-    chunk_indices=None,
-    chunk_size=16,
-    lower_bound=None,
-    A_log=None,
-    dt_bias=None,
-    use_qk_l2norm=True,
-    apply_beta_sigmoid=True,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = 16,
+    lower_bound: float | None = None,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    use_qk_l2norm: bool = True,
+    apply_beta_sigmoid: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused intra-chunk computation. Returns (w, u, qg, kg, Aqk, Akk, g_cumsum)."""
     B, T_len, H, K = q.shape
     HV = g.shape[2]
@@ -3176,11 +2805,7 @@ def _kda_fwd_intra_triton(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps)
-        for BV in [32]
-        for num_warps in [2]
-    ],
+    configs=[triton.Config({"BV": 32}, num_warps=2)],
     key=["HV", "K", "V", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -3195,7 +2820,6 @@ def _kda_fwd_h_o_triton_kernel(
     h0,
     ht,
     cu_seqlens,
-    chunk_offsets,
     scale,
     T,
     HV: tl.constexpr,
@@ -3498,33 +3122,28 @@ def _kda_fwd_h_o_triton_kernel(
 
 
 def _kda_fwd_h_o_triton(
-    kg,
-    w,
-    u,
-    gk,
-    qg,
-    Aqk,
-    scale,
-    initial_state=None,
-    output_final_state=False,
-    state_v_first=False,
-    cu_seqlens=None,
-    chunk_indices=None,
-    chunk_size=16,
-):
+    kg: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor,
+    qg: torch.Tensor,
+    Aqk: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    state_v_first: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Fused state propagation + output."""
     B, T, HV, K = kg.shape
     V = u.shape[-1]
     BT = chunk_size
 
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     if cu_seqlens is None:
         N = B
-        chunk_offsets = None
     else:
         N = len(cu_seqlens) - 1
-        chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
 
     final_state = None
     if output_final_state:
@@ -3535,7 +3154,7 @@ def _kda_fwd_h_o_triton(
 
     o = torch.zeros(B, T, HV, V, device=kg.device, dtype=u.dtype)
 
-    def grid(meta):
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
         return (triton.cdiv(V, meta["BV"]), N * HV)
 
     _kda_fwd_h_o_triton_kernel[grid](
@@ -3549,7 +3168,6 @@ def _kda_fwd_h_o_triton(
         h0=initial_state,
         ht=final_state,
         cu_seqlens=cu_seqlens,
-        chunk_offsets=chunk_offsets,
         scale=scale,
         T=T,
         HV=HV,
@@ -3670,13 +3288,12 @@ def chunk_kda_fwd_infer_triton(
         output_final_state=output_final_state,
         state_v_first=state_v_first,
         cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
         chunk_size=BT,
     )
 
 
 # =============================================================================
-# Input validation (shared by both paths)
+# Input validation shared by all public dispatch paths
 # =============================================================================
 
 
@@ -3699,24 +3316,27 @@ def _validate_chunk_kda_inputs(
     safe_gate: bool,
     lower_bound: float | None,
 ) -> None:
+    """Validate metadata without reading tensor values or synchronizing the GCU."""
     if torch.is_grad_enabled():
-        raise RuntimeError("chunk_kda TLE path only supports inference/no-grad mode")
+        raise RuntimeError("chunk_kda only supports inference/no-grad mode")
+    inputs = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+    for name, tensor in inputs.items():
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
     if q.device.type != "gcu":
         raise ValueError(f"chunk_kda requires Enflame GCU inputs, got {q.device}")
     if chunk_size not in (16, 32):
         raise ValueError(
-            f"chunk_kda TLE path requires chunk_size in {{16, 32}}, "
+            f"chunk_kda requires chunk_size in {{16, 32}}, "
             f"got {chunk_size}"
         )
     supported_dtypes = (torch.bfloat16, torch.float16)
-    for name, tensor in (("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta)):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor")
+    for name, tensor in inputs.items():
         if tensor.device != q.device:
             raise ValueError(f"{name} must be on the same device as q")
         if tensor.dtype not in supported_dtypes:
             raise ValueError(
-                f"chunk_kda TLE path requires {name} dtype to be bf16 or fp16, "
+                f"chunk_kda requires {name} dtype to be bf16 or fp16, "
                 f"got {tensor.dtype}"
             )
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or g.ndim != 4:
@@ -3725,6 +3345,8 @@ def _validate_chunk_kda_inputs(
         raise ValueError("beta must be a 3D tensor in [B, T, HV] layout")
 
     B, T, H, K = q.shape
+    if B <= 0 or T <= 0 or H <= 0:
+        raise ValueError("chunk_kda requires positive B, T, and H dimensions")
     Bk, Tk, Hk, Kk = k.shape
     Bv, Tv, HV, V = v.shape
     if (Bk, Tk, Hk, Kk) != (B, T, H, K):
@@ -3737,33 +3359,37 @@ def _validate_chunk_kda_inputs(
         raise ValueError(f"beta must have shape {(B, T, HV)}, got {tuple(beta.shape)}")
     if K not in (64, 128, 192, 256):
         raise ValueError(
-            f"chunk_kda TLE path requires K in {{64, 128, 192, 256}}, got {K}"
+            f"chunk_kda requires K in {{64, 128, 192, 256}}, got {K}"
         )
     if V <= 0:
-        raise ValueError(f"chunk_kda TLE path requires V > 0, got {V}")
+        raise ValueError(f"chunk_kda requires V > 0, got {V}")
     if HV < H or HV % H != 0:
-        raise ValueError(f"chunk_kda TLE path requires HV % H == 0, got H={H}, HV={HV}")
+        raise ValueError(f"chunk_kda requires HV % H == 0, got H={H}, HV={HV}")
 
     if not use_qk_l2norm_in_kernel:
-        raise ValueError("chunk_kda TLE path requires use_qk_l2norm_in_kernel=True")
+        raise ValueError("chunk_kda requires use_qk_l2norm_in_kernel=True")
     if not use_gate_in_kernel:
-        raise ValueError("chunk_kda TLE path requires use_gate_in_kernel=True")
+        raise ValueError("chunk_kda requires use_gate_in_kernel=True")
     if not use_beta_sigmoid_in_kernel:
-        raise ValueError("chunk_kda TLE path requires use_beta_sigmoid_in_kernel=True")
+        raise ValueError("chunk_kda requires use_beta_sigmoid_in_kernel=True")
     if allow_neg_eigval:
-        raise ValueError("chunk_kda TLE path does not support allow_neg_eigval=True")
+        raise ValueError("chunk_kda does not support allow_neg_eigval=True")
     if not safe_gate:
-        raise ValueError("chunk_kda TLE path requires safe_gate=True")
+        raise ValueError("chunk_kda requires safe_gate=True")
     if lower_bound is None:
-        raise ValueError("chunk_kda TLE path requires lower_bound")
+        raise ValueError("chunk_kda requires lower_bound")
     if A_log is None:
-        raise ValueError("chunk_kda TLE path requires A_log")
+        raise ValueError("chunk_kda requires A_log")
+    if not isinstance(A_log, torch.Tensor):
+        raise TypeError("A_log must be a torch.Tensor")
     if A_log.device != q.device:
         raise ValueError("A_log must be on the same device as q")
     if A_log.numel() != HV:
         raise ValueError(f"A_log.numel() must be HV={HV}, got {A_log.numel()}")
     if dt_bias is None:
-        raise ValueError("chunk_kda TLE path requires dt_bias")
+        raise ValueError("chunk_kda requires dt_bias")
+    if not isinstance(dt_bias, torch.Tensor):
+        raise TypeError("dt_bias must be a torch.Tensor")
     if dt_bias.device != q.device:
         raise ValueError("dt_bias must be on the same device as q")
     if dt_bias.numel() != HV * K:
@@ -3772,8 +3398,12 @@ def _validate_chunk_kda_inputs(
         )
 
     if cu_seqlens is not None:
+        if not isinstance(cu_seqlens, torch.Tensor):
+            raise TypeError("cu_seqlens must be a torch.Tensor")
         if cu_seqlens.ndim != 1:
             raise ValueError("cu_seqlens must be a 1D tensor")
+        if cu_seqlens.numel() < 2:
+            raise ValueError("cu_seqlens must contain at least two elements")
         if cu_seqlens.dtype != torch.int32:
             raise ValueError(
                 "Enflame KDA requires cu_seqlens with dtype torch.int32; "
@@ -3785,6 +3415,8 @@ def _validate_chunk_kda_inputs(
             raise ValueError("cu_seqlens packed varlen inputs must use B=1")
 
     if initial_state is not None:
+        if not isinstance(initial_state, torch.Tensor):
+            raise TypeError("initial_state must be a torch.Tensor")
         if initial_state.device != q.device:
             raise ValueError("initial_state must be on the same device as q")
         N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
@@ -3801,6 +3433,7 @@ def _validate_chunk_kda_inputs(
 # =============================================================================
 
 
+@input_guard
 def chunk_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3819,20 +3452,41 @@ def chunk_kda(
     state_v_first: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     chunk_size: int | None = None,
-    **kwargs,
+    *,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    **kwargs: object,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Inference-only implementation of chunk Kimi Delta Attention.
+    """Run chunk Kimi Delta Attention under no-grad or inference mode.
 
-    Inputs use seq-first layout: q/k ``[B, T, H, K]``, v/g ``[B, T, HV, *]``,
-    and beta ``[B, T, HV]``. q/k L2 norm, gate activation, and beta sigmoid are
-    computed inside the kernels. Backend selection defaults to automatic and
-    can be forced with ``FLAG_ATTN_CHUNK_KDA_BACKEND``. If ``chunk_size`` is
-    omitted, strict-compatible S60 core paths use BT=32 while wider fallback
-    paths retain the legacy BT=16 default. Explicit BT=16 or BT=32 requests
-    are honored.
+    Inputs use sequence-first layout: q/k ``[B, T, H, K]``, v ``[B, T, HV, V]``,
+    g ``[B, T, HV, K]``, and beta ``[B, T, HV]``. K is 64, 128, 192, or 256;
+    HV is a positive multiple of H. Inputs must be bf16 or fp16 tensors on
+    the same GCU. Noncontiguous tensors are made contiguous, and kernels
+    launch in the input device context.
+
+    A_log and dt_bias are required gate parameters with HV and HV * K elements,
+    respectively. q/k L2 normalization, the lower-bound gate, and beta sigmoid
+    are computed inside the kernels; their corresponding flags must be True.
+    allow_neg_eigval must be False.
+
+    cu_seqlens is an optional 1D int32 tensor on the input GCU for packed
+    sequences with B=1. Its values must start at zero, be nondecreasing, and
+    end at T. Values are not inspected on the host.
+    Optional chunk_indices contains precomputed int32 sequence/chunk pairs
+    with shape ``[num_chunks, 2]`` for the selected chunk_size.
+
+    State layout is ``[N, HV, V, K]`` when state_v_first is True and
+    ``[N, HV, K, V]`` otherwise. N is B for fixed-length inputs or the number
+    of packed sequences. Returns output ``[B, T, HV, V]`` and an optional
+    float32 final state in the selected layout.
+
+    FLAG_ATTN_CHUNK_KDA_BACKEND selects auto, strict_tle, tle, or triton.
+    When chunk_size is omitted, strict-compatible S60 core paths use BT=32
+    and wider fallback paths use BT=16. Explicit BT=16 or BT=32 is honored.
+    Additional keyword arguments are retained for API compatibility.
     """
-    A_log = kwargs.get("A_log")
-    dt_bias = kwargs.get("dt_bias")
     fallback_chunk_size = 16 if chunk_size is None else chunk_size
     strict_chunk_size = 32 if chunk_size is None else chunk_size
 
@@ -3855,6 +3509,14 @@ def chunk_kda(
         safe_gate=safe_gate,
         lower_bound=lower_bound,
     )
+
+    if chunk_indices is not None:
+        if not isinstance(chunk_indices, torch.Tensor):
+            raise TypeError("chunk_indices must be a torch.Tensor")
+        if chunk_indices.device != q.device or chunk_indices.dtype != torch.int32:
+            raise ValueError("chunk_indices must be an int32 tensor on the input device")
+        if chunk_indices.ndim != 2 or chunk_indices.shape[1] != 2:
+            raise ValueError("chunk_indices must have shape [num_chunks, 2]")
 
     backend = _chunk_kda_backend()
 
@@ -3922,6 +3584,7 @@ def chunk_kda(
             output_final_state=output_final_state,
             state_v_first=state_v_first,
             cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
             chunk_size=strict_chunk_size,
             safe_gate=safe_gate,
             lower_bound=lower_bound,
@@ -3930,7 +3593,7 @@ def chunk_kda(
         )
 
     if backend in {"auto", "tle"} and HAS_TLE_KDA:
-        return chunk_kda_fwd_infer(
+        return _chunk_kda_fwd_infer_tle(
             q=q,
             k=k,
             v=v,
@@ -3941,6 +3604,7 @@ def chunk_kda(
             output_final_state=output_final_state,
             state_v_first=state_v_first,
             cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
             chunk_size=generic_tle_chunk_size,
             safe_gate=safe_gate,
             lower_bound=lower_bound,
@@ -3963,9 +3627,56 @@ def chunk_kda(
         allow_neg_eigval=allow_neg_eigval,
         state_v_first=state_v_first,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
         chunk_size=triton_chunk_size,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
         A_log=A_log,
         dt_bias=dt_bias,
+    )
+
+
+def chunk_kda_fwd_infer(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    state_v_first: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = 16,
+    safe_gate: bool = False,
+    lower_bound: float | None = None,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    **kwargs: object,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Forward the legacy inference signature through the validated dispatcher.
+
+    Preserve positional arguments and the BT=16 default used by
+    ``flag_attn.chunk_kda``. See :func:`chunk_kda` for input constraints and
+    backend selection.
+    """
+    return chunk_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        state_v_first=state_v_first,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        **kwargs,
     )

@@ -15,7 +15,12 @@ def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 
 
 @tensor_cache
-def prepare_chunk_indices(cu_seqlens: torch.LongTensor, chunk_size: int) -> torch.LongTensor:
+def prepare_chunk_indices(
+    cu_seqlens: torch.LongTensor,
+    chunk_size: int,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+) -> torch.LongTensor:
+    del cu_seqlens_cpu
     chunk_counts = triton.cdiv(prepare_lens(cu_seqlens), chunk_size)
     chunk_offsets = torch.cat([cu_seqlens.new_tensor([0]), chunk_counts]).cumsum(-1)
     chunk_arange = torch.arange(chunk_offsets[-1], device=cu_seqlens.device)

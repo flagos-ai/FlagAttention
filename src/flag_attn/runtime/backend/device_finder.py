@@ -27,6 +27,7 @@ _VENDOR_DEVICES = {
     "hygon": "cuda",
     "iluvatar": "cuda",
     "metax": "cuda",
+    "thead": "cuda",
     "enflame": "gcu",
     "ascend": "npu",
     "cambricon": "mlu",
@@ -36,12 +37,21 @@ _VENDOR_DEVICES = {
 }
 
 _TRITON_VENDORS = {
+    "gcu": "enflame",
     "maca": "metax",
     "metax": "metax",
     "hygon": "hygon",
     "dcu": "hygon",
     "iluvatar": "iluvatar",
 }
+
+# Hygon GPU architectures, used to tell Hygon from AMD. Unlike every other
+# vendor here, Hygon shares both its device type (cuda) and its Triton backend
+# name (hip) with AMD, and its marketing name carries no vendor token ("BW" on
+# the C-3000), so the arch is the only distinguishing field. These IDs are
+# claimed by FlagTree's hcu backend and not by its amd backend; gfx942 and
+# gfx950 are deliberately absent because both backends support them.
+_HYGON_GPU_ARCHS = ("gfx916", "gfx926", "gfx928", "gfx936", "gfx938", "gfx946")
 
 
 def _normalize_vendor(value: str) -> str:
@@ -65,6 +75,7 @@ def _cuda_vendor() -> str:
         ("metax", ("metax", "曦云")),
         ("hygon", ("hygon", "dcu")),
         ("iluvatar", ("iluvatar", "天数")),
+        ("thead", ("ppu", "thead", "t-head", "zw810", "alixpu")),
     ):
         if any(token in name for token in names):
             return vendor
@@ -72,9 +83,16 @@ def _cuda_vendor() -> str:
         import triton
 
         target = triton.runtime.driver.active.get_current_target()
-        vendor = _TRITON_VENDORS.get(str(target.backend).lower())
+        backend = str(target.backend).lower()
+        vendor = _TRITON_VENDORS.get(backend)
         if vendor:
             return vendor
+        # Hygon's Triton backend is named "hip", same as AMD's, so the backend
+        # name alone cannot separate them; the arch can.
+        if backend == "hip" and str(target.arch).lower().startswith(
+            _HYGON_GPU_ARCHS
+        ):
+            return "hygon"
     except Exception:
         # Driver initialization is optional for metadata inspection.
         pass

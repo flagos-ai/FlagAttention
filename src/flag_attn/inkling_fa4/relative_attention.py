@@ -1789,7 +1789,7 @@ if TLE_AVAILABLE:
 
             # Steady state: launch page i+1 into the other slot before doing the
             # math for page i. This is the actual load/compute overlap missing from
-            # a plain tle.gpu.pipeline loop around synchronous tl.load operations.
+            # a plain tl.range loop around synchronous tl.load operations.
             next_block = block_k + 1
             if next_block < block_end:
                 next_slot = (page_iter + 1) % NUM_KV_BUFFERS

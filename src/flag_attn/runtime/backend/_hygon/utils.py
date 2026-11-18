@@ -16,12 +16,41 @@
 """Utility functions extracted from vLLM framework dependencies."""
 
 import re
+from typing import Any
 
 import torch
+
+# Hygon GPU architectures. Kept in step with the same list in
+# flag_attn.runtime.backend.device_finder.
+_HYGON_GPU_ARCHS = ("gfx916", "gfx926", "gfx928", "gfx936", "gfx938", "gfx946")
+
+
+def _triton_target() -> Any | None:
+    """Return Triton's active target without making platform detection fatal."""
+    try:
+        import triton
+
+        return triton.runtime.driver.active.get_current_target()
+    except Exception:
+        return None
 
 
 class _CurrentPlatform:
     """Small platform adapter used by the MSA Triton kernels."""
+
+    def is_hygon(self) -> bool:
+        """Return whether the active Triton target is a Hygon DCU.
+
+        Hygon exposes the CUDA PyTorch ABI and names its Triton backend ``hip``,
+        exactly as AMD does, so neither the device type nor the backend name
+        separates the two. The GPU arch does.
+        """
+        target = _triton_target()
+        if target is None:
+            return False
+        if str(getattr(target, "backend", "")).lower() != "hip":
+            return False
+        return str(getattr(target, "arch", "")).lower().startswith(_HYGON_GPU_ARCHS)
 
     def is_arch_support_pdl(self) -> bool:
         if not torch.cuda.is_available():

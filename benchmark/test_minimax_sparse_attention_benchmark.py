@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUDA benchmark for the MiniMax M3 paged MSA kernels.
-
-The benchmark compares the FlagAttention and vLLM implementations on the same
-inputs.  ``fp8`` means FP8 index queries/index keys and FP8 main KV cache,
-with scalar K/V dequantization scales passed to both implementations.
-"""
 
 from __future__ import annotations
 
@@ -35,7 +29,6 @@ import pytest
 import torch
 import triton
 import triton.knobs
-import triton.testing as triton_testing
 
 try:
     from benchmark.recording import BenchmarkRecorder
@@ -43,7 +36,7 @@ except ModuleNotFoundError:  # Direct script execution.
     from recording import BenchmarkRecorder
 
 from flag_attn.testing import backend as test_backend
-from flag_attn import minimax_m3_sparse_attn
+from flag_attn import minimax_m3_sparse_attn, runtime
 from flag_attn.minimax_sparse_attention import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode,
@@ -54,8 +47,6 @@ from flag_attn.minimax_sparse_attention import minimax_m3_sparse_attn_decode
 from functools import partial
 
 try:
-    if not test_backend.is_nvidia():
-        raise ImportError("CUDA comparison is unavailable on the selected backend")
     from vllm.models.minimax_m3.common.ops.index_topk import (
         minimax_m3_index_decode as vllm_index_decode,
     )
@@ -75,8 +66,17 @@ try:
     VLLM_AVAILABLE = True
     VLLM_IMPORT_ERROR = ""
 except Exception as exc:  # vLLM is an optional benchmark baseline.
+    vllm_index_decode = None
+    vllm_index_score = None
+    vllm_index_topk = None
+    vllm_sparse_attn = None
+    vllm_sparse_attn_decode = None
     VLLM_AVAILABLE = False
     VLLM_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+# vLLM M3 prefill is validated on these vendors; other vLLM installs may
+# dispatch to a different backend and are not a trustworthy baseline.
+VLLM_BASELINE_VENDORS = {"nvidia", "hygon"}
 
 warnings.filterwarnings("ignore", message="tl.make_block_ptr is deprecated")
 triton.knobs.autotuning.adjust_block_size = False
@@ -102,7 +102,7 @@ _flag_attn_platform = _CachedPlatform(_flag_attn_index_module.current_platform)
 _flag_attn_index_module.current_platform = _flag_attn_platform
 _flag_attn_sparse_module.current_platform = _flag_attn_platform
 
-if VLLM_AVAILABLE:
+if VLLM_AVAILABLE and runtime.device.vendor_name in VLLM_BASELINE_VENDORS:
     _vllm_index_module = sys.modules[vllm_index_decode.__module__]
     _vllm_sparse_module = sys.modules[vllm_sparse_attn_decode.__module__]
     _vllm_platform = _CachedPlatform(_vllm_index_module.current_platform)
@@ -120,30 +120,57 @@ BF16_ATOL = BF16_RTOL = 2e-2
 FP8_ATOL, FP8_RTOL = 6e-2, 8e-2
 OUTPUT_CHECK_CHUNK_ELEMENTS = 1 << 20
 
+# Shape tuple: (batch, query, KV length, KV heads, Q heads).
 PREFILL_SHAPES = [
-    (1, 8192, 16, 96),
-    (2, 16384, 8, 96),
-    (1, 32768, 16, 96),
-    (2, 8192, 8, 96),
-    (4, 4096, 16, 384),
-    (4, 4096, 16, 256),
+    (1, 128, 4096, 1, 8),
+    (1, 512, 4096, 1, 8),
+    (1, 1024, 4096, 1, 8),
+    (1, 4096, 4096, 1, 8),
+    (1, 128, 16384, 1, 8),
+    (1, 512, 16384, 1, 8),
+    (1, 1024, 16384, 1, 8),
+    (1, 4096, 16384, 1, 8),
+    (1, 8192, 16384, 1, 8),
+    (1, 128, 65536, 1, 8),
+    (1, 1024, 65536, 1, 8),
+    (4, 128, 4096, 1, 8),
+    (4, 512, 4096, 1, 8),
+    (4, 1024, 4096, 1, 8),
+    (8, 128, 4096, 1, 8),
+    (8, 512, 4096, 1, 8),
+    (8, 1024, 4096, 1, 8),
+    (16, 128, 4096, 1, 8),
+    (16, 512, 4096, 1, 8),
+    (32, 128, 4096, 1, 8),
+    (64, 128, 4096, 1, 8),
 ]
 
+# Shapes: (batch, query_length, kv_length, num_kv_heads, num_heads).
 DECODE_SHAPES = [
-    (1, 4096, 16, 96),
-    (1, 16384, 16, 96),
-    (1, 65536, 16, 96),
-    (4, 4096, 8, 96),
-    (4, 16384, 8, 96),
-    (16, 4096, 8, 96),
-    (32, 2048, 4, 48),
-    (64, 1024, 4, 48),
+    (1, 1, 4096, 1, 8),
+    (1, 1, 16384, 1, 8),
+    (1, 1, 65536, 1, 8),
+    (1, 1, 131072, 1, 8),
+    (4, 1, 4096, 1, 8),
+    (4, 1, 16384, 1, 8),
+    (4, 1, 65536, 1, 8),
+    (16, 1, 4096, 1, 8),
+    (16, 1, 16384, 1, 8),
+    (32, 1, 4096, 1, 8),
+    (32, 1, 16384, 1, 8),
+    (64, 1, 4096, 1, 8),
+    (64, 1, 16384, 1, 8),
+    (128, 1, 4096, 1, 8),
+    (128, 1, 8192, 1, 8),
+    (256, 1, 4096, 1, 8),
+    (512, 1, 3072, 1, 8),
+    (1024, 1, 3072, 1, 8),
 ]
-
 
 @dataclass
 class MSABenchmarkArgs:
-    dtype: str = "both"
+    dtype: str = "all"
+    stage: str = "all"
     shape: str | None = None
     topk: int = 16
     init_blocks: int = 1
@@ -179,13 +206,6 @@ class MSAData:
 def _require_cuda() -> None:
     if not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")):
         raise RuntimeError("This benchmark requires an available accelerator.")
-
-
-def _supports_fp8() -> bool:
-    if FP8_DTYPE is None or not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")):
-        return False
-    # NVIDIA FP8 Tensor Core support starts with Ada (8.9) and Hopper (9.0).
-    return not test_backend.is_nvidia() or test_backend.cuda_capability() >= (8, 9)
 
 
 def _encode_fp8(value: torch.Tensor, scale: float) -> torch.Tensor:
@@ -224,6 +244,7 @@ def make_data(
     *,
     decode: bool,
     decode_qlen: int,
+    query_len: int | None = None,
     randomize_pages: bool = True,
     generator: torch.Generator | None = None,
 ) -> MSAData:
@@ -237,7 +258,8 @@ def make_data(
     storage_dtype = torch.bfloat16 if dtype_name == "bf16" else FP8_DTYPE
     blocks_per_request = (seq_len + BLOCK - 1) // BLOCK
     total_blocks = batch * blocks_per_request
-    total_q = batch * decode_qlen if decode else batch * seq_len
+    q_stride = decode_qlen if decode else (seq_len if query_len is None else query_len)
+    total_q = batch * q_stride
 
     q = (
         torch.randn(
@@ -302,7 +324,6 @@ def make_data(
         kv_cache = kv_cache[physical_pages.argsort()].contiguous()
         index_kv_cache = index_kv_cache[physical_pages.argsort()].contiguous()
 
-    q_stride = decode_qlen if decode else seq_len
     cu_q = torch.arange(
         0,
         (batch + 1) * q_stride,
@@ -311,7 +332,7 @@ def make_data(
         dtype=torch.int32,
     )
     seq_lens = torch.full((batch,), seq_len, device=device, dtype=torch.int32)
-    prefix_lens = torch.zeros_like(seq_lens)
+    prefix_lens = torch.full_like(seq_lens, seq_len - q_stride)
     if dtype_name == "fp8":
         k_scale = torch.tensor([KV_SCALE], device=device, dtype=torch.float32)
         v_scale = torch.tensor([KV_SCALE], device=device, dtype=torch.float32)
@@ -382,6 +403,7 @@ def run_prefill(
     local_blocks: int,
     output: torch.Tensor,
 ) -> None:
+    query_len = data.q.shape[0] // data.seq_lens.numel()
     scores = index_score(
         data.idx_q,
         data.index_kv_cache,
@@ -389,7 +411,7 @@ def run_prefill(
         data.cu_q,
         data.seq_lens,
         data.prefix_lens,
-        seq_len,
+        query_len,
         seq_len,
         num_kv_heads,
     )
@@ -397,7 +419,7 @@ def run_prefill(
         scores,
         data.cu_q,
         data.prefix_lens,
-        seq_len,
+        query_len,
         topk,
         init_blocks,
         local_blocks,
@@ -408,7 +430,7 @@ def run_prefill(
         topk_idx,
         output,
         decode=False,
-        max_query_len=seq_len,
+        max_query_len=query_len,
         num_kv_heads=num_kv_heads,
         decode_qlen=1,
     )
@@ -555,7 +577,7 @@ def _check_outputs(
     flag_output: torch.Tensor,
     vllm_output: torch.Tensor,
     *,
-    shape: tuple[int, int, int, int],
+    shape: tuple[int, int, int, int, int],
     dtype_name: str,
     mode: str,
     layout: str,
@@ -633,9 +655,9 @@ def _bench_steps(
     data: MSAData,
     decode: bool,
     args: MSABenchmarkArgs,
-    shape: tuple[int, int, int, int],
+    shape: tuple[int, int, int, int, int],
 ) -> dict[str, float]:
-    batch, seq_len, num_kv_heads, _ = shape
+    batch, query_len, seq_len, num_kv_heads, _ = shape
     output = torch.empty_like(data.q)
     if decode:
 
@@ -687,7 +709,7 @@ def _bench_steps(
             data.cu_q,
             data.seq_lens,
             data.prefix_lens,
-            seq_len,
+            query_len,
             seq_len,
             num_kv_heads,
         )
@@ -699,7 +721,7 @@ def _bench_steps(
             scores,
             data.cu_q,
             data.prefix_lens,
-            seq_len,
+            query_len,
             args.topk,
             args.init_blocks,
             args.local_blocks,
@@ -713,7 +735,7 @@ def _bench_steps(
             topk_idx,
             output,
             decode=False,
-            max_query_len=seq_len,
+            max_query_len=query_len,
             num_kv_heads=num_kv_heads,
             decode_qlen=1,
         )
@@ -745,10 +767,9 @@ def _parse_shape(value: str) -> tuple[int, int, int, int]:
     return shape
 
 
-def _get_shapes(args: MSABenchmarkArgs) -> list[tuple[int, int, int, int]]:
-    if args.shape is not None and not args.all_shapes:
-        return [_parse_shape(args.shape)]
-    return DECODE_SHAPES if args.decode else PREFILL_SHAPES
+def _get_shapes(args: MSABenchmarkArgs) -> list[tuple[int, int, int, int, int]]:
+    shapes = DECODE_SHAPES if args.decode else PREFILL_SHAPES
+    return [(b, args.decode_qlen if args.decode else q, seq, kh, h) for b, q, seq, kh, h in shapes]
 
 
 def _format_columns(columns: list[tuple[str, int]]) -> str:
@@ -760,7 +781,11 @@ def _run_dtype(
     dtype_name: str,
     record_property: Callable[[str, object], None] | None = None,
 ) -> None:
-    run_vllm = VLLM_AVAILABLE and not args.no_vllm
+    run_vllm = (
+        VLLM_AVAILABLE
+        and runtime.device.vendor_name in VLLM_BASELINE_VENDORS
+        and not args.no_vllm
+    )
     if dtype_name == "fp8" and run_vllm and not _supports_fp8_scales():
         print("[baseline] vLLM FP8 skipped: k_scale/v_scale are unavailable")
         run_vllm = False
@@ -780,14 +805,14 @@ def _run_dtype(
         f"pages={page_mode}, seed={args.seed}, "
         f"warmup={args.warmup}ms, rep={args.rep}ms"
     )
-    print("Timing: eager execution with CUDA events")
+    print("Timing: eager execution with backend device events")
     if run_vllm:
         print(f"vLLM KV cache layout: {vllm_layout}; outputs checked before timing")
         print("Provider order: alternates by shape")
     else:
         print("vLLM baseline: unavailable; FlagAttn only")
 
-    headers = [("Shape [B,S,KVH,H]", 22), ("FlagAttn(ms)", 13)]
+    headers = [("Shape [B,Q,S,KVH,H]", 28), ("FlagAttn(ms)", 13)]
     if run_vllm:
         headers.extend(
             [("vLLM(ms)", 10), ("vLLM/ours", 10), ("Cosine", 9), ("Match", 6)]
@@ -814,7 +839,7 @@ def _run_dtype(
         decode_qlen=args.decode_qlen if args.decode else None,
     )
     for shape_index, shape in enumerate(_get_shapes(args)):
-        batch, seq_len, num_kv_heads, num_heads = shape
+        batch, query_len, seq_len, num_kv_heads, num_heads = shape
         if num_heads % num_kv_heads != 0:
             raise ValueError(
                 f"Invalid shape {shape}: num_heads must be divisible by " "num_kv_heads"
@@ -825,7 +850,7 @@ def _run_dtype(
                 "cannot exceed seq_len"
             )
 
-        generator = torch.Generator(device=device)
+        generator = torch.Generator(device="cpu" if device.type == "gcu" else device)
         generator.manual_seed(args.seed + shape_index + (100_000 if args.decode else 0))
         data = make_data(
             batch,
@@ -836,10 +861,11 @@ def _run_dtype(
             dtype_name,
             decode=args.decode,
             decode_qlen=args.decode_qlen,
+            query_len=query_len,
             randomize_pages=not use_identity_pages,
             generator=generator,
         )
-        vllm_data = _vllm_data(data, vllm_layout) if vllm_layout else None
+        vllm_data = _vllm_data(data, vllm_layout) if run_vllm and vllm_layout else None
         flag_attn_output = torch.empty_like(data.q)
         vllm_output = torch.empty_like(data.q) if run_vllm else None
 
@@ -903,10 +929,16 @@ def _run_dtype(
 
         vllm_ms = None
         accuracy = None
-        if run_vllm:
+        can_compare = run_vllm
+        if can_compare:
             flag_attn_run()
-            vllm_run()
-            test_backend.device_fn.synchronize()
+            try:
+                vllm_run()
+                test_backend.device_fn.synchronize()
+            except Exception as error:
+                print(f"[baseline] vLLM skipped: {error}")
+                run_vllm = can_compare = False
+        if can_compare:
             assert vllm_output is not None and vllm_layout is not None
             accuracy = _check_outputs(
                 flag_attn_output,
@@ -931,16 +963,16 @@ def _run_dtype(
 
         steps = _bench_steps(data, args.decode, args, shape) if args.per_step else {}
         row = [
-            (f"{batch}x{seq_len}x{num_kv_heads}x{num_heads}", 22),
+            (f"{batch}x{query_len}x{seq_len}x{num_kv_heads}x{num_heads}", 28),
             (f"{flag_attn_ms:.4f}", 13),
         ]
-        if run_vllm:
+        if vllm_layout is not None:
             row.extend(
                 [
-                    (f"{vllm_ms:.4f}", 10),
-                    (f"{vllm_ms / flag_attn_ms:.2f}x", 10),
-                    (f"{accuracy:.6f}", 9),
-                    ("pass", 6),
+                    (f"{vllm_ms:.4f}" if can_compare else "N/A", 10),
+                    (f"{vllm_ms / flag_attn_ms:.2f}x" if can_compare else "N/A", 10),
+                    (f"{accuracy:.6f}" if can_compare else "N/A", 9),
+                    ("pass" if can_compare else "N/A", 6),
                 ]
             )
         if args.per_step:
@@ -971,12 +1003,19 @@ def _run_dtype(
 
         # Release this shape before make_data allocates the next one. The
         # closures and provider tuple also hold references to GPU tensors.
-        if run_vllm:
+        if can_compare:
             del providers, timings
         del flag_attn_run, vllm_run, flag_attn_output, vllm_output, vllm_data, data, generator
         test_backend.device_fn.empty_cache()
 
     recorder.record()
+
+
+def _selected_modes(stage: str) -> tuple[bool, ...]:
+    if stage == "all": return (False, True)
+    if stage == "prefill": return (False,)
+    if stage == "decode": return (True,)
+    raise ValueError("stage must be all, prefill or decode")
 
 
 def run_benchmark(
@@ -995,28 +1034,27 @@ def run_benchmark(
         f"[device] {test_backend.get_device_name()} "
         f"capability={capability[0]}.{capability[1]}"
     )
-    if args.prefill_only:
-        modes = (False,)
-    elif args.decode_only:
-        modes = (True,)
-    else:
-        modes = (False, True)
-    if args.dtype in {"fp8", "both"} and not _supports_fp8():
-        print("[FP8] skipped: this GPU or PyTorch build does not support FP8")
-    if args.dtype == "fp8" and not _supports_fp8():
+    modes = _selected_modes(args.stage)
+    if args.dtype not in {"all", "both", "bf16", "fp8"}:
+        raise ValueError("MSA supports dtype all, bf16 or fp8")
+    if args.dtype in {"fp8", "both", "all"} and not test_backend.supports_msa_fp8():
+        print("[FP8] unavailable on this backend; benchmarking supported dtype only")
+    if args.dtype == "fp8" and not test_backend.supports_msa_fp8():
         return
     dtypes = (
         ("bf16", "fp8")
-        if args.dtype == "both" and _supports_fp8()
-        else ("bf16",) if args.dtype == "both" else (args.dtype,)
+        if args.dtype in {"all", "both"} and test_backend.supports_msa_fp8()
+        else ("bf16",) if args.dtype in {"all", "both"} else (args.dtype,)
     )
 
     if args.no_vllm:
-        print("[baseline] vLLM skipped (--no-vllm)")
+        print("[baseline] vLLM disabled (--no-vllm)")
+    elif runtime.device.vendor_name not in VLLM_BASELINE_VENDORS:
+        print(f"[baseline] no validated vLLM MSA baseline for {runtime.device.vendor_name}")
     elif VLLM_AVAILABLE:
         print("[baseline] vLLM enabled")
     else:
-        print(f"[baseline] vLLM skipped ({VLLM_IMPORT_ERROR})")
+        print(f"[baseline] vLLM unavailable ({VLLM_IMPORT_ERROR})")
 
     for mode_index, decode in enumerate(modes):
         args.decode = decode
@@ -1034,6 +1072,8 @@ def run_benchmark(
 def test_msa_benchmark(request, record_property) -> None:
     """Run the MSA benchmark through pytest using benchmark CLI timing options."""
     args = MSABenchmarkArgs(
+        dtype=request.config.getoption("--dtype"),
+        stage=request.config.getoption("--stage"),
         topk=int(request.config.getoption("--topk", default=16)),
         warmup=int(request.config.getoption("--warmup", default=DEFAULT_WARMUP)),
         rep=int(request.config.getoption("--iter", default=DEFAULT_REP)),

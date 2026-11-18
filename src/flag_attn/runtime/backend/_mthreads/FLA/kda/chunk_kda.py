@@ -37,7 +37,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.gated_delta_rule.compat import has_triton_tle
+from flag_attn.utils import has_triton_tle
 
 from ..index import prepare_chunk_indices, prepare_chunk_offsets
 

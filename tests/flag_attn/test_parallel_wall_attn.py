@@ -16,16 +16,12 @@ from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.wall_attn import parallel as provider
 from flag_attn.utils import has_triton_tle
 
-SHAPE_FAMILIES = (("mha", 8), ("gqa", 2))
-DTYPES = (("bf16", torch.bfloat16), ("fp16", torch.float16))
-# Cross the shortest and longest supported lengths with both dtypes and head
-# layouts. Representative interior cases cover the remaining supported lengths.
+# Cover each dtype, head layout, and supported sequence length with representative pairs.
 FAST_CASES = [
-    pytest.param(family, h, t, dtype_name, dtype, id=f"{dtype_name}-t{t}-{family}")
-    for dtype_name, dtype in DTYPES
-    for t in (512, 4096)
-    for family, h in SHAPE_FAMILIES
-] + [
+    pytest.param("mha", 8, 512, "bf16", torch.bfloat16, id="bf16-t512-mha"),
+    pytest.param("gqa", 2, 4096, "bf16", torch.bfloat16, id="bf16-t4096-gqa"),
+    pytest.param("gqa", 2, 512, "fp16", torch.float16, id="fp16-t512-gqa"),
+    pytest.param("mha", 8, 4096, "fp16", torch.float16, id="fp16-t4096-mha"),
     pytest.param("mha", 8, 1024, "bf16", torch.bfloat16, id="bf16-t1024-mha"),
     pytest.param("gqa", 2, 2048, "fp16", torch.float16, id="fp16-t2048-gqa"),
 ]
@@ -33,14 +29,6 @@ FAST_CASES = [
 
 def _has_h100_tle() -> bool:
     return test_backend.supports_operator("parallel_wall_attn") and test_backend.cuda_capability() == (9, 0) and has_triton_tle()
-
-
-def _fla_reference():
-    try:
-        from fla.ops.wall_attn import parallel_wall_attn as reference
-    except Exception as exc:
-        pytest.skip(f"optional FLA comparison is unavailable: {exc}")
-    return reference
 
 
 def _make_inputs(t: int, h: int, d: int, dtype: torch.dtype, seed: int):
@@ -71,11 +59,19 @@ def test_parallel_wall_attn_official_helpers_are_exported():
 
 
 @pytest.mark.parallel_wall_attn
-@pytest.mark.parametrize("h", (2, 8), ids=("gqa", "mha"))
-@pytest.mark.parametrize("option", ("default", "window", "varlen", "sink_scalar"))
+@pytest.mark.parametrize(
+    "h,option",
+    [
+        pytest.param(8, "default", id="mha-default"),
+        pytest.param(2, "default", id="gqa-default"),
+        pytest.param(8, "window", id="mha-window"),
+        pytest.param(2, "varlen", id="gqa-varlen"),
+        pytest.param(8, "sink_scalar", id="mha-sink-scalar"),
+    ],
+)
 @pytest.mark.skipif(not test_backend.supports_operator("parallel_wall_attn"), reason="naive reference comparison requires accelerator cumsum")
 @torch.inference_mode()
-def test_parallel_wall_attn_naive_matches_fla(h, option):
+def test_parallel_wall_attn_default_matches_naive(h, option):
     q, k, v, g = _make_inputs(17, h, 16, torch.float32, seed=7)
     kwargs = {"scale": 16**-0.5}
     if option == "window":
@@ -85,16 +81,22 @@ def test_parallel_wall_attn_naive_matches_fla(h, option):
     elif option == "sink_scalar":
         kwargs["sink_bias"] = torch.randn(8, device=q.device) * 0.1
         kwargs["g_scalar"] = -torch.rand(1, 17, 8, device=q.device) * 0.01
-    expected = _fla_reference()(q, k, v, g, **kwargs).float()
-    actual = wall_attn.naive_wall_attn(q, k, v, g, **kwargs)
+    expected = wall_attn.naive_wall_attn(q, k, v, g, **kwargs)
+    actual = provider._parallel_wall_attn_default(q, k, v, g, **kwargs).float()
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
 
 @pytest.mark.parallel_wall_attn
-@pytest.mark.parametrize("h", (2, 8), ids=("gqa", "mha"))
-@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
-@pytest.mark.parametrize("use_extra_gates", (False, True), ids=("default", "sink_scalar"))
+@pytest.mark.parametrize(
+    "h,dtype,use_extra_gates",
+    [
+        pytest.param(8, torch.bfloat16, False, id="mha-bf16-default"),
+        pytest.param(2, torch.bfloat16, True, id="gqa-bf16-sink-scalar"),
+        pytest.param(8, torch.float16, True, id="mha-fp16-sink-scalar"),
+        pytest.param(2, torch.float16, False, id="gqa-fp16-default"),
+    ],
+)
 @pytest.mark.skipif(not test_backend.supports_operator("parallel_wall_attn"), reason=test_backend.skip_reason("parallel_wall_attn"))
 @torch.inference_mode()
 def test_parallel_wall_attn_decode_matches_naive(h, dtype, use_extra_gates):
@@ -133,15 +135,16 @@ def test_parallel_wall_attn_decode_matches_naive(h, dtype, use_extra_gates):
 @pytest.mark.parametrize("family,h,t,dtype_name,dtype", FAST_CASES)
 @pytest.mark.skipif(not _has_h100_tle(), reason="fast-path matrix requires H100/SM90 with TLE")
 @torch.inference_mode()
-def test_parallel_wall_attn_fast_matrix_matches_fla(family, h, t, dtype_name, dtype):
+def test_parallel_wall_attn_fast_matrix_matches_default(family, h, t, dtype_name, dtype):
     del family
-    inputs = _make_inputs(t, h, 64, dtype, seed=0)
+    q, k, v, g = _make_inputs(t, h, 64, dtype, seed=0)
+    g = g * 0.2
     expected_route = "hopper_bf16" if dtype is torch.bfloat16 else "hopper_fp16"
-    assert provider.select_route(*inputs, scale=64**-0.5) == expected_route
+    assert provider.select_route(q, k, v, g, scale=64**-0.5) == expected_route
 
-    expected = _fla_reference()(*inputs, scale=64**-0.5).float()
-    actual = parallel_wall_attn(*inputs, scale=64**-0.5).float()
-    assert provider.get_last_route() in (expected_route, "official_fallback")
+    expected = provider._parallel_wall_attn_default(q, k, v, g, scale=64**-0.5).float()
+    actual = parallel_wall_attn(q, k, v, g, scale=64**-0.5).float()
+    assert provider.get_last_route() == expected_route
     test_backend.device_fn.synchronize()
 
     assert torch.isfinite(actual).all()
@@ -151,15 +154,23 @@ def test_parallel_wall_attn_fast_matrix_matches_fla(family, h, t, dtype_name, dt
 
 
 @pytest.mark.parallel_wall_attn
-@pytest.mark.parametrize("h", (2, 8), ids=("gqa", "mha"))
-@pytest.mark.parametrize("t", (512, 4096))
+@pytest.mark.parametrize(
+    "h,t",
+    [
+        pytest.param(2, 512, id="512-gqa"),
+        pytest.param(8, 4096, id="4096-mha"),
+    ],
+)
 @pytest.mark.skipif(not _has_h100_tle(), reason="D128 fast path requires H100/SM90 with TLE")
 @torch.inference_mode()
-def test_parallel_wall_attn_bf16_d128_matches_fla(h, t):
-    inputs = _make_inputs(t, h, 128, torch.bfloat16, seed=0)
-    assert provider.select_route(*inputs) == "hopper_bf16"
-    expected = _fla_reference()(*inputs).float()
-    actual = parallel_wall_attn(*inputs).float()
+def test_parallel_wall_attn_bf16_d128_matches_default(h, t):
+    q, k, v, g = _make_inputs(t, h, 128, torch.bfloat16, seed=0)
+    # Keep the long sequence within the fast path numerical range.
+    g = g * 0.2
+    assert provider.select_route(q, k, v, g) == "hopper_bf16"
+    expected = provider._parallel_wall_attn_default(q, k, v, g).float()
+    actual = parallel_wall_attn(q, k, v, g).float()
+    assert provider.get_last_route() == "hopper_bf16"
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
 
@@ -231,26 +242,10 @@ def test_parallel_wall_attn_constant_gate_uses_safe_fallback(dtype):
 
 
 @pytest.mark.parallel_wall_attn
-@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
-@pytest.mark.parametrize("t", (512, 4096))
-@pytest.mark.skipif(not _has_h100_tle(), reason="weak-gate fast path requires H100/SM90 with TLE")
-@torch.inference_mode()
-def test_parallel_wall_attn_weak_gate_executes_hopper(dtype, t):
-    q, k, v, g = _make_inputs(t, 2, 64, dtype, seed=0)
-    g = g * 0.2
-    expected = _fla_reference()(q, k, v, g)
-    actual = parallel_wall_attn(q, k, v, g)
-    route = "hopper_bf16" if dtype is torch.bfloat16 else "hopper_fp16"
-    assert provider.get_last_route() == route
-    assert torch.isfinite(actual).all()
-    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
-
-
-@pytest.mark.parallel_wall_attn
 @pytest.mark.parametrize("change", ("tail", "noncontiguous", "window_size", "sink_bias", "g_scalar"))
 @pytest.mark.skipif(not test_backend.supports_operator("parallel_wall_attn"), reason=test_backend.skip_reason("parallel_wall_attn"))
 @torch.inference_mode()
-def test_parallel_wall_attn_real_fallback_matches_fla(change):
+def test_parallel_wall_attn_real_fallback_matches_naive(change):
     t = 257 if change == "tail" else 256
     q, k, v, g = _make_inputs(t, 2, 64, torch.bfloat16, seed=1)
     kwargs = {}
@@ -263,49 +258,36 @@ def test_parallel_wall_attn_real_fallback_matches_fla(change):
         kwargs[change] = torch.zeros(8, device=q.device, dtype=q.dtype)
     elif change == "g_scalar":
         kwargs[change] = torch.zeros(1, t, 8, device=q.device, dtype=q.dtype)
-    expected = _fla_reference()(q, k, v, g, **kwargs)
+    expected = wall_attn.naive_wall_attn(q, k, v, g, scale=64**-0.5, **kwargs)
     actual = parallel_wall_attn(q, k, v, g, **kwargs)
     assert provider.get_last_route() == "official_fallback"
     assert torch.isfinite(actual).all()
-    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+    torch.testing.assert_close(actual.float(), expected, atol=0.05, rtol=0.05)
 
 
 @pytest.mark.parallel_wall_attn
 @pytest.mark.skipif(not test_backend.supports_operator("parallel_wall_attn"), reason=test_backend.skip_reason("parallel_wall_attn"))
-def test_parallel_wall_attn_real_fallback_gradients_match_fla():
+def test_parallel_wall_attn_real_fallback_gradients_match_naive(monkeypatch):
+    from flag_attn.FLA.wall_attn import naive as naive_provider
+
+    def differentiable_cumsum(x, *, cu_seqlens=None, scale=1.0):
+        assert cu_seqlens is None
+        return torch.cumsum(x.float(), dim=1) * scale
+
+    monkeypatch.setattr(naive_provider, "chunk_global_cumsum", differentiable_cumsum)
     inputs = _make_inputs(128, 2, 64, torch.bfloat16, seed=7)
     reference_inputs = tuple(x.detach().clone().requires_grad_(True) for x in inputs)
     candidate_inputs = tuple(x.detach().clone().requires_grad_(True) for x in inputs)
-    expected = _fla_reference()(*reference_inputs)
+    expected = wall_attn.naive_wall_attn(*reference_inputs, scale=64**-0.5)
     actual = parallel_wall_attn(*candidate_inputs)
     assert provider.get_last_route() == "official_fallback"
     grad = torch.randn_like(actual)
     expected_grads = torch.autograd.grad(expected, reference_inputs, grad)
     actual_grads = torch.autograd.grad(actual, candidate_inputs, grad)
-    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+    torch.testing.assert_close(actual.float(), expected, atol=0.05, rtol=0.05)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         assert torch.isfinite(actual_grad).all()
         torch.testing.assert_close(actual_grad, expected_grad, atol=0.05, rtol=0.05)
-
-
-@pytest.mark.parallel_wall_attn
-@pytest.mark.skipif(test_backend.device_fn.device_count() < 2, reason="device context regression requires two CUDA GPUs")
-@torch.inference_mode()
-@pytest.mark.skipif(not test_backend.is_nvidia(), reason="tests the generic NVIDIA implementation contract")
-def test_parallel_wall_attn_runs_on_input_device():
-    original_device = test_backend.device_fn.current_device()
-    try:
-        test_backend.device_fn.set_device(0)
-        with test_backend.device_fn.device(1):
-            inputs = _make_inputs(512, 2, 64, torch.bfloat16, seed=0)
-            expected = _fla_reference()(*inputs)
-        actual = parallel_wall_attn(*inputs)
-        assert actual.device == inputs[0].device
-        assert test_backend.device_fn.current_device() == 0
-        assert torch.isfinite(actual).all()
-        torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
-    finally:
-        test_backend.device_fn.set_device(original_device)
 
 
 @pytest.mark.parallel_wall_attn

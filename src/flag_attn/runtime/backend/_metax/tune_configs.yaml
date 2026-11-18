@@ -1,7 +1,17 @@
-# MetaX C550 GDN2 measured-winner candidate unions, not per-shape optimality claims.
-# Full test and benchmark coverage is unchanged.
-# FLAG_ATTN_GDN2_FULL_TUNING=1 restores the original candidate search.
-# Evidence report SHA256: 7c1ce279ca4990cfeba7250b634fda66aa382f99e1851c24e5f4cd9468f659ce
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 _chunk_gdn2_fwd_intra_infer_kernel:
 - META:
     BK: 32
@@ -157,3 +167,7 @@ gdn2_native_output_tle:
   num_stages: 4
   num_ctas: 1
   maxnreg: null
+
+# State update used by the shared GDN2 implementation.
+chunk_gated_delta_rule_fwd_kernel_h_blockdim64:
+  - {META: {BV: 32}, num_warps: 4, num_stages: 1}
