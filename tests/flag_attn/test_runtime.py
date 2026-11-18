@@ -21,7 +21,7 @@ import torch
 import triton
 
 import flag_attn
-from flag_attn.runtime.backend import device_finder
+from flag_attn.runtime.backend import arch_finder, device_finder, op_registry
 
 
 @pytest.fixture
@@ -151,3 +151,76 @@ def test_missing_triton_driver_does_not_break_metadata(automatic_vendor, monkeyp
     )
     monkeypatch.setattr(triton.runtime, "driver", driver)
     assert device_finder.detect_vendor() == "nvidia"
+
+
+@pytest.mark.parametrize(
+    "capability, arch",
+    [
+        ((9, 0), "hopper"),
+        ((10, 0), "blackwell"),
+        ((12, 0), "blackwell"),
+        ((8, 0), None),
+        ((7, 5), None),
+    ],
+)
+def test_nvidia_arch_detection(monkeypatch, capability, arch):
+    monkeypatch.delenv("FLAG_ATTN_ARCH", raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
+    arch_finder.detect_arch.cache_clear()
+    assert arch_finder.detect_arch("nvidia") == arch
+
+
+def test_non_nvidia_vendors_declare_no_arch(monkeypatch):
+    monkeypatch.delenv("FLAG_ATTN_ARCH", raising=False)
+    arch_finder.detect_arch.cache_clear()
+    for vendor in ("metax", "hygon", "enflame", "ascend", "mthreads", "cpu"):
+        assert arch_finder.detect_arch(vendor) is None
+
+
+def test_arch_override(monkeypatch):
+    monkeypatch.setenv("FLAG_ATTN_ARCH", "hopper")
+    arch_finder.detect_arch.cache_clear()
+    # The override applies without a matching GPU present, and to any vendor.
+    assert arch_finder.detect_arch("nvidia") == "hopper"
+    assert arch_finder.detect_arch("metax") == "hopper"
+
+
+def test_arch_detection_survives_a_missing_device(monkeypatch):
+    monkeypatch.delenv("FLAG_ATTN_ARCH", raising=False)
+
+    def unavailable(*_):
+        raise RuntimeError("no CUDA device")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", unavailable)
+    arch_finder.detect_arch.cache_clear()
+    assert arch_finder.detect_arch("nvidia") is None
+
+
+def test_arch_exports_overlay_vendor_exports():
+    """An arch table wins for the names it declares and changes nothing else."""
+    vendor_exports = op_registry._exports_of("flag_attn.runtime.backend._metax")
+    assert vendor_exports, "expected the MetaX backend to declare operators"
+    # No MetaX arch subpackage exists, so an arch argument must be a no-op.
+    assert op_registry._backend_exports("metax", None) == vendor_exports
+    assert op_registry._backend_exports("metax", "blackwell") == vendor_exports
+
+
+def test_missing_arch_package_keeps_vendor_selection():
+    exports = op_registry._backend_exports("nvidia", "does_not_exist")
+    assert exports == op_registry._backend_exports("nvidia", None)
+
+
+def test_invalid_arch_name_is_rejected():
+    with pytest.raises(ValueError, match="Invalid arch name"):
+        op_registry._backend_exports("nvidia", "not an identifier")
+
+
+def test_generic_operator_resolves_without_an_arch_override():
+    """chunk_kda must resolve to the generic pure-Triton module off Hopper."""
+    resolved = op_registry.resolve_operator(
+        "chunk_kda_fwd_infer",
+        "flag_attn.FLA.chunk_kda",
+        vendor="nvidia",
+        arch=None,
+    )
+    assert resolved.__module__ == "flag_attn.FLA.chunk_kda"

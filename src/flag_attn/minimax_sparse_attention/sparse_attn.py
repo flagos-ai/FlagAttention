@@ -2893,7 +2893,7 @@ def _kv_block_attn_tle_kernel(
 # multi-slot SMEM ring via TMA while the MMA/softmax warpgroup (consumer)
 # runs QK WGMMA -> single-block softmax -> PV WGMMA and writes the partial.
 # Load and compute overlap across work-tiles; the ``empty``/``*_full`` barrier
-# pair is the producer/consumer handshake (cf. FLA/wall_attn/parallel_fwd.py).
+# pair is the producer/consumer handshake (cf. runtime/backend/_nvidia/hopper/wall_attn_fwd.py).
 #
 # Each work-tile is an independent (page, kv_head, query-chunk) unit, so unlike
 # a single query's causal sweep the consumer keeps NO running softmax across

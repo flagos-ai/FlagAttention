@@ -11,3 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""NVIDIA attention backend.
+
+The generic implementations under ``src/flag_attn`` are written against NVIDIA
+and use plain Triton only, so this package declares no vendor-wide overrides.
+What is specific to one GPU generation lives in a subpackage instead:
+
+- ``hopper``: SM90 kernels using Triton Language Extensions (warp
+  specialization, wgmma, TMA descriptors).
+- ``blackwell``: SM100/SM120 kernels.
+
+``op_registry`` prefers the running generation's exports over this package's,
+and this package's over the generic implementation, so a kernel written for one
+generation never runs on another. ``tune_configs.yaml`` holds the autotuning
+configurations shared by every NVIDIA generation.
+"""
+

@@ -17,6 +17,16 @@ from flag_attn.FLA.utils import is_tma_supported
 from flag_attn.FLA.utils import exp, make_tensor_descriptor
 
 
+def _set_descriptor_allocator(device: torch.device) -> None:
+    """Give Triton a scratch allocator for this kernel's tensor descriptors."""
+
+    def alloc_fn(size: int, align: int, stream):
+        del align, stream
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    triton.set_allocator(alloc_fn)
+
+
 FLA_TRIL_PRECISION = os.environ.get("FLAG_ATTN_TRIL_PRECISION", "ieee")
 ALLOWED_TRIL_PRECISIONS = {"ieee", "tf32", "tf32x3"}
 if FLA_TRIL_PRECISION not in ALLOWED_TRIL_PRECISIONS:
@@ -502,6 +512,12 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         # Varlen kernels derive the sequence from chunk_indices. The batch id
         # from i_bh is unused there, so H programs are sufficient for B > 1 too.
         return (NT, H if cu_seqlens is not None else B * H)
+
+    # The TMA path builds tensor descriptors, which Triton allocates from a
+    # scratch buffer supplied by the process-wide allocator. Callers that reach
+    # this launcher directly need not have set one, so install it here.
+    if is_tma_supported:
+        _set_descriptor_allocator(g.device)
 
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel[grid](
         g_in=g,
