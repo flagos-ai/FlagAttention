@@ -19,6 +19,7 @@ _OPERATOR_EXPORTS = {
     "parallax_decode": (".parallax", "parallax_decode"),
     "parallax_attn_with_kvcache": (".parallax", "parallax_attn_with_kvcache"),
     "forward": (".attn_qk_int8_per_block", "forward"),
+    "fused_attnres": (".FLA.attnres", "fused_attnres"),
     "per_block_int8": (".ops", "quant_per_block_int8"),
     "quant_per_block_int8": (".ops", "quant_per_block_int8"),
     "sage_attention": (".attn_qk_int8_per_block", "forward"),
