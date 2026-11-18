@@ -5,27 +5,12 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 
 from .index import prepare_chunk_offsets
 from flag_attn.runtime import autotune_cache_kwargs, get_tuned_config
-from .utils import check_shared_mem
-
-# The Hygon BW runtime does not expose shared-memory properties through
-# PyTorch, so check_shared_mem() conservatively returns False there. BW has
-# sufficient SRAM for the larger state tiles; using them halves the number of
-# K/V tile programs in the recurrent state scan.
-_is_hygon_bw = False
-if torch.cuda.is_available():
-    try:
-        _is_hygon_bw = torch.cuda.get_device_name(torch.cuda.current_device()) == "BW"
-    except (AssertionError, RuntimeError):
-        pass
-BKV_LIST = [32, 64] if check_shared_mem() or _is_hygon_bw else [16, 32]
 
 
 @triton.jit
@@ -693,7 +678,6 @@ def chunk_fwd_h(
         and not states_in_fp32
         and cu_seqlens is None
         and V >= 256
-        and os.environ.get("FLAG_ATTN_GLA_H_V2", "1") != "0"
     )
 
     if use_v2:
@@ -776,11 +760,8 @@ def chunk_fwd_h_fused_cumsum(
     # Reuse the gate-transformed K tile across the remaining V groups only
     # when there are at least four groups.  On gfx936 this avoids repeated
     # K/gk traffic and gate scaling for wide states; narrower states do not
-    # amortize the extra Kbar write/read.  Keep an opt-out for A/B diagnosis.
-    use_pretransformed_k = (
-        os.environ.get("FLAG_ATTN_GLA_H_PRETRANSFORMED_K", "1") == "1"
-        and n_groups >= 4
-    )
+    # amortize the extra Kbar write/read.
+    use_pretransformed_k = n_groups >= 4
     kbar = torch.empty_like(k) if use_pretransformed_k else k
     chunk_fwd_kernel_h_v2_cumsum[(triton.cdiv(K, BK), B * H)](
         k=k,

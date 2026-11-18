@@ -14,8 +14,8 @@
 
 """Pytest benchmark for local Inkling FA4 relative attention.
 
-Uses the same triton.testing.perf_report / do_bench convention as the other
-FlagAttention benchmarks. Providers share inputs, split counts and timing.
+Uses the local Benchmark template and device-aware do_bench timing.
+Providers share inputs, split counts and timing; reports need no plotting packages.
 CuTe is an optional comparison baseline; no vLLM installation is required.
 """
 
@@ -34,9 +34,16 @@ from functools import cache, partial
 from pathlib import Path
 from typing import Any, Callable
 
+import pandas as pd
 import torch
 import torch.nn.functional as F
-import triton.testing as triton_testing
+
+try:
+    from benchmark.base import Benchmark
+    from benchmark.recording import BenchmarkRecorder
+except ModuleNotFoundError:
+    from base import Benchmark
+    from recording import BenchmarkRecorder
 
 from flag_attn.testing import backend as test_backend
 from flag_attn.inkling_fa4 import get_backend, tle_available
@@ -296,63 +303,108 @@ def resolve_backends(names: list[str], flash_root: str | None) -> dict[str, Back
 
 
 
-def run_benchmark(args) -> None:
-    if not test_backend.supports_operator("inkling_fa4_rel_attention"):
-        pytest.skip("this benchmark requires an available accelerator")
-    if test_backend.is_nvidia() and test_backend.cuda_capability() < (8, 0):
-        pytest.skip("the BF16 benchmark requires SM80 or newer")
+class InklingFA4Benchmark(Benchmark):
+    """Adapt the local template to multiple providers and an optional baseline."""
 
-    backends = resolve_backends(args.providers, args.flash_attn_root)
-    if not backends:
-        pytest.skip("none of the requested providers is available")
-    cases = [c for c in build_cases() if args.cases is None or c.name in args.cases]
-    # Reuse the exact same tensors across providers and split configurations.
-    prepared = {
-        c.name: prepare_case(c, rel_mode=args.rel, seed=index, backends=tuple(backends))
-        for index, c in enumerate(cases)
-    }
-    configs = [
-        triton_testing.Benchmark(
-            x_names=["case"],
-            x_vals=[c.name for c in cases],
-            line_arg="provider",
-            line_vals=list(backends),
-            line_names=list(backends),
-            styles=[("red", "-"), ("blue", "-"), ("green", "-")][: len(backends)],
-            ylabel="ms",
-            plot_name=f"inkling_fa4-bf16-splits-{splits}-rel-{args.rel}",
-            args={"num_splits": splits},
+    def __init__(self, args):
+        super().__init__(
+            op_name="inkling_fa4_rel_attention", torch_op=None, dtypes=[DTYPE],
         )
-        for splits in dict.fromkeys(args.num_splits)
-    ]
+        self.args = args
+        self.cases = [
+            case for case in build_cases()
+            if args.cases is None or case.name in args.cases
+        ]
+        self.backends: dict[str, Backend] = {}
 
-    @triton_testing.perf_report(configs)
-    def bench_relative_attention(case: str, provider: str, num_splits: int) -> float:
-        data = prepared[case]
-        data.num_splits = num_splits
-        run = make_runner(backends[provider], data)
-        # Compile and initialize the provider before entering timed measurement.
+    def get_input_iter(self, dtype):
+        # Prepare once, outside timing, and reuse across providers and splits.
+        if dtype != DTYPE:
+            raise ValueError("Inkling FA4 benchmarks require bfloat16 inputs")
+        for index, case in enumerate(self.cases):
+            yield (prepare_case(
+                case, rel_mode=self.args.rel, seed=index,
+                backends=tuple(self.backends),
+            ),)
+
+    def get_latency(self, op, *args, **kwargs) -> float:
+        # Compile and initialize before entering the original timed measurement.
+        run = partial(op, *args, **kwargs) if args or kwargs else op
         for _ in range(3):
             run()
         test_backend.device_fn.synchronize()
-        return float(
-            test_backend.do_bench(
-                run,
-                warmup=args.warmup,
-                rep=args.rep,
-                return_mode="median",
-            )
+        return float(test_backend.do_bench(
+            run, warmup=self.args.warmup, rep=self.args.rep,
+            return_mode="median",
+        ))
+
+    def run(self, record_property=None) -> None:
+        if not test_backend.supports_operator(self.op_name):
+            pytest.skip("this benchmark requires an available accelerator")
+        if test_backend.is_nvidia() and test_backend.cuda_capability() < (8, 0):
+            pytest.skip("the BF16 benchmark requires SM80 or newer")
+
+        self.backends = resolve_backends(self.args.providers, self.args.flash_attn_root)
+        if not self.backends:
+            pytest.skip("none of the requested providers is available")
+        self.torch_op = (
+            self.backends["official_cute"].fn
+            if "official_cute" in self.backends else None
         )
+        self.set_gems(self.backends["triton"].fn if "triton" in self.backends else None)
+        self.init_user_config()
+        prepared = {
+            data.config.name: data
+            for (data,) in self.get_input_iter(DTYPE)
+        }
 
-    print(f"GPU: {test_backend.get_device_name()} | dtype: bf16 | latency: median ms")
-    print(f"warmup={args.warmup} ms | rep={args.rep} ms | relative logits={args.rel}")
-    with torch.inference_mode():
-        bench_relative_attention.run(print_data=True, show_plots=False, save_path="")
+        print(f"GPU: {test_backend.get_device_name()} | dtype: bf16 | latency: median ms")
+        print(
+            f"warmup={self.args.warmup} ms | rep={self.args.rep} ms "
+            f"| relative logits={self.args.rel}"
+        )
+        with torch.inference_mode():
+            for splits in dict.fromkeys(self.args.num_splits):
+                recorder = BenchmarkRecorder(
+                    record_property, op_name=self.op_name, dtype=str(DTYPE),
+                    baseline="official_cute" if self.torch_op is not None else None,
+                )
+                rows = []
+                for case in self.cases:
+                    data = prepared[case.name]
+                    data.num_splits = splits
+                    latencies = {
+                        name: self.get_latency(make_runner(backend, data))
+                        for name, backend in self.backends.items()
+                    }
+                    rows.append({
+                        "case": case.name,
+                        **{f"{name} (ms)": value for name, value in latencies.items()},
+                    })
+                    if self.gems_op is not None:
+                        recorder.add(
+                            shape_detail={
+                                "case": case.name, "num_splits": splits,
+                                "rel": self.args.rel,
+                            },
+                            latency=latencies["triton"],
+                            latency_base=latencies.get("official_cute"),
+                        )
+                # Match perf_report's table output without its plotting imports.
+                print(f"inkling_fa4-bf16-splits-{splits}-rel-{self.args.rel}:")
+                print(pd.DataFrame(
+                    rows, columns=["case", *(f"{name} (ms)" for name in self.backends)],
+                ).to_string(), flush=True)
+                recorder.record()
 
 
-def test_inkling_fa4_rel_attention_benchmark():
+def run_benchmark(args, record_property=None) -> None:
+    InklingFA4Benchmark(args).run(record_property)
+
+
+def test_inkling_fa4_rel_attention_benchmark(record_property):
     args = argparse.Namespace(
         cases=None, providers=list(BACKEND_NAMES), num_splits=[1],
         warmup=25, rep=100, rel="real", flash_attn_root=os.getenv("FLASH_ATTN_ROOT"),
     )
-    run_benchmark(args)
+    run_benchmark(args, record_property)
