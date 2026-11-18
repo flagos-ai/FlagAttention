@@ -98,7 +98,7 @@ FlagAttention 是一个使用 [Triton](https://github.com/triton-lang/triton) �
 | `_hygon` | `cuda` | MiniMax M3、SageAttention、NSA、GLA、KDA、AttnRes，以及私有的 `mla` 算子族 |
 | `_mthreads` | `musa` | MiniMax M3、SageAttention、NSA、GLA、KDA、GDN2、MoBA |
 | `_enflame` | `gcu` | MiniMax M3、SageAttention、NSA、GLA、KDA、GDN2、AttnRes、Parallax |
-| `_ascend` | `npu` | Gated Delta Rule、Parallax、GDN2、SageAttention |
+| `_ascend` | `npu` | Gated Delta Rule、Parallax、GDN2、SageAttention、Forgetting Attention |
 | `_thead` | `cuda` | MiniMax M3、Wall Attention |
 | `_iluvatar` | `cuda` | 尚未声明覆盖 |
 
@@ -319,7 +319,7 @@ GLA、GDN2 和 KDA 使用 sequence-first `[B,T,H,D]`。Gated Delta Rule 默认 `
 - [`hy3_attention`](./src/flag_attn/hpc_ops_attention) 提供 FP8 paged 块稀疏 prefill（`stage="prefill"`）以及由 `variant=` 选择的六种 decode 实现：`bf16_static`、`bf16_dynamic`、`fp8_qk_static`、`fp8_qk_dynamic`、`fp8_kv_static`、`fp8_kv_dynamic`。其中 `qk` 表示逐 token 量化 Q/K 并逐 head 量化 V，`kv` 表示逐 token 量化 Q 并逐 tensor 量化 K/V；`static` 与 `dynamic` 选择调度策略。Decode 会原样转发 `(inputs, workspace)`，因此需要先用对应实现模块准备 workspace。该算子族要求 PyTorch 2.7.0。
 - [`inkling_fa4_rel_attention`](./src/flag_attn/inkling_fa4) 是仅用于推理的 paged varlen 注意力，并叠加相对位置 logits，参数与同名 vLLM 算子一致。Cache 使用 `[num_blocks, block_size, num_kv_heads, head_dim]` 布局。`backend=` 接受 `"auto"`（默认）、`"triton"` 或 `"tle"`，环境变量 `INKLING_FA4_BACKEND` 可做同样选择；auto 优先使用 TLE，当 TLE 不可用或布局不支持时回落到 Triton。
 - [`diffkv_attention`](./src/flag_attn/diffkv_attention/api.py) 是 K/V head dimension 不对称的 paged decode：`query: [B,Hq,Dqk]`、`key_cache: [NB,BS,Hkv,Dqk]`、`value_cache: [NB,BS,Hkv,Dv]`，返回 `[B,Hq,Dv]`。`window_size=-1` 表示完整上下文；`path` 选择 `"2d"` 或 `"3d"` launch，`num_segments` 控制 3D 路径的 split-KV；`backend` 接受 `"auto"`、`"tle"` 或 `"triton"`。
-- [`parallel_forgetting_attn`](./src/flag_attn/forgetting_attention/parallel.py) 通过 `log_fgate` 引入逐 token 的对数遗忘门，另有 `head_first=`、`seq_start=`、`sm_scale=` 和 `adaptive_threshold=`。在 SM90 且 TLE 兼容时使用 TLE kernel，否则由普通 Triton kernel 处理 16、32、60、64、100、128 这些 head dimension，通过零填充实现且不改变 attention 缩放与剪枝行为。
+- `parallel_forgetting_attn` 通过 `log_fgate` 引入逐 token 的对数遗忘门，支持 `head_first=`、`seq_start=`、`sm_scale=` 和 `adaptive_threshold=`。[Ascend 910B 后端](./src/flag_attn/runtime/backend/_ascend/forgetting_attention.py) 支持 FP16 和 BF16 前向计算，head dimension 范围为 16 至 128。ACP 要求对数遗忘门与阈值均非正。[通用实现](./src/flag_attn/forgetting_attention/parallel.py) 在 SM90 且 TLE 兼容时使用 TLE kernel，其他情况下由普通 Triton kernel 处理 16、32、60、64、100、128 这六种 head dimension。
 - [`fused_attnres`](./src/flag_attn/FLA/attnres/fused.py) 聚合多个残差源：每个源先做 RMS 归一化用于与 `query` 打分，再由源维度上的 softmax 混合原始残差，`output_rms_weight` 可选地融合下一子层所需的 RMSNorm。该算子仅用于推理、不提供 autograd 公式，针对 Kimi K3 形状优化，支持最多 16 个源和最大 8192 的 hidden size。
 
 这些 alpha API 针对特定模型布局进行了优化。集成前请阅读对应 docstring 和测试，其参数与后端约束仍可能变化。

@@ -40,7 +40,7 @@ _OPERATOR_EXPORTS = {
     "parallel_nsa": ("flag_attn.parallel_nsa", "parallel_nsa"),
     "parallel_nsa_compression": ("flag_attn.parallel_nsa.parallel_nsa_compression", "parallel_nsa_compression"),
     "parallel_moba": ("flag_attn.FLA.moba.parallel", "parallel_moba"),
-    "parallel_forgetting_attn": ("flag_attn.forgetting_attention", "parallel_forgetting_attn"),
+    "parallel_forgetting_attn": ("flag_attn.forgetting_attention.parallel", "parallel_forgetting_attn"),
     "log_linear_attn": ("flag_attn.FLA.log_linear_attn.chunk_tle", "log_linear_attn"),
     "diffkv_attention": ("flag_attn.diffkv_attention.api", "diffkv_attention"),
     "hy3_attention": ("flag_attn.hpc_ops_attention", "hy3_attention"),
