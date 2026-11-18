@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_attn.runtime import get_tuned_config
 from .routing import _copy_triton, cdiv
 
 
@@ -368,33 +369,48 @@ def _attention_launch_config(
         # A 128x128 tile with BLOCK_D=256 exceeds Hopper's shared-memory budget.
         return 64, 64, block_d, 8, 2
 
-    # Conservative fallback for every non-SM90 CUDA architecture. In
-    # particular, the 32x32 D=256 tile remains below the tighter shared-memory
-    # limits found on some GPUs, without maintaining per-model tables.
-    if head_dim <= 128:
-        return 64, 64, block_d, 4, 2
-    return 32, 32, block_d, 4, 1
+    # Hygon launch parameters are curated in the backend tune_configs.yaml.
+    op_name = "_moba_attention" if head_dim <= 128 else "_moba_attention_d256"
+    fallback = (
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2)
+        if head_dim <= 128
+        else triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1)
+    )
+    config = (get_tuned_config(op_name) or [fallback])[0]
+    return (
+        config.kwargs.get("BLOCK_M", fallback.kwargs["BLOCK_M"]),
+        config.kwargs.get("BLOCK_N", fallback.kwargs["BLOCK_N"]),
+        block_d,
+        config.num_warps or 4,
+        config.num_stages or fallback.num_stages,
+    )
 
 
 def _routed_attention_launch_config(
     head_dim: int,
     device: torch.device,
 ) -> tuple[int, int, int, int, int]:
-    """Use a shorter software pipeline for Hygon routed attention.
-
-    The routed path has irregular descriptor occupancy; keeping two stages
-    alive increases register lifetime without providing a reusable K/V tile.
-    NVIDIA's validated launch policy remains unchanged.
-    """
-    block_m, block_n, block_d, num_warps, num_stages = _attention_launch_config(
-        head_dim, device
-    )
+    """Use curated Hygon launch settings; retain NVIDIA's validated policy."""
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    if torch.cuda.get_device_capability(device_index) != (9, 0):
-        num_stages = 1
-    return block_m, block_n, block_d, num_warps, num_stages
+    if torch.cuda.get_device_capability(device_index) == (9, 0):
+        return _attention_launch_config(head_dim, device)
+    op_name = "_moba_routed_attention" if head_dim <= 128 else "_moba_routed_attention_d256"
+    fallback = (
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1)
+        if head_dim <= 128
+        else triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1)
+    )
+    config = (get_tuned_config(op_name) or [fallback])[0]
+    block_d = max(16, triton.next_power_of_2(head_dim))
+    return (
+        config.kwargs.get("BLOCK_M", fallback.kwargs["BLOCK_M"]),
+        config.kwargs.get("BLOCK_N", fallback.kwargs["BLOCK_N"]),
+        block_d,
+        config.num_warps or 4,
+        config.num_stages or 1,
+    )
 
 
 def _triton_varlen_forward(
@@ -951,11 +967,8 @@ def _routed_sparse_attention_merge_inplace_triton(
 
 
 @triton.autotune(
-    configs=[
-        # Hygon HCU requires the MFMA-compatible four-warp launch family for
-        # this reduction/merge kernel.  The one- and two-warp candidates that
-        # are useful on NVIDIA are rejected by the HCU launch path with
-        # ``invalid argument`` during autotune.
+    configs=get_tuned_config("_moba_fused_merge")
+    or [
         triton.Config({"BLOCK_D": 64}, num_warps=4),
         triton.Config({"BLOCK_D": 128}, num_warps=4),
     ],

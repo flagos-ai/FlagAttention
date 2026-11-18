@@ -20,6 +20,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_attn.runtime import get_tuned_config
+
 _PREFIX_SCAN_BLOCK = 1024
 
 
@@ -266,37 +268,14 @@ def _expand_kv_heads_triton(k, v, num_q_heads):
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_ROWS": 4, "BYPASS_L1": False},
-            num_warps=4,
-            num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_ROWS": 4, "BYPASS_L1": True},
-            num_warps=4,
-            num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_ROWS": 8, "BYPASS_L1": False},
-            num_warps=8,
-            num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_ROWS": 8, "BYPASS_L1": True},
-            num_warps=8,
-            num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_ROWS": 16, "BYPASS_L1": False},
-            num_warps=8,
-            num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_ROWS": 16, "BYPASS_L1": True},
-            num_warps=8,
-            num_stages=1,
-        ),
+    configs=get_tuned_config("_moba_gather_q")
+    or [
+        triton.Config({"BLOCK_ROWS": 4, "BYPASS_L1": False}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_ROWS": 4, "BYPASS_L1": True}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_ROWS": 8, "BYPASS_L1": False}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_ROWS": 8, "BYPASS_L1": True}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_ROWS": 16, "BYPASS_L1": False}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_ROWS": 16, "BYPASS_L1": True}, num_warps=8, num_stages=1),
     ],
     key=["head_dim"],
 )
