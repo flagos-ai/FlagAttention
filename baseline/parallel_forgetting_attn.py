@@ -36,7 +36,7 @@ CASES = (
 
 def native():
     try:
-        from flag_attn.forgetting_attention.naive import forgetting_attention
+        from flag_attn.FLA.forgetting_attn.naive import forgetting_attention
     except (ImportError, OSError):
         return None
 

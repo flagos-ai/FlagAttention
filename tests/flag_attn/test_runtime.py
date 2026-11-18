@@ -219,8 +219,8 @@ def test_generic_operator_resolves_without_an_arch_override():
     """chunk_kda must resolve to the generic pure-Triton module off Hopper."""
     resolved = op_registry.resolve_operator(
         "chunk_kda_fwd_infer",
-        "flag_attn.FLA.chunk_kda",
+        "flag_attn.FLA.kda.chunk_kda",
         vendor="nvidia",
         arch=None,
     )
-    assert resolved.__module__ == "flag_attn.FLA.chunk_kda"
+    assert resolved.__module__ == "flag_attn.FLA.kda.chunk_kda"

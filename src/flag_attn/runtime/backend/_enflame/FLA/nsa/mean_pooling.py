@@ -12,8 +12,8 @@ import triton.language as tl
 from ..index import (
     prepare_chunk_indices_enflame as prepare_chunk_indices,
 )
-from flag_attn.parallel_nsa.triton_ops_helper import autotune_cache_kwargs
-from flag_attn.parallel_nsa.utils import input_guard
+from flag_attn.FLA.nsa.triton_ops_helper import autotune_cache_kwargs
+from flag_attn.FLA.nsa.utils import input_guard
 
 
 MAX_GRID_Y = 255

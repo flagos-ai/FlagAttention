@@ -8,8 +8,8 @@ import torch
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gdn2, runtime
-from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
-from flag_attn.gdn2.native.output import chunk_gla_fwd_kernel_o
+from flag_attn.FLA.gdn2.native.chunk_fwd import chunk_gdn2_fwd
+from flag_attn.FLA.gdn2.native.output import chunk_gla_fwd_kernel_o
 
 ASSERT_RATIO = 0.01
 
@@ -43,7 +43,7 @@ pytestmark = [
 
 
 def _set_public_gdn2_native_for_call(force_native: bool):
-    module = importlib.import_module("flag_attn.gdn2.chunk")
+    module = importlib.import_module("flag_attn.FLA.gdn2.chunk")
     old = module.HAS_TLE_GDN2
     if force_native:
         module.HAS_TLE_GDN2 = False
@@ -165,7 +165,7 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
 @pytest.mark.parametrize(
     "impl",
     [pytest.param("tle", id="tle"), pytest.param("native", id="native")]
-    if importlib.import_module("flag_attn.gdn2.chunk").HAS_TLE_GDN2
+    if importlib.import_module("flag_attn.FLA.gdn2.chunk").HAS_TLE_GDN2
     else [pytest.param("backend", id="backend")],
 )
 @pytest.mark.parametrize(
@@ -210,10 +210,10 @@ def test_chunk_gdn2_matches_native_triton(impl, dtype, shape):
     _assert_close("ht", actual_final, expected_final)
 
 
-if importlib.import_module("flag_attn.gdn2.chunk").HAS_TLE_GDN2:
+if importlib.import_module("flag_attn.FLA.gdn2.chunk").HAS_TLE_GDN2:
     @pytest.mark.chunk_gdn2
     def test_k1_tle_resource_controls_are_enabled():
-        module = importlib.import_module("flag_attn.gdn2.chunk")
+        module = importlib.import_module("flag_attn.FLA.gdn2.chunk")
         assert module.K1_TLE_MAXNREG_CANDIDATES == (64, 72, 96)
         assert module.K1_TLE_SMEM_REUSE_MIN_K == 256
         source = Path(module.__file__).read_text(encoding="utf-8")

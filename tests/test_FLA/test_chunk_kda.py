@@ -20,8 +20,6 @@ import torch
 import torch.nn.functional as F
 
 from flag_attn.testing import backend as test_backend
-if not test_backend.has_specialization("chunk_kda_fwd_infer"):
-    pytest.importorskip("triton.experimental.tle.language", reason="generic chunk_kda requires Triton TLE >= 3.6")
 
 from flag_attn import chunk_kda
 

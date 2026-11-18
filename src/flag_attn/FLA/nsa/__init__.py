@@ -11,7 +11,7 @@ from flag_attn.runtime.backend import resolve_operator
 _OPERATOR_EXPORTS = {
     "parallel_nsa_compression": (
         "parallel_nsa_compression",
-        "flag_attn.parallel_nsa.parallel_nsa_compression",
+        "flag_attn.FLA.nsa.parallel_nsa_compression",
         "parallel_nsa_compression",
     )
 }
@@ -34,7 +34,7 @@ def parallel_nsa(*args, mode: Literal["full", "compression"] = "full", **kwargs)
     when the backend does not export it. Arguments and returns are unchanged.
     """
     if mode == "full":
-        implementation = resolve_operator("parallel_nsa", "flag_attn.parallel_nsa.parallel_nsa")
+        implementation = resolve_operator("parallel_nsa", "flag_attn.FLA.nsa.parallel_nsa")
     elif mode == "compression":
         implementation = __getattr__("parallel_nsa_compression")
     else:

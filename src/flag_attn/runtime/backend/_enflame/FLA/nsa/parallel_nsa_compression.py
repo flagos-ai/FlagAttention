@@ -11,12 +11,12 @@ import triton.language as tl
 from ..index import (
     prepare_chunk_offsets_enflame as prepare_chunk_offsets,
 )
-from flag_attn.parallel_nsa.triton_ops_helper import (
+from flag_attn.FLA.nsa.triton_ops_helper import (
     autotune_cache_kwargs,
     exp,
     log,
 )
-from flag_attn.parallel_nsa.utils import (
+from flag_attn.FLA.nsa.utils import (
     check_shared_mem,
 )
 
@@ -652,7 +652,7 @@ def install_enflame_compression_compat():
     )
 
     module = importlib.import_module(
-        "flag_attn.parallel_nsa."
+        "flag_attn.FLA.nsa."
         "parallel_nsa_compression"
     )
 

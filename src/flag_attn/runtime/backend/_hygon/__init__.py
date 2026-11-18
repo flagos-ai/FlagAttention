@@ -35,22 +35,22 @@ error = _Error()
 _OPERATOR_EXPORTS = {
     "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),
     "sage_attention_forward": (".sage_attention.attn_qk_int8_per_block", "forward"),
-    "SPARSE_BLOCK_SIZE": (".msa.index_topk", "SPARSE_BLOCK_SIZE"),
+    "SPARSE_BLOCK_SIZE": (".minimax_sparse_attention.index_topk", "SPARSE_BLOCK_SIZE"),
     "chunk_kda_fwd_infer": (".FLA.kda.chunk_kda", "chunk_kda_fwd_infer"),
     "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
     "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
     "chunk_gla": (".FLA.gla", "chunk_gla"),
     "fused_attnres": (".FLA.attnres", "fused_attnres"),
-    "minimax_m3_index_decode": (".msa", "minimax_m3_index_decode"),
-    "minimax_m3_index_decode_score": (".msa", "minimax_m3_index_decode_score"),
-    "minimax_m3_index_score": (".msa", "minimax_m3_index_score"),
-    "minimax_m3_index_topk": (".msa", "minimax_m3_index_topk"),
-    "minimax_m3_sparse_attn": (".msa", "minimax_m3_sparse_attn"),
+    "minimax_m3_index_decode": (".minimax_sparse_attention", "minimax_m3_index_decode"),
+    "minimax_m3_index_decode_score": (".minimax_sparse_attention", "minimax_m3_index_decode_score"),
+    "minimax_m3_index_score": (".minimax_sparse_attention", "minimax_m3_index_score"),
+    "minimax_m3_index_topk": (".minimax_sparse_attention", "minimax_m3_index_topk"),
+    "minimax_m3_sparse_attn": (".minimax_sparse_attention", "minimax_m3_sparse_attn"),
     # The public minimax_m3_sparse_attn is a stage facade that resolves its
     # prefill primitive under this private name, so the plain key above never
     # reaches the prefill path on its own.
-    "_minimax_m3_sparse_attn_prefill": (".msa", "minimax_m3_sparse_attn"),
-    "minimax_m3_sparse_attn_decode": (".msa", "minimax_m3_sparse_attn_decode"),
+    "_minimax_m3_sparse_attn_prefill": (".minimax_sparse_attention", "minimax_m3_sparse_attn"),
+    "minimax_m3_sparse_attn_decode": (".minimax_sparse_attention", "minimax_m3_sparse_attn_decode"),
 }
 
 

@@ -1,6 +1,6 @@
 from flag_attn.runtime.backend import resolve_operator
 
-_OPERATOR_EXPORTS = {"chunk_gdn2": ("chunk_gdn2", "flag_attn.gdn2.chunk", "chunk_gdn2")}
+_OPERATOR_EXPORTS = {"chunk_gdn2": ("chunk_gdn2", "flag_attn.FLA.gdn2.chunk", "chunk_gdn2")}
 
 
 def __getattr__(name: str):

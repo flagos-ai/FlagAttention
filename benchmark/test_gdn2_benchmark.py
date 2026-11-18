@@ -26,8 +26,8 @@ except ModuleNotFoundError:
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gdn2, runtime
-from flag_attn.gdn2.chunk import HAS_TLE_GDN2
-from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
+from flag_attn.FLA.gdn2.chunk import HAS_TLE_GDN2
+from flag_attn.FLA.gdn2.native.chunk_fwd import chunk_gdn2_fwd
 
 
 ALL_SHAPES = [

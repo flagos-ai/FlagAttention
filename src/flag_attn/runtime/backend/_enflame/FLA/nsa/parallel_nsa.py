@@ -5,13 +5,13 @@
 """Enflame-specific compatibility entry for parallel NSA."""
 
 import torch
-from flag_attn.parallel_nsa.parallel_nsa import (
+from flag_attn.FLA.nsa.parallel_nsa import (
     parallel_nsa as _generic_parallel_nsa,
 )
 import os
 import triton
 import triton.language as tl
-from flag_attn.parallel_nsa.triton_ops_helper import (
+from flag_attn.FLA.nsa.triton_ops_helper import (
     HAS_TLE,
     autotune_cache_kwargs,
     exp,
@@ -1224,10 +1224,10 @@ def _install_enflame_nsa_compat():
     )
 
     main_module = importlib.import_module(
-        "flag_attn.parallel_nsa.parallel_nsa"
+        "flag_attn.FLA.nsa.parallel_nsa"
     )
     compression_module = importlib.import_module(
-        "flag_attn.parallel_nsa."
+        "flag_attn.FLA.nsa."
         "parallel_nsa_compression"
     )
 

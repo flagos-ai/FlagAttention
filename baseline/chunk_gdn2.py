@@ -32,7 +32,7 @@ SHAPES = (
 
 def native():
     try:
-        from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
+        from flag_attn.FLA.gdn2.native.chunk_fwd import chunk_gdn2_fwd
     except (ImportError, OSError):
         return None
     return chunk_gdn2_fwd

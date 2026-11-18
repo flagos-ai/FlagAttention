@@ -24,6 +24,8 @@ from .parallel_nsa_compression import parallel_nsa_compression
 from .triton_ops_helper import autotune_cache_kwargs, exp, log
 from .utils import _bitonic_merge, check_shared_mem, input_guard
 
+import flag_attn.runtime as runtime
+
 try:
     HAS_TLE = False
     import triton.experimental.tle.language as tle  # noqa: F401
@@ -830,6 +832,9 @@ def parallel_nsa_fwd(
     else:
         BK = min(128, triton.next_power_of_2(K))
         BV = min(128, triton.next_power_of_2(V))
+    # A backend whose registers cannot hold the default output tile caps it in
+    # its tune_configs.yaml; without a cap this leaves BV exactly as computed.
+    BV = runtime.clamp_tile("parallel_nsa_fwd", "BV", BV)
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
     assert NK == 1, "The key dimension can not be larger than 256"
