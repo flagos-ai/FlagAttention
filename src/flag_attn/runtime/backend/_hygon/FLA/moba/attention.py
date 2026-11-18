@@ -19,7 +19,7 @@ import triton
 import triton.language as tl
 
 from flag_attn.runtime import get_tuned_config
-from .routing import _copy_triton, cdiv
+from flag_attn.runtime.backend._hygon.FLA.moba.routing import _copy_triton, cdiv
 
 
 _LOG2E = tl.constexpr(1.4426950408889634)

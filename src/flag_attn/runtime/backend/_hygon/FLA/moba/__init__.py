@@ -1,6 +1,6 @@
 """MoBA attention implementations."""
 
-from .parallel import (
+from flag_attn.runtime.backend._hygon.FLA.moba.parallel import (
     parallel_moba,
 )
 

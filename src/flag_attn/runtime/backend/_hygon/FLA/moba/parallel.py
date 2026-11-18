@@ -16,7 +16,7 @@
 
 import torch
 
-from .attention import (
+from flag_attn.runtime.backend._hygon.FLA.moba.attention import (
     _attention_launch_config,
     _fused_merge_softmax_triton,
     _routed_sparse_attention_triton,
@@ -25,7 +25,7 @@ from .attention import (
     _triton_varlen_forward,
     _triton_varlen_func,
 )
-from .routing import (
+from flag_attn.runtime.backend._hygon.FLA.moba.routing import (
     _build_dense_chunk_metadata_triton,
     _build_sparse_routes_device_triton,
     _build_sparse_routes_triton,
