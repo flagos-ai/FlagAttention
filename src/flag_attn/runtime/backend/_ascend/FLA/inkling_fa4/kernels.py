@@ -48,6 +48,7 @@ def _rel_attn_paged_kernel(
     KV_GROUP: tl.constexpr,
     BIAS_ALL_IN_RANGE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    VALUE_HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -62,14 +63,7 @@ def _rel_attn_paged_kernel(
     SPLIT_KV: tl.constexpr,
     PAGE_LOAD: tl.constexpr = False,
 ):
-    """Relative attention over the paged KV cache.
-
-    One program covers up to ``BLOCK_M`` consecutive query tokens of one sequence
-    for one query head (GQA heads are not packed: the per-row head index made the
-    Q load and the output store scalarise, which measured 4-8x slower).  The KV
-    range is clipped by the causal bound and the sliding window, then split across
-    ``NUM_SPLITS`` programs so long caches and short windows both get parallelism.
-    """
+    """Process one query tile and head over a clipped KV split."""
     pid_m = tl.program_id(0)
     pid_sh = tl.program_id(1)
     pid_split = tl.program_id(2)
@@ -92,6 +86,7 @@ def _rel_attn_paged_kernel(
     q_glob = q_start + token_c
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < HEAD_DIM
+    mask_v = offs_d < VALUE_HEAD_DIM
 
     q_tile = tl.load(
         q_ptr
@@ -128,142 +123,153 @@ def _rel_attn_paged_kernel(
         kv_span = kv_hi - kv_lo
     # Column offsets of the bias row slice: constant for the whole loop.
     bias_col = tl.arange(0, BLOCK_N) * stride_rel_d
-    for j0 in range(0, kv_span, BLOCK_N):
-        if PAGE_LOAD:
-            # Load each physical page as a contiguous token/feature tile.
-            n = iter_hi - 1 - j0 - tl.arange(0, BLOCK_N)
-            k_valid = (n >= kv_lo) & (n < kv_hi)
-            page_start = (iter_hi - j0 - BLOCK_N) // BLOCK_SIZE
-            page = page_start + tl.arange(0, BLOCK_N // BLOCK_SIZE)
-            page_pos = page * BLOCK_SIZE
-            row = tl.arange(0, BLOCK_SIZE)
-            pos = page_pos[:, None] + row[None, :]
-            page_valid = (page_pos < kv_hi) & (page_pos + BLOCK_SIZE > kv_lo)
-            physical_page = tl.load(block_table_ptr + seq * stride_bt_b + page * stride_bt_block,
-                                    mask=page_valid, other=0)
-            k_fwd = tl.load(k_ptr + physical_page[:, None, None] * stride_k_block
-                            + row[None, :, None] * stride_k_t + kv_head * stride_k_h
-                            + offs_d[None, None, :] * stride_k_d,
-                            mask=((pos >= kv_lo) & (pos < kv_hi))[:, :, None]
-                            & mask_d[None, None, :], other=0.0)
-            k_tile = tl.reshape(k_fwd, [BLOCK_N, BLOCK_D])
-            q_vec = tl.sum(q_tile.to(tl.float32), axis=0)
-            scores_fwd = tl.sum(k_tile.to(tl.float32) * q_vec[None, :], axis=1)
-            reverse = BLOCK_N - 1 - tl.arange(0, BLOCK_N)
-            scores = tl.gather(scores_fwd, reverse, 0)[None, :] * softmax_scale
+    tl.static_assert(BLOCK_N >= BLOCK_M)
+    # Peel the causal boundary tile from the reverse traversal.
+    for phase in tl.static_range(2 if BIAS_ALL_IN_RANGE and BLOCK_M > 1 else 1):
+        if BIAS_ALL_IN_RANGE and BLOCK_M > 1:
+            loop_lo = 0 if phase == 0 else BLOCK_N
+            loop_hi = tl.minimum(kv_span, BLOCK_N) if phase == 0 else kv_span
         else:
-            j = j0 + tl.arange(0, BLOCK_N)
-            k_valid = j < kv_span
-            # Walk the KV window backwards: with ``pos = kv_hi - 1 - j`` the relative
-            # index ``q_pos - pos`` grows by one along the column axis, so the bias
-            # load becomes a contiguous ascending row slice.  With the forward walk
-            # it was a descending (negative-stride) address, which the compiler
-            # turned into one scalar gather per element - the dominant cost of the
-            # prefill shapes.
-            n = (kv_hi - 1) - j
-            logical = n // BLOCK_SIZE
-            offset = n - logical * BLOCK_SIZE
-            physical = tl.load(
-                block_table_ptr + seq * stride_bt_b + logical * stride_bt_block,
-                mask=k_valid,
-                other=0,
-            )
-            k_tile = tl.load(
-                k_ptr
-                + physical[:, None] * stride_k_block
-                + offset[:, None] * stride_k_t
-                + kv_head * stride_k_h
-                + offs_d[None, :] * stride_k_d,
-                mask=k_valid[:, None] & mask_d[None, :],
-                other=0.0,
-            )
-            if BLOCK_M == 1:
-                # A single query uses vector reductions without padded Cube rows.
+            loop_lo = 0
+            loop_hi = kv_span
+        for j0 in range(loop_lo, loop_hi, BLOCK_N):
+            if PAGE_LOAD:
+                # Load each physical page as a contiguous token/feature tile.
+                n = iter_hi - 1 - j0 - tl.arange(0, BLOCK_N)
+                k_valid = (n >= kv_lo) & (n < kv_hi)
+                page_start = (iter_hi - j0 - BLOCK_N) // BLOCK_SIZE
+                page = page_start + tl.arange(0, BLOCK_N // BLOCK_SIZE)
+                page_pos = page * BLOCK_SIZE
+                row = tl.arange(0, BLOCK_SIZE)
+                pos = page_pos[:, None] + row[None, :]
+                page_valid = (page_pos < kv_hi) & (page_pos + BLOCK_SIZE > kv_lo)
+                physical_page = tl.load(block_table_ptr + seq * stride_bt_b + page * stride_bt_block,
+                                        mask=page_valid, other=0)
+                k_fwd = tl.load(k_ptr + physical_page[:, None, None] * stride_k_block
+                                + row[None, :, None] * stride_k_t + kv_head * stride_k_h
+                                + offs_d[None, None, :] * stride_k_d,
+                                mask=((pos >= kv_lo) & (pos < kv_hi))[:, :, None]
+                                & mask_d[None, None, :], other=0.0)
+                k_tile = tl.reshape(k_fwd, [BLOCK_N, BLOCK_D])
                 q_vec = tl.sum(q_tile.to(tl.float32), axis=0)
-                scores = tl.sum(k_tile.to(tl.float32) * q_vec[None, :], axis=1)[None, :] * softmax_scale
+                scores_fwd = tl.sum(k_tile.to(tl.float32) * q_vec[None, :], axis=1)
+                reverse = BLOCK_N - 1 - tl.arange(0, BLOCK_N)
+                scores = tl.gather(scores_fwd, reverse, 0)[None, :] * softmax_scale
             else:
-                scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * softmax_scale
+                j = j0 + tl.arange(0, BLOCK_N)
+                k_valid = j < kv_span
+                # Reverse KV traversal makes relative-bias indices ascend along columns.
+                n = (kv_hi - 1) - j
+                logical = n // BLOCK_SIZE
+                offset = n - logical * BLOCK_SIZE
+                physical = tl.load(
+                    block_table_ptr + seq * stride_bt_b + logical * stride_bt_block,
+                    mask=k_valid,
+                    other=0,
+                )
+                k_tile = tl.load(
+                    k_ptr
+                    + physical[:, None] * stride_k_block
+                    + offset[:, None] * stride_k_t
+                    + kv_head * stride_k_h
+                    + offs_d[None, :] * stride_k_d,
+                    mask=k_valid[:, None] & mask_d[None, :],
+                    other=0.0,
+                )
+                if BLOCK_M == 1:
+                    # A single query uses vector reductions without padded Cube rows.
+                    q_vec = tl.sum(q_tile.to(tl.float32), axis=0)
+                    scores = tl.sum(k_tile.to(tl.float32) * q_vec[None, :], axis=1)[None, :] * softmax_scale
+                else:
+                    scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * softmax_scale
 
-        # Relative index of the first column of this tile; the index grows by one
-        # per column, so the whole slice is one contiguous row run and the per-row
-        # base can be hoisted out of the elementwise address math.
-        bias_start = q_pos - ((iter_hi - 1) - j0)
-        bias_row = (
-            rel_ptr
-            + q_glob * stride_rel_t
-            + head * stride_rel_h
-            + bias_start * stride_rel_d
-        )
-        if BIAS_ALL_IN_RANGE:
-            # causal + KV span within rel_extent: every attended key is in
-            # range, so no clamp and no in-range mask are needed at all.
-            rel_bias = tl.load(
-                bias_row[:, None] + bias_col[None, :],
-                mask=row_valid[:, None] & k_valid[None, :],
-                other=0.0,
-            ).to(tl.float32)
-        else:
-            rel_dist = bias_start[:, None] + tl.arange(0, BLOCK_N)[None, :]
-            in_range = (rel_dist >= 0) & (rel_dist < REL_EXTENT)
-            clamp_lo = tl.maximum(rel_dist, 0)
-            safe_idx = tl.minimum(clamp_lo, REL_EXTENT - 1)
-            rel_bias = tl.load(
+            # Relative index of the first column of this tile; the index grows by one
+            # per column, so the whole slice is one contiguous row run and the per-row
+            # base can be hoisted out of the elementwise address math.
+            bias_start = q_pos - ((iter_hi - 1) - j0)
+            bias_row = (
                 rel_ptr
-                + q_glob[:, None] * stride_rel_t
-                + head[:, None] * stride_rel_h
-                + safe_idx * stride_rel_d,
-                mask=row_valid[:, None] & k_valid[None, :] & in_range,
-                other=0.0,
-            ).to(tl.float32)
-        scores = scores + rel_bias
-
-        keep = row_valid[:, None] & k_valid[None, :]
-        if CAUSAL:
-            keep = keep & (n[None, :] <= q_pos[:, None])
-        if HAS_LEFT:
-            keep = keep & (n[None, :] >= q_pos[:, None] - WINDOW_LEFT)
-        if HAS_RIGHT:
-            keep = keep & (n[None, :] <= q_pos[:, None] + WINDOW_RIGHT)
-        scores = tl.where(keep, scores, -float("inf"))
-
-        if PAGE_LOAD:
-            v_fwd = tl.load(v_ptr + physical_page[:, None, None] * stride_v_block
-                            + row[None, :, None] * stride_v_t + kv_head * stride_v_h
-                            + offs_d[None, None, :] * stride_v_d,
-                            mask=((pos >= kv_lo) & (pos < kv_hi))[:, :, None]
-                            & mask_d[None, None, :], other=0.0)
-            v_tile = tl.reshape(v_fwd, [BLOCK_N, BLOCK_D])
-        else:
-            v_tile = tl.load(
-                v_ptr
-                + physical[:, None] * stride_v_block
-                + offset[:, None] * stride_v_t
-                + kv_head * stride_v_h
-                + offs_d[None, :] * stride_v_d,
-                mask=k_valid[:, None] & mask_d[None, :],
-                other=0.0,
+                + q_glob * stride_rel_t
+                + head * stride_rel_h
+                + bias_start * stride_rel_d
             )
+            if BIAS_ALL_IN_RANGE:
+                if BLOCK_M > 1 and phase == 0:
+                    # Only the first reverse tile can contain future keys.
+                    rel_bias = tl.load(
+                        bias_row[:, None] + bias_col[None, :],
+                        mask=row_valid[:, None] & k_valid[None, :]
+                        & (n[None, :] <= q_pos[:, None]),
+                        other=0.0,
+                    ).to(tl.float32)
+                else:
+                    rel_bias = tl.load(
+                        bias_row[:, None] + bias_col[None, :],
+                        mask=row_valid[:, None] & k_valid[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+            else:
+                rel_dist = bias_start[:, None] + tl.arange(0, BLOCK_N)[None, :]
+                in_range = (rel_dist >= 0) & (rel_dist < REL_EXTENT)
+                clamp_lo = tl.maximum(rel_dist, 0)
+                safe_idx = tl.minimum(clamp_lo, REL_EXTENT - 1)
+                rel_bias = tl.load(
+                    rel_ptr
+                    + q_glob[:, None] * stride_rel_t
+                    + head[:, None] * stride_rel_h
+                    + safe_idx * stride_rel_d,
+                    mask=row_valid[:, None] & k_valid[None, :] & in_range,
+                    other=0.0,
+                ).to(tl.float32)
+            scores = scores + rel_bias
 
-        tile_max = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, tile_max)
-        row_has = m_new != -float("inf")
-        m_safe = tl.where(row_has, m_new, 0.0)
-        alpha = tl.where(m_i == -float("inf"), 0.0, tl.exp(m_i - m_safe))
-        probabilities = tl.exp(scores - m_safe[:, None])
-        l_i = l_i * alpha + tl.sum(probabilities, axis=1)
-        if PAGE_LOAD:
-            # Reverse only score/probability vectors to keep bias loads ascending.
-            p_reverse = tl.gather(tl.reshape(probabilities, [BLOCK_N]), reverse, 0)
-            weighted_v = p_reverse[:, None] * v_tile.to(tl.float32)
-            acc = acc * alpha[:, None] + tl.sum(weighted_v, axis=0)[None, :]
-        elif BLOCK_M == 1:
-            weighted_v = tl.trans(probabilities) * v_tile.to(tl.float32)
-            acc = acc * alpha[:, None] + tl.sum(weighted_v, axis=0)[None, :]
-        else:
-            acc = acc * alpha[:, None] + tl.dot(
-                probabilities.to(v_tile.dtype), v_tile, out_dtype=tl.float32
-            )
-        m_i = m_new
+            keep = row_valid[:, None] & k_valid[None, :]
+            if CAUSAL and (not BIAS_ALL_IN_RANGE or (BLOCK_M > 1 and phase == 0)):
+                keep = keep & (n[None, :] <= q_pos[:, None])
+            if HAS_LEFT:
+                keep = keep & (n[None, :] >= q_pos[:, None] - WINDOW_LEFT)
+            if HAS_RIGHT:
+                keep = keep & (n[None, :] <= q_pos[:, None] + WINDOW_RIGHT)
+            scores = tl.where(keep, scores, -float("inf"))
+
+            if PAGE_LOAD:
+                v_fwd = tl.load(v_ptr + physical_page[:, None, None] * stride_v_block
+                                + row[None, :, None] * stride_v_t + kv_head * stride_v_h
+                                + offs_d[None, None, :] * stride_v_d,
+                                mask=((pos >= kv_lo) & (pos < kv_hi))[:, :, None]
+                                & mask_v[None, None, :], other=0.0)
+                v_tile = tl.reshape(v_fwd, [BLOCK_N, BLOCK_D])
+            else:
+                v_tile = tl.load(
+                    v_ptr
+                    + physical[:, None] * stride_v_block
+                    + offset[:, None] * stride_v_t
+                    + kv_head * stride_v_h
+                    + offs_d[None, :] * stride_v_d,
+                    mask=k_valid[:, None] & mask_v[None, :],
+                    other=0.0,
+                )
+
+            tile_max = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, tile_max)
+            row_has = m_new != -float("inf")
+            m_safe = tl.where(row_has, m_new, 0.0)
+            alpha = tl.where(m_i == -float("inf"), 0.0, tl.exp(m_i - m_safe))
+            probabilities = tl.exp(scores - m_safe[:, None])
+            l_i = l_i * alpha + tl.sum(probabilities, axis=1)
+            if PAGE_LOAD:
+                # Reverse only score/probability vectors to keep bias loads ascending.
+                p_reverse = tl.gather(tl.reshape(probabilities, [BLOCK_N]), reverse, 0)
+                weighted_v = p_reverse[:, None] * v_tile.to(tl.float32)
+                acc = acc * alpha[:, None] + tl.sum(weighted_v, axis=0)[None, :]
+            elif BLOCK_M == 1:
+                weighted_v = tl.trans(probabilities) * v_tile.to(tl.float32)
+                acc = acc * alpha[:, None] + tl.sum(weighted_v, axis=0)[None, :]
+            else:
+                acc = acc * alpha[:, None] + tl.dot(
+                    probabilities.to(v_tile.dtype), v_tile, out_dtype=tl.float32
+                )
+            m_i = m_new
 
     if SPLIT_KV:
         # Store the *normalised* partial output plus the log-sum-exp.  The combine
@@ -280,7 +286,7 @@ def _rel_attn_paged_kernel(
             + head[:, None] * stride_po_h
             + offs_d[None, :],
             acc / l_safe[:, None],
-            mask=row_valid[:, None] & mask_d[None, :],
+            mask=row_valid[:, None] & mask_v[None, :],
         )
         tl.store(
             partial_lse_ptr
@@ -298,7 +304,7 @@ def _rel_attn_paged_kernel(
             + head[:, None] * stride_out_h
             + offs_d[None, :] * stride_out_d,
             result.to(out_ptr.dtype.element_ty),
-            mask=row_valid[:, None] & mask_d[None, :],
+            mask=row_valid[:, None] & mask_v[None, :],
         )
 
 

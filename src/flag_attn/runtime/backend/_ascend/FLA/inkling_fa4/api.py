@@ -1,20 +1,10 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Ascend implementation of Inkling FA4 paged relative attention.
+"""Ascend paged relative attention with Cube, Vector decode and split-KV.
 
-Semantics follow ``flag_attn.testing.inkling_fa4.ref_rel_attn``: the query rows
-of one sequence are the last ``q_len`` positions of its cached key sequence, the
-relative logits are added only for ``0 <= q_pos - k_pos < rel_extent``, and the
-causal / sliding-window mask is applied on the shifted positions.
-
-Ascend layout choices:
-* each program handles one query head; single-token decode with contiguous
-  feature dimensions uses vector reductions, while other tiles use Cube products;
-* the KV range is clipped by the causal bound and the sliding window (past and
-  future keys are never fetched);
-* the range is split across ``NUM_SPLITS`` programs and merged by a small fp32
-  combine kernel, because decode shapes otherwise have only a handful of
-  programs.  ``num_splits`` from the caller wins when it is greater than one.
+Queries occupy the last q_len positions of each cached sequence. Relative
+logits apply where 0 <= q_pos - k_pos < rel_extent; causal and window masks
+use the same shifted positions.
 """
 
 import torch
@@ -41,7 +31,10 @@ _TARGET_PROGRAMS = 128
 def _plan(batch, num_heads, head_dim_q, head_dim_v, block_size,
           rel_extent, max_seqlen_q, num_splits, causal, window_left, window_right,
           kv_upper, contiguous_features):
-    if max_seqlen_q == 1 and max(head_dim_q, head_dim_v) <= 128 and contiguous_features:
+    if max(head_dim_q, head_dim_v) > 128:
+        # Bound the UB working set for wide QK or value heads.
+        block_m, block_n = _SMALL_Q_BLOCK_M, _BLOCK_N
+    elif max_seqlen_q == 1 and contiguous_features:
         block_m, block_n = 1, _SMALL_Q_BLOCK_N
     elif max_seqlen_q <= _SMALL_Q:
         block_m, block_n = _SMALL_Q_BLOCK_M, _SMALL_Q_BLOCK_N
@@ -108,6 +101,8 @@ def _check(q, key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q, 
         raise ValueError("rel_logits must have shape [total_q, num_heads, rel_extent]")
     if key_cache.shape[:3] != value_cache.shape[:3]:
         raise ValueError("key_cache and value_cache block/token/head shapes must match")
+    if key_cache.shape[3] != q.shape[2]:
+        raise ValueError("Q and K head dimensions must match")
     if key_cache.shape[3] > _MAX_HEAD_DIM or value_cache.shape[3] > _MAX_HEAD_DIM:
         raise ValueError(f"head_dim must be <= {_MAX_HEAD_DIM} on Ascend")
     if block_table.shape[0] != cache_seqlens.shape[0]:
@@ -116,8 +111,13 @@ def _check(q, key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q, 
         raise ValueError("cu_seqlens_q must contain batch_size + 1 entries")
     if rel_logits.dtype != q.dtype:
         raise TypeError("rel_logits and q must have the same dtype")
-    if out is not None and (out.shape != q.shape or out.dtype != q.dtype):
-        raise ValueError("out must match q in shape and dtype")
+    if out is not None:
+        expected_shape = (q.shape[0], q.shape[1], value_cache.shape[3])
+        if out.shape != expected_shape or out.dtype != q.dtype or out.device != device:
+            raise ValueError(
+                "out must have shape [total_q, num_heads, value_head_dim] "
+                "and match q dtype/device"
+            )
 
 
 def inkling_fa4_rel_attention(
@@ -161,9 +161,7 @@ def inkling_fa4_rel_attention(
 
     if not rel_logits.is_contiguous():
         rel_logits = rel_logits.contiguous()
-    # One query head per program: packing the heads that share a KV head was
-    # measured 4-8x slower here, because the per-row head index turns both the Q
-    # tile load and the output store into scalar gathers.
+    # Map each query head to the KV head shared by its GQA group.
     kv_group = num_heads // num_kv_heads
     h_grid = num_heads
     window_left, window_right = window_size
@@ -242,6 +240,7 @@ def inkling_fa4_rel_attention(
         KV_GROUP=kv_group,
         BIAS_ALL_IN_RANGE=bias_all_in_range,
         HEAD_DIM=head_dim_q,
+        VALUE_HEAD_DIM=head_dim_v,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_D=block_d,
