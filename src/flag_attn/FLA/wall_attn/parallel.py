@@ -44,7 +44,7 @@ import triton.language as tl
 
 from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.index import prepare_chunk_indices
-from flag_attn.FLA.nsa.bwd_preprocess import parallel_attn_bwd_preprocess
+from flag_attn.parallel_nsa.bwd_preprocess import parallel_attn_bwd_preprocess
 from flag_attn.utils import check_shared_mem, has_triton_tle, input_guard
 
 RCP_LN2 = 1.4426950216
@@ -1018,13 +1018,8 @@ def get_last_route() -> str | None:
 
 @lru_cache(maxsize=1)
 def _load_fwd_module():
-    """Load Hopper-only kernels after metadata dispatch accepts an inference call.
-
-    These warp-specialized wgmma kernels live with the other SM90 code under
-    runtime/backend/_nvidia/hopper. select_route() has already established that
-    this is a Hopper device with TLE before anything imports them.
-    """
-    module = import_module("flag_attn.runtime.backend._nvidia.hopper.wall_attn_fwd")
+    """Load Hopper-only kernels after metadata dispatch accepts an inference call."""
+    module = import_module(f"{__package__}.parallel_fwd")
     triton.set_allocator(module.allocate_descriptor)
     return module
 

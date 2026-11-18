@@ -324,11 +324,8 @@ def get_fwd_config(B, H, M, N, D, causal):
         else:
             BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
     else:
-        # Every tuned branch above names one measured architecture, so a newer
-        # or unlisted one has no entry. These tiles are the portable default:
-        # they are correct on any device Triton compiles for, and give up only
-        # the per-architecture tuning. Blackwell (10, 0) reaches this branch.
-        BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+        raise ValueError(f"Unsupported device capability {torch.cuda.get_device_capability()}. Please open an issue.")
+        # BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
 
 @triton.jit

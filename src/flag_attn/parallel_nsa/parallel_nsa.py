@@ -24,7 +24,6 @@ from .parallel_nsa_compression import parallel_nsa_compression
 from .triton_ops_helper import autotune_cache_kwargs, exp, log
 from .utils import _bitonic_merge, check_shared_mem, input_guard
 
-
 try:
     HAS_TLE = False
     import triton.experimental.tle.language as tle  # noqa: F401

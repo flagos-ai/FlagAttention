@@ -16,7 +16,7 @@
 
 from flag_attn.runtime.backend import resolve_operator
 
-_OPERATOR_EXPORTS = {"chunk_gla": ("chunk_gla", "flag_attn.FLA.gla.chunk_gla", "chunk_gla")}
+_OPERATOR_EXPORTS = {"chunk_gla": ("chunk_gla", "flag_attn.FLA.gated_linear_attention.chunk_gla", "chunk_gla")}
 
 
 def __getattr__(name: str):

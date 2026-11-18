@@ -72,13 +72,7 @@ def _block_size(head_dim: int, device_index: int) -> int:
     # accumulators live at once, so Hopper uses a smaller tile than the baseline
     # kernel. Varlen still uses this same BT to keep chunk_indices consistent.
     if is_nvidia_blackwell_device(device_index):
-        # Blackwell issues tl.dot on tcgen05, whose accumulators live in tensor
-        # memory instead of registers, with a 512-column budget per CTA. The
-        # score tile and the four gradient accumulators share that budget, so
-        # BT=128 needs 640 columns in the long-sequence backward at every head
-        # dimension, and 576 in the short one once head_dim exceeds 64. BT=64
-        # is the largest tile that fits both, measured on B200 (SM100).
-        return 64
+        return 128
     if has_shared_memory(232_448, device_index):
         return 64 if head_dim <= 128 else 32
     return 64

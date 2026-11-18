@@ -37,10 +37,10 @@ _OPERATOR_EXPORTS = {
     "flash_attention_split_kv": ("flag_attn.split_kv", "attention"),
     "paged_attention": ("flag_attn.paged", "attention"),
     "sage_attention": ("flag_attn.sage_attention.attn_qk_int8_per_block", "forward"),
-    "parallel_nsa": ("flag_attn.FLA.nsa", "parallel_nsa"),
-    "parallel_nsa_compression": ("flag_attn.FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
+    "parallel_nsa": ("flag_attn.parallel_nsa", "parallel_nsa"),
+    "parallel_nsa_compression": ("flag_attn.parallel_nsa.parallel_nsa_compression", "parallel_nsa_compression"),
     "parallel_moba": ("flag_attn.FLA.moba.parallel", "parallel_moba"),
-    "parallel_forgetting_attn": ("flag_attn.FLA.forgetting_attn", "parallel_forgetting_attn"),
+    "parallel_forgetting_attn": ("flag_attn.forgetting_attention", "parallel_forgetting_attn"),
     "log_linear_attn": ("flag_attn.FLA.log_linear_attn.chunk_tle", "log_linear_attn"),
     "diffkv_attention": ("flag_attn.diffkv_attention.api", "diffkv_attention"),
     "hy3_attention": ("flag_attn.hpc_ops_attention", "hy3_attention"),
@@ -59,11 +59,11 @@ _OPERATOR_EXPORTS = {
         "chunk_gated_delta_rule",
     ),
     "chunk_gla": (
-        "flag_attn.FLA.gla.chunk_gla",
+        "flag_attn.FLA.gated_linear_attention.chunk_gla",
         "chunk_gla",
     ),
-    "chunk_gdn2": ("flag_attn.FLA.gdn2.chunk", "chunk_gdn2"),
-    "chunk_kda": ("flag_attn.FLA.kda.chunk_kda", "chunk_kda_fwd_infer"),
+    "chunk_gdn2": ("flag_attn.gdn2.chunk", "chunk_gdn2"),
+    "chunk_kda": ("flag_attn.FLA.chunk_kda", "chunk_kda_fwd_infer"),
     "parallel_wall_attn": ("flag_attn.FLA.wall_attn", "parallel_wall_attn"),
     "InfLLMV2Config": (
         "flag_attn.infllmv2",
@@ -100,9 +100,7 @@ for _name in (
 # Initialize only lightweight namespaces before publishing same-named APIs.
 # Later submodule imports then cannot replace these callable exports with
 # package objects. Implementations remain lazy inside each namespace.
-# parallel_nsa is absent here because its package now lives at FLA.nsa,
-# following the upstream name, so it no longer collides with the callable.
-for _package_name in ("sage_attention", "diffkv_attention"):
+for _package_name in ("sage_attention", "parallel_nsa", "diffkv_attention"):
     importlib.import_module(f"{__name__}.{_package_name}")
     globals().pop(_package_name, None)
 
