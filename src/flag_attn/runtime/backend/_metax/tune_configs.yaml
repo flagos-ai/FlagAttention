@@ -12,13 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Tile caps for kernels that size their tiles at run time. The generic kernel
-# keeps its own sizing logic; these only narrow it for this device.
-tile_limits:
-  parallel_nsa_fwd:
-    # MetaX registers cannot hold the default D=128 output tile.
-    BV: 64
-
 _chunk_gdn2_fwd_intra_infer_kernel:
 - META:
     BK: 32
