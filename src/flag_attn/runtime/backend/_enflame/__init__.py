@@ -23,6 +23,9 @@ _OPERATOR_EXPORTS = {
     "minimax_m3_index_topk": (".msa", "minimax_m3_index_topk"),
     "minimax_m3_sparse_attn": (".msa", "minimax_m3_sparse_attn"),
     "minimax_m3_sparse_attn_decode": (".msa", "minimax_m3_sparse_attn_decode"),
+    "parallel_parallax": (".FLA.parallax", "parallel_parallax"),
+    "parallax_decode": (".FLA.parallax", "parallax_decode"),
+    "parallax_attn_with_kvcache": (".FLA.parallax", "parallax_attn_with_kvcache"),
     "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
     "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
     "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),
@@ -30,10 +33,6 @@ _OPERATOR_EXPORTS = {
     "sage_attention_per_block_int8": (".sage_attention.quant_per_block", "per_block_int8"),
 }
 
-
-# The vendor GLA API does not accept the generic cu_seqlens_cpu keyword.
-# Keep it available explicitly, but do not substitute it for the public API.
-_GENERIC_ONLY_OPS = {"chunk_gla"}
 
 
 def __getattr__(name: str):

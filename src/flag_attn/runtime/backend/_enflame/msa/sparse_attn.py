@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from flag_attn.runtime.backend._enflame.utils import current_platform as current_platform
 from flag_attn.minimax_sparse_attention.sparse_attn import (
     _FP8_DTYPES,
     _KV_SCALE_NONE,

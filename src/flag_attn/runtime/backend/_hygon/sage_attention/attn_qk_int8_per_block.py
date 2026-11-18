@@ -36,6 +36,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     start_m, mask_ptrs, stride_maskn,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
+                    K_SCALE_BLOCK: tl.constexpr,
                     ):
     lo, hi = 0, kv_len
     for start_n in range(lo, hi, BLOCK_N):
@@ -50,7 +51,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
         if not skip:
             k_mask = offs_n[None, :] < (kv_len - start_n)
             k = tl.load(K_ptrs, mask=k_mask)
-            k_scale = tl.load(K_scale_ptr)
+            k_scale = tl.load(K_scale_ptr + start_n // K_SCALE_BLOCK)
 
             qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
 
@@ -78,7 +79,6 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             acc += tl.dot(p, v, out_dtype=tl.float16)
             m_i = m_ij
         K_ptrs += BLOCK_N * stride_kn
-        K_scale_ptr += 1
         V_ptrs += BLOCK_N * stride_vn
     return acc, l_i, m_i
 
@@ -213,7 +213,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
                                         start_m, mask_ptrs, stride_maskn,
                                         BLOCK_M, HEAD_DIM, BLOCK_N,
-                                        4 - STAGE, offs_m, offs_n
+                                        4 - STAGE, offs_m, offs_n, K_SCALE_BLOCK
                                         )
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
@@ -263,8 +263,8 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
 
     def grid(meta):
         return (triton.cdiv(qo_len, meta["BLOCK_M"]), h_qo, b)
-    # Full-static experiment: specialize every shape by its KV block count.
-    static_kv = True
+    # Unroll only short KV sequences; long sequences use the equivalent loop.
+    static_kv = kv_len <= 256
     launch_options = {}
     if maxnreg is not None and maxnreg <= 0:
         raise ValueError("maxnreg must be positive")

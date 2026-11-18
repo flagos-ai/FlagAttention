@@ -4,7 +4,7 @@
 
 """Shared sparse-attention helpers for non-FLA Enflame operators."""
 
-from flag_attn.minimax_sparse_attention.utils import (
+from flag_attn.utils import (
     current_platform,
     has_triton_tle,
     round_up,

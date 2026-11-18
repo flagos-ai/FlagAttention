@@ -47,6 +47,18 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
     return wrapper
 
 
+def get_num_sms(device_index: int | None = None) -> int:
+    """Return the selected GCU device's multiprocessor count."""
+    if not hasattr(torch, "gcu") or not torch.gcu.is_available():
+        return 0
+    try:
+        if device_index is None:
+            device_index = torch.gcu.current_device()
+        return torch.gcu.get_device_properties(device_index).multi_processor_count
+    except (AttributeError, AssertionError, RuntimeError):
+        return 0
+
+
 def input_guard(fn: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -156,6 +168,7 @@ def make_grid_2d(
 
 
 __all__ = [
+    "get_num_sms",
     "check_shared_mem",
     "input_guard",
     "make_grid_2d",

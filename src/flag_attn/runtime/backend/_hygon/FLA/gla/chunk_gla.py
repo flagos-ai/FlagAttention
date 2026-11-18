@@ -4,7 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
-import os
 
 import torch
 import triton
@@ -13,7 +12,8 @@ import triton.language as tl
 from ..chunk_h import chunk_bwd_dh, chunk_fwd_h, chunk_fwd_h_fused_cumsum
 from ..cumsum_gla import chunk_local_cumsum
 from ..index import prepare_chunk_indices
-from ..utils import check_shared_mem, input_guard
+from flag_attn.runtime import autotune_cache_kwargs, get_tuned_config
+from ..utils import input_guard
 
 RCP_LN2 = 1.4426950216
 OP_NAME = "chunk_gla"
@@ -21,10 +21,6 @@ _SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Conservative aggregate state-tile work limit for the gfx936 streaming path.
 # Keep this paired with the separate sequential-chunk bound below.
 _STREAM_FUSED_MAX_STATE_WORK = 128 * 128 * 128
-
-
-BK_LIST = [32, 64] if check_shared_mem() else [16, 32]
-BV_LIST = [64, 128] if check_shared_mem("ampere") else [16, 32]
 
 
 def _select_chunk_size(sequence_length: int) -> int:
@@ -42,12 +38,9 @@ def exp2(x):
     }
 )
 @triton.autotune(
-    # Hygon gfx936: winners observed across all supported forward shape families.
-    configs=[
-        triton.Config({"BK": 64}, num_warps=1, num_stages=2),
-        triton.Config({"BK": 64}, num_warps=2, num_stages=2),
-    ],
-    key=["BC", "K"],
+    configs=get_tuned_config("chunk_gla_fwd_A_kernel_intra_sub_inter"),
+    key=["BC"],
+    **autotune_cache_kwargs(),
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_A_kernel_intra_sub_inter(
@@ -401,18 +394,9 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_merge(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BK": BK, "BV": BV},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["BT", "H", "K", "HV", "STATE_V_FIRST", "V"],
+    configs=get_tuned_config("chunk_gla_fwd_kernel_o"),
+    key=["BT", "HV", "STATE_V_FIRST", "V"],
+    **autotune_cache_kwargs(),
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -487,11 +471,10 @@ def chunk_gla_fwd_kernel_o(
         # [BT, BK]
         b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
         b_h = tl.load(p_h, boundary_check=(0, 1))
-        if i_k >= 0:
-            if STATE_V_FIRST:
-                b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
-            else:
-                b_o += tl.dot(b_qg, b_h.to(b_qg.dtype))
+        if STATE_V_FIRST:
+            b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
+        else:
+            b_o += tl.dot(b_qg, b_h.to(b_qg.dtype))
     b_o *= scale
     p_v = tl.make_block_ptr(
         v, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
@@ -1099,12 +1082,9 @@ def chunk_gla_bwd_kernel_dv(
     }
 )
 @triton.autotune(
-    # Hygon gfx936: alternate K/V state tiles cover long and small D families.
-    configs=[
-        triton.Config({"BK": 16, "BV": 32}, num_warps=4, num_stages=4),
-        triton.Config({"BK": 32, "BV": 16}, num_warps=4, num_stages=3),
-    ],
-    key=["BT", "H", "K", "V", "STATE_V_FIRST"],
+    configs=get_tuned_config("chunk_gla_bwd_kernel_inter"),
+    key=["BT", "K", "V", "STATE_V_FIRST"],
+    **autotune_cache_kwargs(),
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_bwd_kernel_inter(
@@ -1639,7 +1619,6 @@ def chunk_gla_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     use_fused_h_cumsum = (
         g_cumsum is None
-        and os.environ.get("FLAG_ATTN_GLA_FUSED_CUMSUM_H", "1") != "0"
         and initial_state is None
         and not output_final_state
         and not state_v_first
@@ -1843,7 +1822,6 @@ class ChunkGLAFunction(torch.autograd.Function):
         cu_seqlens_cpu,
     ):
         chunk_size = _select_chunk_size(q.shape[1])
-        stream_fused_mode = os.environ.get("FLAG_ATTN_GLA_STREAM_FUSED", "auto").lower()
         stream_fused_chunks = triton.cdiv(q.shape[1], chunk_size)
         stream_fused_bk = triton.next_power_of_2(q.shape[-1])
         stream_fused_bv = triton.cdiv(v.shape[-1], 32) * 32
@@ -1855,8 +1833,7 @@ class ChunkGLAFunction(torch.autograd.Function):
             * stream_fused_bv
         )
         use_fused_state = (
-            stream_fused_mode not in ("0", "false", "off")
-            and q.dtype == torch.bfloat16
+            q.dtype == torch.bfloat16
             and g.dtype == torch.bfloat16
             and chunk_size == 64
             and (
@@ -1901,11 +1878,9 @@ class ChunkGLAFunction(torch.autograd.Function):
         # For BF16 K=V=64 inference without an initial/final state, use one
         # 64-row tile to fuse the intra-chunk A@V work into output generation.
         # This removes the FP32 A intermediate without splitting/recomputing
-        # the tile. Keep an env opt-out for reproducible A/B measurements.
+        # the tile.
         use_fused_intra = (
-            os.environ.get("FLAG_ATTN_GLA_FUSED_INTRA", "auto").lower()
-            not in ("0", "false", "off")
-            and q.dtype == torch.bfloat16
+            q.dtype == torch.bfloat16
             and g.dtype == torch.bfloat16
             and q.shape[-1] == 64
             and v.shape[-1] == 64
@@ -2105,26 +2080,8 @@ def chunk_gla(
         )
     """
     _validate_chunk_gla_inputs(q, k, v, g, initial_state, state_v_first, cu_seqlens)
-    if cu_seqlens is not None:
-        if q.shape[0] != 1:
-            raise ValueError(
-                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
-                f"Please flatten variable-length inputs before processing.",
-            )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
-            raise ValueError(
-                f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
-            )
     if scale is None:
         scale = q.shape[-1] ** -0.5
-    if initial_state is not None:
-        assert initial_state.dtype == torch.float32, "initial_state must be in float32."
-    assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
-    assert v.shape == (
-        *q.shape[:3],
-        v.shape[-1],
-    ), "v must be of shape (batch size, seq len, num of head, head dim)."
     o, final_state = ChunkGLAFunction.apply(
         q,
         k,
@@ -2233,22 +2190,13 @@ def chunk_gla_fwd_o_fused_state(
     B, T, H, K = k.shape
     HV, V = v.shape[2], v.shape[-1]
     BK, BV = triton.next_power_of_2(K), 32
-    split_mode = os.environ.get("FLAG_ATTN_GLA_STREAM_K_SPLIT", "auto").lower()
-    if split_mode not in ("0", "false", "off", "no") and K > 64 and V > 64:
-        try:
-            num_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
-        except (AttributeError, RuntimeError):
-            num_cus = 0
+    if K > 64 and V > 64:
+        num_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
         base_ctas = triton.cdiv(V, BV) * B * HV
         # A 2-way split did not amortize the extra reduction at this CTA
         # scale. Try 4-way splitting only when the unsplit grid is below half
         # the CU count and four partitions can supply at least one wave.
-        if (
-            num_cus > 0
-            and base_ctas * 2 < num_cus
-            and base_ctas * 4 >= num_cus
-            and BK // 16 >= 4
-        ):
+        if base_ctas * 2 < num_cus and base_ctas * 4 >= num_cus:
             return chunk_gla_fwd_o_fused_state_k_split(
                 q=q,
                 k=k,

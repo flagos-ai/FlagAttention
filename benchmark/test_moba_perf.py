@@ -20,25 +20,39 @@ import torch
 import triton
 
 from flag_attn.testing import backend as test_backend
-from flag_attn import parallel_moba
+from flag_attn import parallel_moba, runtime
+
+try:
+    from benchmark.recording import BenchmarkRecorder
+except ModuleNotFoundError:  # Direct script execution.
+    from recording import BenchmarkRecorder
 from flag_attn.FLA.moba.routing import (
     _build_dense_chunk_metadata_triton,
     _compute_dense_chunk_means_triton,
     _compute_selected_chunks_batched_streaming_triton,
 )
 
-try:
-    if not test_backend.is_nvidia():
-        raise ImportError("CUDA comparison is unavailable on the selected backend")
-    from flash_moba import flash_moba_varlen_func
-    from flash_moba.flash_moba_interface import (
-        flash_moba_gpu,
-        flash_topk_mean_pool,
-    )
-except ImportError:
-    flash_moba_varlen_func = None
-    flash_moba_gpu = None
-    flash_topk_mean_pool = None
+flash_moba_varlen_func = None
+flash_moba_gpu = None
+flash_topk_mean_pool = None
+if test_backend.is_nvidia():
+    try:
+        from flash_moba import flash_moba_varlen_func
+        from flash_moba.flash_moba_interface import flash_moba_gpu, flash_topk_mean_pool
+    except ImportError:
+        flash_moba_varlen_func = None
+        flash_moba_gpu = None
+        flash_topk_mean_pool = None
+
+mate_parallel_moba = None
+if runtime.device.vendor_name == "mthreads":
+    try:
+        from BaselineBenchmark.backends._mthreads.ops.moba import (
+            parallel_moba as mate_parallel_moba,
+        )
+    except ImportError:
+        pass
+
 
 
 WARMUP_MS = 25
@@ -214,7 +228,7 @@ def _flash_moba(q, k, v, cu_seqlens, max_seqlen, chunk_size, topk):
 
 
 def benchmark_kernel(func, args):
-    """Return median CUDA latency in milliseconds."""
+    """Return median device-event latency in milliseconds."""
 
     @torch.no_grad()
     def run():
@@ -240,41 +254,53 @@ def _format_shape(seq_lens, num_heads, head_dim, chunk_size, topk, dtype):
     )
 
 
-def _print_results(results):
+def _print_results(results, baseline_name):
     print(f"\n{'=' * TABLE_WIDTH}")
-    print("MoBA benchmark: FlagAttention with optional FlashMoBA comparison")
+    print("MoBA inference benchmark")
     print(f"device: {test_backend.get_device_name()}")
+    print(f"baseline: {baseline_name or 'unavailable'}")
     print(f"timing: warmup={WARMUP_MS}ms  rep={REPETITION_MS}ms")
     print(f"{'-' * TABLE_WIDTH}")
-    print(
-        f"{'Shape':<38} {'Flag ms':>8} {'CUDA ms':>7} {'Speedup':>8}"
-    )
+    print(f"{'Shape':<38} {'Flag ms':>8} {'Base ms':>8} {'Base/Flag':>10}")
     print(f"{'-' * TABLE_WIDTH}")
 
-    for shape, triton_ms, cuda_ms in results:
-        triton_speedup = None if cuda_ms is None else cuda_ms / triton_ms
-        cuda_text = "N/A" if cuda_ms is None else f"{cuda_ms:.3f}"
-        speedup_text = "N/A" if triton_speedup is None else f"{triton_speedup:.2f}x"
+    for shape, flag_ms, baseline_ms in results:
+        baseline_text = "N/A" if baseline_ms is None else f"{baseline_ms:.3f}"
+        speedup = None if baseline_ms is None else baseline_ms / flag_ms
+        speedup_text = "N/A" if speedup is None else f"{speedup:.2f}x"
         print(
-            f"{shape:<38} {triton_ms:>8.3f} {cuda_text:>7} "
-            f"{speedup_text:>8}"
+            f"{shape:<38} {flag_ms:>8.3f} {baseline_text:>8} "
+            f"{speedup_text:>10}"
         )
 
     print(f"{'-' * TABLE_WIDTH}")
-    print("Speedup = CUDA / Triton; > 1.00x means Triton wins.")
+    print("Base/Flag > 1.00x means FlagAttention is faster.")
     print(f"{'=' * TABLE_WIDTH}")
 
 
 @pytest.mark.parallel_moba
-def test_attn_varlen_moba_speed():
+def test_attn_varlen_moba_speed(record_property):
     if not test_backend.supports_operator("parallel_moba"):
         pytest.skip("MoBA benchmark requires an available accelerator")
-    compare_flash = test_backend.is_nvidia() and flash_moba_varlen_func is not None
-    if compare_flash:
+    baseline_name = baseline_fn = None
+    max_verified_seqlen = None
+    if flash_moba_varlen_func is not None:
+        baseline_name = "FlashMoBA"
+        baseline_fn = _flash_moba
         _validate_routing_contract()
-    else:
-        print("FlashMoBA comparison unavailable; measuring FlagAttention only")
+    elif mate_parallel_moba is not None:
+        # The experimental MATE baseline is verified only through 65536 tokens.
+        baseline_name = "MATE MoBA (experimental)"
+        baseline_fn = mate_parallel_moba
+        max_verified_seqlen = 65536
 
+    recorder = BenchmarkRecorder(
+        record_property,
+        op_name="parallel_moba",
+        dtype=str(BENCHMARK_CASES[0][-1]),
+        baseline=baseline_name,
+        phase="inference",
+    )
     results = []
     for (
         seq_lens,
@@ -285,44 +311,46 @@ def test_attn_varlen_moba_speed():
         dtype,
     ) in BENCHMARK_CASES:
         q, k, v, cu_seqlens, max_seqlen = generate_data(
-            seq_lens,
-            num_heads,
-            head_dim,
-            dtype,
+            seq_lens, num_heads, head_dim, dtype
         )
         args = (q, k, v, cu_seqlens, max_seqlen, chunk_size, topk)
+        case_baseline_fn = baseline_fn
+        if max_verified_seqlen is not None and max_seqlen > max_verified_seqlen:
+            case_baseline_fn = None
         shape = _format_shape(
-            seq_lens,
-            num_heads,
-            head_dim,
-            chunk_size,
-            topk,
-            dtype,
+            seq_lens, num_heads, head_dim, chunk_size, topk, dtype
         )
 
-        # A fast result is meaningful only when both providers compute the same
-        # operation. Mean error is used because near-tied routing scores can send
-        # a handful of queries to different chunks and inflate max error.
         with torch.no_grad():
-            triton_output = _triton_moba(*args)
-            assert triton_output.shape == q.shape
-            assert triton_output.dtype == dtype
-            assert torch.isfinite(triton_output).all()
-            if compare_flash:
-                cuda_output = _flash_moba(*args)
-                assert cuda_output.shape == q.shape
-                assert cuda_output.dtype == dtype
-                assert torch.isfinite(cuda_output).all()
+            flag_output = _triton_moba(*args)
+            assert flag_output.shape == q.shape
+            assert flag_output.dtype == dtype
+            assert torch.isfinite(flag_output).all()
+            mean_abs_diff = None
+            if case_baseline_fn:
+                base_output = case_baseline_fn(*args)
+                assert base_output.shape == q.shape
+                assert base_output.dtype == dtype
+                assert torch.isfinite(base_output).all()
                 mean_abs_diff = (
-                    (triton_output.float() - cuda_output.float()).abs().mean().item()
+                    (flag_output.float() - base_output.float()).abs().mean().item()
                 )
                 assert mean_abs_diff < MAX_MEAN_ABS_DIFF, (
-                    f"{shape}: mean absolute difference {mean_abs_diff:.3e} exceeds "
-                    f"{MAX_MEAN_ABS_DIFF:.1e}"
+                    f"{shape}: {baseline_name} mean absolute difference "
+                    f"{mean_abs_diff:.3e} exceeds {MAX_MEAN_ABS_DIFF:.1e}"
                 )
 
-        triton_ms = benchmark_kernel(_triton_moba, args)
-        cuda_ms = benchmark_kernel(_flash_moba, args) if compare_flash else None
-        results.append((shape, triton_ms, cuda_ms))
+        flag_ms = benchmark_kernel(_triton_moba, args)
+        baseline_ms = benchmark_kernel(case_baseline_fn, args) if case_baseline_fn else None
+        results.append((shape, flag_ms, baseline_ms))
+        recorder.add(
+            shape_detail=(seq_lens, num_heads, head_dim, chunk_size, topk),
+            latency=flag_ms,
+            latency_base=baseline_ms,
+            mean_abs_diff=mean_abs_diff,
+            baseline_used=baseline_name if case_baseline_fn else None,
+        )
+        del args, q, k, v, cu_seqlens
 
-    _print_results(results)
+    _print_results(results, baseline_name)
+    recorder.record()

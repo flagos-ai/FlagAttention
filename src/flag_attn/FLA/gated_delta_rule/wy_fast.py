@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_attn import runtime
 from flag_attn.FLA.compat import libentry, libtuner
 from flag_attn.utils import has_triton_tle
 from flag_attn.FLA.index import prepare_chunk_indices
@@ -48,11 +49,7 @@ def maybe_set_tle_recompute_allocator(device: torch.device, cu_seqlens: torch.Te
 @libentry()
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @libtuner(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=runtime.get_tuned_config("recompute_w_u_fwd_kernel"),
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -153,11 +150,7 @@ if HAS_TLE_RECOMPUTE_W_U:
 
     @libentry()
     @libtuner(
-        configs=[
-            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-            for num_warps in [2, 4]
-            for num_stages in [2, 3]
-        ],
+        configs=runtime.get_tuned_config("recompute_w_u_fwd_tle_kernel"),
         key=["H", "K", "V", "BT", "BK", "BV", "PIPE_STAGES"],
     )
     @triton.jit(do_not_specialize=["T"])

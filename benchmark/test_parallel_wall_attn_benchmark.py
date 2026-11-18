@@ -211,7 +211,7 @@ def _run_benchmark(dtype_name, dtype, record_property=None):
     record_benchmark_result(
         record_property,
         op_name="parallel_wall_attn",
-        dtype=dtype_name,
+        dtype=str(dtype),
         result=metrics,
         baseline="official_fla" if fla_wall_attn is not None else None,
         phase="forward",

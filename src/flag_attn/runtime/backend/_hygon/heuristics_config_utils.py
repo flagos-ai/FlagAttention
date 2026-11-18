@@ -12,4 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-HEURISTICS_CONFIGS = {}
+# AttnRes policy keyed by operation. The default preserves the current Hygon
+# threshold; add per-device overrides only after measuring them.
+HEURISTICS_CONFIGS = {
+    "fused_attnres": {
+        "default": {"join_reductions_max_rows": 1024},
+        "by_sm_count": {},
+    },
+}

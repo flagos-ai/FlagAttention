@@ -31,7 +31,7 @@ from ..triton_ops_helper import autotune_cache_kwargs, exp2
 from .wy_fast import recompute_w_u_fwd_gdn2
 
 IS_TF32_SUPPORTED = (
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+    torch.cuda.is_available() and torch.version.cuda is not None and torch.cuda.get_device_capability()[0] >= 8
 )
 
 IS_GATHER_SUPPORTED = hasattr(tl, "gather")

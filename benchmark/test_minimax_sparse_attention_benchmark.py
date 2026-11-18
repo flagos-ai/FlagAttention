@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark MiniMax M3 paged MSA on supported accelerator backends.
-
-When compatible vLLM kernels are installed, compare both implementations on
-matching inputs. Otherwise benchmark FlagAttention only. FP8 uses FP8 index
-queries, index keys and main KV cache.
-"""
 
 from __future__ import annotations
 
@@ -35,7 +29,6 @@ import pytest
 import torch
 import triton
 import triton.knobs
-import triton.testing as triton_testing
 
 try:
     from benchmark.recording import BenchmarkRecorder
@@ -43,7 +36,7 @@ except ModuleNotFoundError:  # Direct script execution.
     from recording import BenchmarkRecorder
 
 from flag_attn.testing import backend as test_backend
-from flag_attn import minimax_m3_sparse_attn
+from flag_attn import minimax_m3_sparse_attn, runtime
 from flag_attn.minimax_sparse_attention import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode,
@@ -73,8 +66,17 @@ try:
     VLLM_AVAILABLE = True
     VLLM_IMPORT_ERROR = ""
 except Exception as exc:  # vLLM is an optional benchmark baseline.
+    vllm_index_decode = None
+    vllm_index_score = None
+    vllm_index_topk = None
+    vllm_sparse_attn = None
+    vllm_sparse_attn_decode = None
     VLLM_AVAILABLE = False
     VLLM_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+# vLLM M3 prefill is validated on these vendors; other vLLM installs may
+# dispatch to a different backend and are not a trustworthy baseline.
+VLLM_BASELINE_VENDORS = {"nvidia", "hygon"}
 
 warnings.filterwarnings("ignore", message="tl.make_block_ptr is deprecated")
 triton.knobs.autotuning.adjust_block_size = False
@@ -100,7 +102,7 @@ _flag_attn_platform = _CachedPlatform(_flag_attn_index_module.current_platform)
 _flag_attn_index_module.current_platform = _flag_attn_platform
 _flag_attn_sparse_module.current_platform = _flag_attn_platform
 
-if VLLM_AVAILABLE:
+if VLLM_AVAILABLE and runtime.device.vendor_name in VLLM_BASELINE_VENDORS:
     _vllm_index_module = sys.modules[vllm_index_decode.__module__]
     _vllm_sparse_module = sys.modules[vllm_sparse_attn_decode.__module__]
     _vllm_platform = _CachedPlatform(_vllm_index_module.current_platform)
@@ -779,7 +781,11 @@ def _run_dtype(
     dtype_name: str,
     record_property: Callable[[str, object], None] | None = None,
 ) -> None:
-    run_vllm = VLLM_AVAILABLE and not args.no_vllm
+    run_vllm = (
+        VLLM_AVAILABLE
+        and runtime.device.vendor_name in VLLM_BASELINE_VENDORS
+        and not args.no_vllm
+    )
     if dtype_name == "fp8" and run_vllm and not _supports_fp8_scales():
         print("[baseline] vLLM FP8 skipped: k_scale/v_scale are unavailable")
         run_vllm = False
@@ -844,7 +850,7 @@ def _run_dtype(
                 "cannot exceed seq_len"
             )
 
-        generator = torch.Generator(device=device)
+        generator = torch.Generator(device="cpu" if device.type == "gcu" else device)
         generator.manual_seed(args.seed + shape_index + (100_000 if args.decode else 0))
         data = make_data(
             batch,
@@ -859,7 +865,7 @@ def _run_dtype(
             randomize_pages=not use_identity_pages,
             generator=generator,
         )
-        vllm_data = _vllm_data(data, vllm_layout) if vllm_layout else None
+        vllm_data = _vllm_data(data, vllm_layout) if run_vllm and vllm_layout else None
         flag_attn_output = torch.empty_like(data.q)
         vllm_output = torch.empty_like(data.q) if run_vllm else None
 
@@ -923,10 +929,16 @@ def _run_dtype(
 
         vllm_ms = None
         accuracy = None
-        if run_vllm:
+        can_compare = run_vllm
+        if can_compare:
             flag_attn_run()
-            vllm_run()
-            test_backend.device_fn.synchronize()
+            try:
+                vllm_run()
+                test_backend.device_fn.synchronize()
+            except Exception as error:
+                print(f"[baseline] vLLM skipped: {error}")
+                run_vllm = can_compare = False
+        if can_compare:
             assert vllm_output is not None and vllm_layout is not None
             accuracy = _check_outputs(
                 flag_attn_output,
@@ -954,13 +966,13 @@ def _run_dtype(
             (f"{batch}x{query_len}x{seq_len}x{num_kv_heads}x{num_heads}", 28),
             (f"{flag_attn_ms:.4f}", 13),
         ]
-        if run_vllm:
+        if vllm_layout is not None:
             row.extend(
                 [
-                    (f"{vllm_ms:.4f}", 10),
-                    (f"{vllm_ms / flag_attn_ms:.2f}x", 10),
-                    (f"{accuracy:.6f}", 9),
-                    ("pass", 6),
+                    (f"{vllm_ms:.4f}" if can_compare else "N/A", 10),
+                    (f"{vllm_ms / flag_attn_ms:.2f}x" if can_compare else "N/A", 10),
+                    (f"{accuracy:.6f}" if can_compare else "N/A", 9),
+                    ("pass" if can_compare else "N/A", 6),
                 ]
             )
         if args.per_step:
@@ -991,7 +1003,7 @@ def _run_dtype(
 
         # Release this shape before make_data allocates the next one. The
         # closures and provider tuple also hold references to GPU tensors.
-        if run_vllm:
+        if can_compare:
             del providers, timings
         del flag_attn_run, vllm_run, flag_attn_output, vllm_output, vllm_data, data, generator
         test_backend.device_fn.empty_cache()
@@ -1026,7 +1038,7 @@ def run_benchmark(
     if args.dtype not in {"all", "both", "bf16", "fp8"}:
         raise ValueError("MSA supports dtype all, bf16 or fp8")
     if args.dtype in {"fp8", "both", "all"} and not test_backend.supports_msa_fp8():
-        print("[FP8] skipped: this MSA backend or PyTorch build does not support FP8 inputs")
+        print("[FP8] unavailable on this backend; benchmarking supported dtype only")
     if args.dtype == "fp8" and not test_backend.supports_msa_fp8():
         return
     dtypes = (
@@ -1036,11 +1048,13 @@ def run_benchmark(
     )
 
     if args.no_vllm:
-        print("[baseline] vLLM skipped (--no-vllm)")
+        print("[baseline] vLLM disabled (--no-vllm)")
+    elif runtime.device.vendor_name not in VLLM_BASELINE_VENDORS:
+        print(f"[baseline] no validated vLLM MSA baseline for {runtime.device.vendor_name}")
     elif VLLM_AVAILABLE:
         print("[baseline] vLLM enabled")
     else:
-        print(f"[baseline] vLLM skipped ({VLLM_IMPORT_ERROR})")
+        print(f"[baseline] vLLM unavailable ({VLLM_IMPORT_ERROR})")
 
     for mode_index, decode in enumerate(modes):
         args.decode = decode

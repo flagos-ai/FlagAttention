@@ -11,9 +11,13 @@ FlagAttention is a collection of memory-efficient attention operators implemente
 Like [FlashAttention](https://arxiv.org/abs/2205.14135), the dense kernels tile the computation and recompute intermediates instead of materializing the full attention matrix. The repository also contains decoding, block-sparse, quantized, and recurrent operators that do not fit the standard scaled-dot-product-attention interface.
 
 > [!IMPORTANT]
-> The repository contains operators at different maturity levels. Only FlashAttention and Piecewise Attention are currently marked `stable`; the remaining operator families are `alpha`. [`conf/operators.yaml`](./conf/operators.yaml) is the source of truth for stages, tests, and benchmark entry points.
+> The repository contains operators at different maturity levels. Only FlashAttention and Piecewise Attention are currently marked `stable`; the remaining operator families are `alpha`, and their arguments and backend constraints may still change. [`conf/operators.yaml`](./conf/operators.yaml) is the source of truth for stages, tests, and benchmark entry points.
 
 ## Operator overview
+
+Twenty-six inventory entries are registered in [`conf/operators.yaml`](./conf/operators.yaml), covering the operator families below. Only FlashAttention and Piecewise Attention are `stable`; everything else is `alpha`.
+
+### Dense attention
 
 | Operator family | Public import | Main layout/use | Gradient support | Stage |
 | --- | --- | --- | --- | --- |
@@ -21,15 +25,40 @@ Like [FlashAttention](https://arxiv.org/abs/2205.14135), the dense kernels tile 
 | Piecewise Attention | `flag_attn.piecewise_attention` | Dense attention with two Q/K pairs selected by token distance | Forward + backward | Stable |
 | Split-KV FlashAttention | `flag_attn.flash_attention_split_kv` | Long-KV decoding and low-query-parallelism workloads | Forward | Alpha |
 | Paged Attention | `flag_attn.paged_attention` | Single-token queries over a paged KV cache | Forward | Alpha |
+
+### Sparse and block-sparse attention
+
+| Operator family | Public import | Main layout/use | Gradient support | Stage |
+| --- | --- | --- | --- | --- |
 | MiniMax M3 sparse attention | Six `flag_attn.minimax_m3_*` functions | 128-token page scoring, top-k selection, sparse prefill and decode | Inference | Alpha |
+| Parallel NSA | `flag_attn.parallel_nsa.parallel_nsa`, `parallel_nsa_compression` | Native sparse attention and compression; fixed or packed variable lengths | Forward + backward | Alpha |
+| InfLLM-V2 | `flag_attn.infllmv2_attention`, `infllmv2_decode` | Continuous-packed causal prefill with block selection, plus variable-length decode | Forward + backward (prefill) | Alpha |
+| Parallel MoBA | `flag_attn.parallel_moba` | Variable-length Mixture-of-Block-Attention with causal chunk routing | Forward + backward | Alpha |
+| Hy3 attention | `flag_attn.hy3_attention` | FP8 paged block-sparse prefill and six BF16/FP8 decode variants | Inference | Alpha |
+| Inkling FA4 relative attention | `flag_attn.inkling_fa4_rel_attention` | Paged varlen attention with relative-position logits; Triton and Hopper TLE | Inference | Alpha |
+
+### Recurrent and linear attention
+
+| Operator family | Public import | Main layout/use | Gradient support | Stage |
+| --- | --- | --- | --- | --- |
 | Chunk GLA | `flag_attn.chunk_gla` | Recurrent gated linear attention; `[B,T,H,D]`, fixed or packed variable lengths | Forward + backward | Alpha |
 | Chunk Gated Delta Rule | `flag_attn.chunk_gated_delta_rule` | Chunked delta-rule recurrence; head-first or sequence-first | Forward | Alpha |
 | GDN2 | `flag_attn.chunk_gdn2` | Chunked GDN2 prefill with native Triton/TLE and vendor paths | Forward/inference | Alpha |
 | Kimi Delta Attention | `flag_attn.chunk_kda` | Specialized chunked KDA inference; constraints depend on the active backend | Inference | Alpha |
-| SageAttention | `flag_attn.sage_attention.forward`, `per_block_int8` | Per-block INT8 Q/K quantization and attention; HND or NHD layout | Forward | Alpha |
-| Parallel NSA | `flag_attn.parallel_nsa.parallel_nsa`, `parallel_nsa_compression` | Native sparse attention and compression; fixed or packed variable lengths | Forward + backward | Alpha |
+| Log-Linear Attention | `flag_attn.log_linear_attn`, `chunk_log_linear_attn` | Dense log-linear attention with multi-level gate scales; TLE kernels | Forward | Alpha |
+| Parallax | `flag_attn.parallel_parallax` | Parameterized local linear attention; prefill, decode and KV-cache decode stages | Forward + backward (prefill) | Alpha |
+| Wall Attention | `flag_attn.parallel_wall_attn` | Gated windowed attention with optional sink bias and packed variable lengths | Forward + backward | Alpha |
 
-The top-level package exports the dense, paged, recurrent, KDA/GDN2, and MiniMax APIs. SageAttention and Parallel NSA are submodule APIs. Vendor-specific development interfaces are available under `flag_attn.runtime.backend._<vendor>` but are not treated as stable public APIs.
+### Quantized and fused operators
+
+| Operator family | Public import | Main layout/use | Gradient support | Stage |
+| --- | --- | --- | --- | --- |
+| SageAttention | `flag_attn.sage_attention.forward`, `per_block_int8` | Per-block INT8 Q/K quantization and attention; HND or NHD layout | Forward | Alpha |
+| DiffKV attention | `flag_attn.diffkv_attention` | Paged decode with asymmetric K/V head dimensions; Triton and TLE paths | Inference | Alpha |
+| Forgetting Attention | `flag_attn.parallel_forgetting_attn` | Attention with per-token log forget gates; SM90 TLE path with Triton fallback | Forward + backward | Alpha |
+| Fused AttnRes | `flag_attn.fused_attnres` | Softmax mixing of RMS-normalized residual sources, with optional fused output RMSNorm | Inference | Alpha |
+
+The top-level package exports every operator above except SageAttention and Parallel NSA, which are submodule APIs. Vendor-specific development interfaces are available under `flag_attn.runtime.backend._<vendor>` but are not treated as stable public APIs.
 
 ## Requirements and backends
 
@@ -40,9 +69,24 @@ The top-level package exports the dense, paged, recurrent, KDA/GDN2, and MiniMax
 
 PyTorch and accelerator runtimes are intentionally not hard dependencies in [`pyproject.toml`](./pyproject.toml), because the correct packages depend on the device and driver stack. Install the appropriate PyTorch build before FlagAttention.
 
-The runtime recognizes `nvidia`, `amd`, `hygon`, `iluvatar`, `metax`, `enflame`, `ascend`, `cambricon`, `mthreads`, `intel`, and `cpu` for device metadata and explicit selection. Recognition does not mean that every operator is implemented or tested on every backend; consult [`conf/operators.yaml`](./conf/operators.yaml), the backend packages in [`src/flag_attn/runtime/backend`](./src/flag_attn/runtime/backend), and the relevant tests for operator-level coverage.
+The runtime recognizes `nvidia`, `amd`, `hygon`, `iluvatar`, `metax`, `thead`, `enflame`, `ascend`, `cambricon`, `mthreads`, `intel`, and `cpu` for device metadata and explicit selection. Recognition does not mean that every operator is implemented or tested on every backend; consult [`conf/operators.yaml`](./conf/operators.yaml), the backend packages in [`src/flag_attn/runtime/backend`](./src/flag_attn/runtime/backend), and the relevant tests for operator-level coverage.
 
-Backend routing is also operator-specific. The top-level GDN2/KDA APIs select specialized Enflame, MetaX, and MThreads implementations; MiniMax M3 selects its MetaX implementation. Other vendor extensions may require their backend submodule. Do not assume that every top-level API dispatches to every detected vendor.
+Backend routing is operator-specific and name-based. Each vendor package declares an `_OPERATOR_EXPORTS` table; a public API resolves to the vendor implementation when that table names it, and otherwise keeps the generic Triton implementation. A declared override that fails to import or run is an error rather than a silent fallback. The generic implementations target NVIDIA, so `_nvidia` declares no overrides and supplies only tuning configuration.
+
+Vendor packages currently ship overrides for these operator families:
+
+| Backend | Device | Operator families with vendor implementations |
+| --- | --- | --- |
+| `_nvidia` | `cuda` | None; generic Triton paths plus `tune_configs.yaml` |
+| `_metax` | `cuda` | MiniMax M3, SageAttention, NSA, GLA, KDA, GDN2, AttnRes |
+| `_hygon` | `cuda` | MiniMax M3, SageAttention, NSA, GLA, KDA, AttnRes, and a private `mla` family |
+| `_mthreads` | `musa` | MiniMax M3, SageAttention, NSA, GLA, KDA, GDN2, MoBA |
+| `_enflame` | `gcu` | MiniMax M3, SageAttention, NSA, GLA, KDA, GDN2, AttnRes, Parallax |
+| `_ascend` | `npu` | Gated Delta Rule, Parallax, GDN2, SageAttention |
+| `_thead` | `cuda` | MiniMax M3, Wall Attention |
+| `_iluvatar` | `cuda` | None declared yet |
+
+Note that the two `stable` dense families, FlashAttention and Piecewise Attention, have no vendor overrides at all and run their generic Triton kernels everywhere. Do not assume that every top-level API dispatches to every detected vendor.
 
 Device metadata follows the FlagGems/FlagGems-vLLM convention:
 
@@ -234,26 +278,45 @@ Both `HND` (`[B,H,N,D]`) and `NHD` (`[B,N,H,D]`) layouts are supported. Q is qua
 
 `forward` always returns `(out, lse)`; when `return_lse=False`, `lse` is an empty CPU tensor. The public `flag_attn.sage_attention` submodule automatically selects the Ascend implementation on an available NPU; other vendor-specific SageAttention implementations use their backend development modules.
 
-## Recurrent and linear attention APIs
+## Recurrent, linear, and remaining operator APIs
+
+### Recurrent and linear attention
 
 GLA, GDN2, and KDA use sequence-first `[B,T,H,D]`. Gated Delta Rule defaults to head-first `[B,H,T,D]` with `head_first=True`, and also accepts sequence-first input. Most recurrent APIs return `(output, final_state)` and support packed variable-length sequences through `cu_seqlens`.
 
 - [`chunk_gla`](./src/flag_attn/FLA/gated_linear_attention/chunk_gla.py) implements chunked gated linear attention with autograd and optional initial/final recurrent states.
 - [`chunk_gated_delta_rule`](./src/flag_attn/FLA/gated_delta_rule/api.py) provides a forward-only delta-rule implementation. `head_first=True` uses `[B,H,T,D]`; `BT` is currently fixed at 64.
 - [`chunk_gdn2`](./src/flag_attn/gdn2/chunk.py) dispatches between native Triton, TLE, and vendor-specific GDN2 forward paths.
-- [`chunk_kda`](./src/flag_attn/FLA/chunk_kda.py) is an inference API. The generic CUDA path requires Triton TLE 3.6 or newer, inference mode, BF16 inputs, `K=V=128`, chunk size 16, V-first state, and gate parameters; vendor implementations may differ.
-- [`parallel_nsa`](./src/flag_attn/parallel_nsa) contains Native Sparse Attention selection and compression operators with fixed-length and packed-variable-length support. `parallel_nsa` needs either precomputed `block_indices` or `g_cmp`, and `Hq/Hkv` must be a power of two and at least 16. Sliding-window composition additionally needs `g_swa` and the external `flash-attn` package. For fixed-length input, the compression API consumes full-length Q and K/V with time dimension `ceil(T / block_size)`, then returns `(output, lse)`; packed input stores the per-sequence compressed blocks consecutively. The registered NSA tests import the Enflame-specific modules, so they do not establish coverage for the public `flag_attn.parallel_nsa` submodule on other backends.
+- [`chunk_kda`](./src/flag_attn/FLA/chunk_kda.py) is an inference API. The generic CUDA path needs a Triton build providing TLE, and rejects grad-enabled calls, non-BF16 or non-contiguous inputs, `K != 128`, `V != 128`, and GVA. Chunk size defaults to 16; vendor implementations may differ.
+- [`log_linear_attn`](./src/flag_attn/FLA/log_linear_attn/chunk_tle.py) is a dense, forward-only Log-Linear Attention entry built on TLE kernels. It takes `(q, k, v, g, level_scales)`, where `level_scales` supplies the per-level gate scales. `chunk_log_linear_attn` is the same function under its inventory name.
+- [`parallel_parallax`](./src/flag_attn/FLA/parallax) is parameterized local linear attention with a single public entry and three stages selected by `stage=`. Prefill (`"prefill"`, the default) takes `(q, r, k, v)` with `q/r: [B,T,HQ,D]` and `k/v: [B,T,H,D]`, supports GQA, autograd, an optional `window_size`, and packed variable lengths via `cu_seqlens`. Note that `r` is not pre-scaled by `scale`. The `"decode"` and `"kvcache"` stages route to the KV-cache decode kernels.
+- [`parallel_wall_attn`](./src/flag_attn/FLA/wall_attn/parallel.py) is gated windowed attention taking `(q, k, v, g)` with optional `g_scalar`, `sink_bias`, `window_size`, and `cu_seqlens`. It provides forward and backward. The public entry validates its inputs and picks a numerically checked fast path or the general implementation; validation synchronizes with the host, so graph capture always uses the general path.
+
+### Native Sparse Attention
+
+[`parallel_nsa`](./src/flag_attn/parallel_nsa) contains Native Sparse Attention selection and compression operators with fixed-length and packed-variable-length support, selected through `mode=`. `parallel_nsa` needs either precomputed `block_indices` or `g_cmp`, and `Hq/Hkv` must be a power of two and at least 16. Sliding-window composition additionally needs `g_swa` and the external `flash-attn` package. For fixed-length input, the compression API consumes full-length Q and K/V with time dimension `ceil(T / block_size)`, then returns `(output, lse)`; packed input stores the per-sequence compressed blocks consecutively.
+
+### Other sparse and fused operators
+
+- [`infllmv2_attention`](./src/flag_attn/infllmv2) runs continuous-packed causal prefill by default and variable-length decode with `stage="decode"`. Prefill takes packed `q/k/v` with `cu_seqlens_q`, `cu_seqlens_k`, and the two max lengths; each Q sequence is the suffix of its KV sequence, so KV must contain the cached prefix plus the current chunk. Block selection parameters live in `InfLLMV2Config`, which currently supports causal mode only. Gradients flow through all supplied Q/K/V. The operator performs no paged-cache or in-place cache updates.
+- [`parallel_moba`](./src/flag_attn/FLA/moba/parallel.py) is causal variable-length MoBA over packed `[seqlen, heads, head_dim]` tensors, taking `cu_seqlens`, `max_seqlen`, `moba_chunk_size`, and `moba_topk`. `moba_topk` counts the current causal chunk, matching FlashMoBA. It supports MHA/GQA/MQA, head dimensions up to 256, and top-k up to 64. The inference path deliberately skips host-side validation of value-dependent metadata; the autograd path retains it.
+- [`hy3_attention`](./src/flag_attn/hpc_ops_attention) exposes FP8 paged block-sparse prefill (`stage="prefill"`) and six decode implementations selected by `variant=`: `bf16_static`, `bf16_dynamic`, `fp8_qk_static`, `fp8_qk_dynamic`, `fp8_kv_static`, `fp8_kv_dynamic`. Here `qk` means per-token Q/K with per-head V quantization, and `kv` means per-token Q with per-tensor K/V quantization; `static` and `dynamic` select the scheduling policy. Decode forwards `(inputs, workspace)` unchanged, so prepare the workspace with the matching implementation module first. This family requires PyTorch 2.7.0.
+- [`inkling_fa4_rel_attention`](./src/flag_attn/inkling_fa4) is inference-only paged varlen attention that adds relative-position logits, with arguments mirroring the vLLM operator of the same name. Caches use `[num_blocks, block_size, num_kv_heads, head_dim]`. `backend=` accepts `"auto"` (default), `"triton"`, or `"tle"`, and `INKLING_FA4_BACKEND` sets the same choice; auto prefers TLE and falls back to Triton when TLE is unavailable or the layout is unsupported.
+- [`diffkv_attention`](./src/flag_attn/diffkv_attention/api.py) is paged decode with asymmetric K/V head dimensions: `query: [B,Hq,Dqk]`, `key_cache: [NB,BS,Hkv,Dqk]`, `value_cache: [NB,BS,Hkv,Dv]`, returning `[B,Hq,Dv]`. `window_size=-1` means full context; `path` selects the `"2d"` or `"3d"` launch, with `num_segments` controlling split-KV on the 3D path; `backend` accepts `"auto"`, `"tle"`, or `"triton"`.
+- [`parallel_forgetting_attn`](./src/flag_attn/forgetting_attention/parallel.py) adds per-token log forget gates through `log_fgate`, with `head_first=`, `seq_start=`, `sm_scale=`, and `adaptive_threshold=`. On SM90 with compatible TLE it uses the TLE kernel; otherwise the ordinary Triton kernel handles head dimensions 16, 32, 60, 64, 100, and 128 by zero-padding without changing attention scaling or pruning.
+- [`fused_attnres`](./src/flag_attn/FLA/attnres/fused.py) aggregates residual sources: each source is RMS-normalized for scoring against `query`, then a softmax over the source axis mixes the original residuals, with `output_rms_weight` optionally fusing the next sublayer's RMSNorm. It is inference-only with no autograd formula, tuned for Kimi K3 shapes, and supports up to 16 sources and hidden sizes up to 8192.
 
 These alpha APIs are optimized for specific model layouts. Read their docstrings and tests before integrating them; arguments and backend constraints may change.
 
 ## Tests
 
-Install the development dependencies and list the operator inventory without probing a GPU:
+Install the development dependencies:
 
 ```sh
 pip install -e ".[triton,test]"
-python tools/run_tests.py --list-ops --stages all
 ```
+
+The operator inventory itself is [`conf/operators.yaml`](./conf/operators.yaml); read it directly to see which stages, tests, and benchmark entry points are registered.
 
 Run the full pytest suite in a compatible CUDA environment:
 
@@ -266,9 +329,12 @@ The dense operators are compared against FP32 PyTorch references. Their accuracy
 The inventory-driven scheduler runs `stable` operators by default and distributes work across selected CUDA GPUs:
 
 ```sh
-python tools/run_tests.py --stages stable --gpus 0 --skip-benchmarks
+python tools/run_tests.py --stages stable --gpus 0
 python tools/run_tests.py --stages all --gpus all --dump-output
+python tools/run_tests.py --ops "sage_attention,chunk_gla" --gpus 0
 ```
+
+Operator selection follows `--ops` > `--op-list-file` > `--stages`.
 
 Use the pytest recorder for FlagGems-compatible case-level JSON. It also writes an operator-level upload summary as `summary.json` beside the requested output:
 
@@ -299,28 +365,65 @@ The requested `performance_result.json` contains each measured shape's baseline 
 
 The path-free pytest command collects the pytest benchmark tests under `benchmark/`. Standalone benchmark scripts are run directly and do not contribute data to this pytest JSON file.
 
+### Comparing against an NVIDIA baseline
+
+[`baseline/`](./baseline) holds NVIDIA reference implementations, one module per operator, each declaring its shapes, dtypes, input builders, and the upstream callable it measures. Pass a baseline JSON produced from those references to compare a non-NVIDIA run shape by shape:
+
+```sh
+pytest benchmark -m "chunk_gla" --record json --base-data nvidia_baseline.json -vs
+```
+
+Each matched shape then carries a `compared_speedup` alongside the on-machine `speedup`. When the baseline supplies `_scaling_factors` for the running chip, the comparison is divided by the factor matching that shape's bottleneck resource, so the number reflects efficiency rather than raw hardware difference. Unmatched shapes record a `base_miss_reason`; a shape with neither an on-machine reference nor a baseline match fails the run instead of reporting an unqualified number. Without `--base-data` the comparison is simply disabled.
+
 The scheduler runs accuracy tests before benchmarks. Under each operator's output directory, human-readable benchmark output is saved as `performance_stdout.log`, while structured records from each benchmark script are saved separately as `performance_records_0.log`, `performance_records_1.log`, and so on. These records use FlagGems-compatible `[INFO] {` JSON lines containing shapes, baseline latency, FlagAttention latency, and speedup when a baseline is available. Raw records use `speedup: null` without a baseline; the FlagGems-compatible `--record json` report omits those shape rows so FlagGems reports the dtype as `Unknown`.
 
 Direct script execution without a record path still prints machine records to stdout for older schedulers. Set `FLAG_ATTN_BENCHMARK_LOG_PATH=/path/to/records.log` to keep direct console output free of JSON. Existing tables, plots, and matmul-based throughput remain available; the `flash_decoding_benchmark.py` plot axis now correctly says milliseconds. Historical v0.2 plots remain under [`assets/v0.2`](./assets/v0.2); rerun the current benchmark for conclusions about current code, Triton, and hardware.
 
 ## Repository layout
 
+The package has three layers: generic Triton implementations written against NVIDIA, a runtime that detects the vendor and resolves each operator by name, and vendor packages that override individual operators.
+
 ```text
 FlagAttention/
 ├── src/flag_attn/
-│   ├── flash.py, piecewise.py, split_kv.py, paged.py
-│   ├── minimax_sparse_attention/   # MiniMax M3 index + sparse attention
-│   ├── sage_attention/             # INT8 Q/K quantization + attention
+│   ├── __init__.py                 # Public API facade; lazy per-operator dispatch
+│   │
+│   │   # Layer 1 -- generic implementations, pure Triton, NVIDIA as the reference
+│   ├── flash.py, piecewise.py, split_kv.py, total.py, paged.py, dropout.py
+│   ├── utils.py                    # has_triton_tle(), is_sm90_device(), tensor_cache
+│   ├── FLA/                        # GLA, Gated Delta Rule, KDA, log-linear, MoBA,
+│   │                               #   Parallax, Wall Attention, AttnRes, shared chunk helpers
+│   ├── gdn2/                       # GDN2 facade + native/ Triton kernels
 │   ├── parallel_nsa/               # NSA selection and compression
-│   ├── FLA/                        # GLA, Gated Delta Rule, KDA helpers
-│   ├── gdn2/                       # Generic GDN2 implementation
-│   ├── runtime/backend/            # Device detection and vendor backends
-│   └── testing/                    # PyTorch reference implementations
-├── tests/                          # Accuracy and dispatch tests
+│   ├── minimax_sparse_attention/   # MiniMax M3 index + sparse attention
+│   ├── infllmv2/                   # InfLLM-V2 prefill, backward, decode
+│   ├── hpc_ops_attention/          # Hy3 FP8 prefill + six decode variants
+│   ├── sage_attention/             # INT8 Q/K quantization + attention
+│   ├── diffkv_attention/           # Paged DiffKV, Triton and TLE paths
+│   ├── inkling_fa4/                # FA4 relative attention, Triton and TLE paths
+│   ├── forgetting_attention/       # Forgetting Attention + naive reference
+│   │
+│   │   # Layer 2 -- vendor dispatch
+│   ├── runtime/
+│   │   ├── accelerator.py          # Torch device abstraction for optional backends
+│   │   ├── configs_loader.py       # Reads backend/_<vendor>/tune_configs.yaml
+│   │   └── backend/
+│   │       ├── device_finder.py    # Vendor detection and device-type mapping
+│   │       ├── op_registry.py      # resolve_operator(): vendor override or generic
+│   │       │
+│   │       │   # Layer 3 -- vendor implementations, may use TLE
+│   │       ├── _nvidia/            # No overrides; tune_configs.yaml only
+│   │       ├── _metax/  _hygon/  _mthreads/  _enflame/
+│   │       └── _ascend/  _thead/  _iluvatar/
+│   │
+│   └── testing/                    # PyTorch reference implementations + test helpers
+├── tests/flag_attn/                # Accuracy and dispatch tests, one file per operator
 ├── benchmark/                      # Performance entry points
+├── baseline/                       # NVIDIA reference implementations for comparison
 ├── examples/                       # Small usage programs
 ├── conf/operators.yaml             # Operator stage/test/benchmark inventory
 ├── tools/run_tests.py              # Multi-device test scheduler
+├── .github/configs/backends/       # Per-machine CI configuration
 └── packaging/                      # Debian/RPM packaging
 ```
 
@@ -330,8 +433,9 @@ FlagAttention/
 - Operator and dtype coverage varies by backend. Do not infer support only from successful backend detection.
 - FlashAttention and Piecewise Attention require head dimensions in `{16, 32, 64, 128}`; paged and specialized operators have their own constraints.
 - FlashAttention dropout cannot run when the automatic dispatcher selects split-KV.
-- Split-KV, paged, MiniMax M3, recurrent/linear, SageAttention, and NSA APIs are currently alpha.
-- Several TLE paths require a specific recent Triton build and stricter shapes than their native fallbacks.
+- Every operator family except FlashAttention and Piecewise Attention is currently alpha, including all of the sparse, recurrent, quantized, and fused operators listed above.
+- Several TLE paths require a Triton build that provides TLE and accept stricter shapes than their native fallbacks. Hy3 additionally requires PyTorch 2.7.0, and NSA sliding-window composition requires the external `flash-attn` package.
+- Many operators are forward- or inference-only; the operator overview tables state which provide gradients.
 
 ## More
 

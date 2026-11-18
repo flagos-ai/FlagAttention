@@ -2249,7 +2249,7 @@ def chunk_gla(
     output_final_state: bool = False,
     state_v_first: bool = False,
     cu_seqlens: torch.Tensor | None = None,
-    # cu_seqlens_cpu: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:

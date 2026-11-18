@@ -1112,6 +1112,8 @@ def _parallel_wall_attn_fast_path(
     unsafe = torch.zeros((), device=q.device, dtype=torch.int32)
 
     fwd.prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe)
+    if unsafe.item() != 0:
+        return None
 
     fwd.parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, capacity=2, scale=scale)
     return output
