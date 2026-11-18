@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_attn import runtime
 from flag_attn.FLA.compat import libentry, libtuner
 from flag_attn.FLA.index import prepare_chunk_indices
 from flag_attn.FLA.utils import is_tma_supported
@@ -70,12 +71,7 @@ def _store_gated_inverse_block(
     }
 )
 @libtuner(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=runtime.get_tuned_config("chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel"),
     key=["H", "K", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])

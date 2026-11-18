@@ -24,7 +24,6 @@ from typing import Callable
 import pytest
 import torch
 import torch.nn.functional as F
-import triton
 
 try:
     from benchmark.recording import BenchmarkRecorder

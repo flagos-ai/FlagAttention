@@ -42,8 +42,21 @@ test = [
     "pytest>=7.1.0",
     "PyYAML>=6.0",
     "distro==1.9.0",
-    "flash-linear-attention[cuda]",
 ]
+
+nvidia = [
+    "flash-linear-attention[cuda]",  # GLA, GDN, AttnRes, Parallax, Wall
+    "flash-moba @ git+https://github.com/mit-han-lab/flash-moba.git@39d9ac043b271d046a2181a9991e99a26b67bca1",  # MoBA
+    "flash-attn-4[cu13] @ git+https://github.com/Dao-AILab/flash-attention.git@54b044c8cf897dfcc2577a665559d1bfda0bfc80#subdirectory=flash_attn/cute",  # Inkling FA4
+]
+[tool.uv]
+# These hardware-specific packages are already supplied by the runtime image.
+exclude-dependencies = [
+    "numpy",
+    "torch",
+    "triton",
+]
+no-build-isolation-package = ["flash-moba"]
 
 [project.urls]
 homepage = "https://github.com/FlagOpen/FlagAttention"

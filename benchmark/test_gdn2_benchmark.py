@@ -1,23 +1,31 @@
-"""Standalone latency benchmark for the GDN2 native and TLE forward paths."""
-
-from __future__ import annotations
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 
 import argparse
 import math
-from collections.abc import Callable
 
 import pytest
 import torch
-import triton
 
 try:
     from benchmark.recording import BenchmarkRecorder
-except ModuleNotFoundError:  # Direct script execution.
+except ModuleNotFoundError:
     from recording import BenchmarkRecorder
 
 from flag_attn.testing import backend as test_backend
-from flag_attn import chunk_gdn2
+from flag_attn import chunk_gdn2, runtime
 from flag_attn.gdn2.chunk import HAS_TLE_GDN2
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
 
@@ -85,7 +93,7 @@ def _native_forward(inputs):
 
 
 @torch.inference_mode()
-def _tle_forward(inputs):
+def _public_forward(inputs):
     q, k, v, g, b, w, initial_state = inputs
     return chunk_gdn2(
         q,
@@ -97,13 +105,17 @@ def _tle_forward(inputs):
         scale=q.shape[-1] ** -0.5,
         initial_state=initial_state,
         output_final_state=True,
-        chunk_size=16,
+        chunk_size=(
+            16
+            if HAS_TLE_GDN2 or runtime.device.vendor_name in {"mthreads", "metax"}
+            else 64
+        ),
     )
 
 
 def run_benchmark(
     argv: list[str] = (),
-    record_property: Callable[[str, object], None] | None = None,
+    record_property=None,
 ) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
@@ -115,18 +127,20 @@ def run_benchmark(
 
     if not test_backend.supports_operator("chunk_gdn2"):
         raise RuntimeError("GDN2 benchmark requires an available accelerator")
-    compare_native = test_backend.device == "cuda"
+    compare_native = HAS_TLE_GDN2
+    baseline_name = "FlagAttention native Triton" if compare_native else None
 
     dtype = getattr(torch, args.dtype)
     shapes = args.shape or (ALL_SHAPES if args.full else DEFAULT_SHAPES)
     print(f"GPU: {test_backend.get_device_name()} | dtype: {args.dtype}")
-    print("B,T,H,K,V                     native_ms   public_ms     speedup")
+    print(f"baseline: {baseline_name or 'unavailable'}")
+    print("B,T,H,K,V                       base_ms   public_ms   base/public")
     print("-" * 66)
     recorder = BenchmarkRecorder(
         record_property,
         op_name="chunk_gdn2",
         dtype=str(dtype),
-        baseline="native" if compare_native else None,
+        baseline=baseline_name,
         phase="forward",
     )
     for shape in shapes:
@@ -134,19 +148,19 @@ def run_benchmark(
         inputs = _make_inputs(shape, dtype)
         if compare_native:
             _native_forward(inputs)
-        _tle_forward(inputs)
+        _public_forward(inputs)
         test_backend.device_fn.synchronize()
         native_ms = test_backend.do_bench(
             lambda: _native_forward(inputs), warmup=args.warmup, rep=args.rep
         ) if compare_native else None
-        tle_ms = test_backend.do_bench(
-            lambda: _tle_forward(inputs), warmup=args.warmup, rep=args.rep
+        public_ms = test_backend.do_bench(
+            lambda: _public_forward(inputs), warmup=args.warmup, rep=args.rep
         )
         shape_text = ",".join(str(item) for item in shape)
         baseline_text = "N/A" if native_ms is None else f"{native_ms:.4f}"
-        speedup_text = "N/A" if native_ms is None else f"{native_ms / tle_ms:.3f}x"
-        print(f"{shape_text:<28} {baseline_text:>10} {tle_ms:>11.4f} {speedup_text:>11}")
-        recorder.add(shape_detail=shape, latency_base=native_ms, latency=tle_ms)
+        speedup_text = "N/A" if native_ms is None else f"{native_ms / public_ms:.3f}x"
+        print(f"{shape_text:<28} {baseline_text:>10} {public_ms:>11.4f} {speedup_text:>11}")
+        recorder.add(shape_detail=shape, latency_base=native_ms, latency=public_ms)
         del inputs
         test_backend.device_fn.empty_cache()
     recorder.record()

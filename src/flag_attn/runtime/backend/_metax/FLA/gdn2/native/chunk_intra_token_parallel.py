@@ -21,7 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ..tuning import get_tuned_config
+from flag_attn.runtime import get_tuned_config
 
 from ...compat import autotune_cache_kwargs, exp2
 
@@ -32,14 +32,7 @@ from ...compat import autotune_cache_kwargs, exp2
     }
 )
 @triton.autotune(
-    configs=get_tuned_config(
-        "chunk_gdn2_fwd_kernel_intra_token_parallel",
-        fallback=[
-            triton.Config({"BH": BH}, num_warps=num_warps)
-            for BH in [1, 2, 4, 8]
-            for num_warps in [1, 2, 4, 8]
-        ],
-    ),
+    configs=get_tuned_config("chunk_gdn2_fwd_kernel_intra_token_parallel"),
     key=["K", "H"],
     **autotune_cache_kwargs,
 )

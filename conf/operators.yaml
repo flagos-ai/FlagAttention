@@ -75,7 +75,6 @@ ops:
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_two_kernel_matches_native
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_two_kernel_configs
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_fwd_hybrid_matches_two_kernel
-      - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_hybrid_matches_fla
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_public_api_uses_two_kernel
     benchmark: benchmark/test_gated_delta_rule_benchmark.py
   - id: chunk_gdn2

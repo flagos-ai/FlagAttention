@@ -351,8 +351,9 @@ if TLE_AVAILABLE:
         rd=tl.arange(0,D)
         pp=PREFIX+(b*H+h)*N
         gq=tl.load(pp+N-1)
-        mi=tl.full((),-float("inf"),tl.float32)
-        li=tl.zeros((),tl.float32)
+        # Keep a rank-2 parent layout for the decode reductions.
+        mi=tl.full((1,),-float("inf"),tl.float32)
+        li=tl.zeros((1,),tl.float32)
         acc=tl.zeros([D],tl.float32)
         log2e:tl.constexpr=1.4426950408889634
         scale=sm_scale*log2e
@@ -368,19 +369,19 @@ if TLE_AVAILABLE:
                 tle.gpu.copy(KDESC,ks.slot(nxt),[BN,D],[b*N+start+BN,hk*D],barrier=kb[nxt])
                 tle.gpu.copy(VDESC,vs.slot(nxt),[BN,D],[b*N+start+BN,hk*D],barrier=vb[nxt])
             product=tle.gpu.set_layout((q[None,:]*k).to(dtype).to(tl.float32),PV_LAYOUT)
-            score=tl.sum(product,1)*scale
+            score=tl.sum(product,1)[:,None]*scale
             # A nonzero masked filler avoids CSE with the D-wide zero accumulator.
             # Invalid logits are replaced by -inf below, so this filler is unobservable.
-            gk=tl.load(pp+start+rn,start+rn<N,other=-10000)
+            gk=tl.load(pp+start+rn,start+rn<N,other=-10000)[:,None]
             score=tl.fma(gq-gk,log2e,score)
-            score=tl.where(start+rn<N,score,-float("inf"))
+            score=tl.where((start+rn<N)[:,None],score,-float("inf"))
             mnew=tl.maximum(mi,tl.max(score,0))
             alpha=tl.exp2(mi-mnew)
-            p=tl.exp2(score-mnew)
+            p=tl.exp2(score-mnew[None,:])
             psum=tl.sum(p,0)
             tle.gpu.barrier_wait(vb[slot],phaseIdx=phase)
             v=tl.load(tl.max_contiguous(tl.multiple_of(tle.gpu.local_ptr(vs.slot(slot)),[1,8]),[1,8]))
-            product_v=tle.gpu.set_layout(p[:,None]*v,PV_LAYOUT)
+            product_v=tle.gpu.set_layout(p*v,PV_LAYOUT)
             acc=acc*alpha+tl.sum(product_v,0)
             li=li*alpha+psum
             mi=mnew

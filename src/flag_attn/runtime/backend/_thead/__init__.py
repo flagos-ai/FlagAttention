@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "inkling_fa4_rel_attention": (".inkling_fa4.relative_attention", "inkling_fa4_rel_attention"),
     "SPARSE_BLOCK_SIZE": (".minimax_sparse_attention.index_topk", "SPARSE_BLOCK_SIZE"),
     "minimax_m3_index_decode": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode"),
     "minimax_m3_index_decode_score": (
@@ -31,6 +32,18 @@ _OPERATOR_EXPORTS = {
     "minimax_m3_sparse_attn_decode": (
         ".minimax_sparse_attention.sparse_attn",
         "minimax_m3_sparse_attn_decode",
+    ),
+    "parallel_wall_attn": (
+        ".FLA.wall_attn.parallel",
+        "parallel_wall_attn",
+    ),
+    "log_linear_attn": (
+        ".FLA.log_linear_attn.log_linear_attn",
+        "log_linear_attn",
+    ),
+    "chunk_log_linear_attn": (
+        ".FLA.log_linear_attn.log_linear_attn",
+        "chunk_log_linear_attn",
     ),
 }
 

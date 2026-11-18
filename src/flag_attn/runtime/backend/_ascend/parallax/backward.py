@@ -325,7 +325,7 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
             raise ValueError("packed varlen backward requires B == 1")
         offsets = cu_seqlens.detach().cpu().tolist()
         segments = [(int(start), int(end - start), 0) for start, end in zip(offsets[:-1], offsets[1:])]
-    inline_delta = segments is None and total_t <= 128
+    inline_delta = segments is None and total_t <= 128 and bd <= 64
     use_staged = (
         segments is None
         and not inline_delta
