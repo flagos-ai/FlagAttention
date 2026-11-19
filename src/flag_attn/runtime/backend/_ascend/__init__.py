@@ -15,7 +15,6 @@ _OPERATOR_EXPORTS = {
         "fused_recurrent_gated_delta_rule_packed_decode",
     ),
     "chunk_gdn2": (".gdn2", "chunk_gdn2"),
-    "parallel_wall_attn": (".FLA.wall_attn", "parallel_wall_attn"),
     "parallel_parallax": (".parallax", "parallel_parallax"),
     "parallax_decode": (".parallax", "parallax_decode"),
     "parallax_attn_with_kvcache": (".parallax", "parallax_attn_with_kvcache"),
@@ -25,6 +24,7 @@ _OPERATOR_EXPORTS = {
     "sage_attention": (".attn_qk_int8_per_block", "forward"),
     "sage_attention_forward": (".attn_qk_int8_per_block", "forward"),
     "sage_attention_per_block_int8": (".ops", "quant_per_block_int8"),
+    "parallel_wall_attn": (".FLA.wall_attn.api", "parallel_wall_attn"),
 }
 
 __all__ = sorted(_OPERATOR_EXPORTS)

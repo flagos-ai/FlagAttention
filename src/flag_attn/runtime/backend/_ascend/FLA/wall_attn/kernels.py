@@ -1,18 +1,32 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
-"""Ascend Triton kernel for the Wall attention forward pass.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Upstream: https://github.com/fla-org/flash-linear-attention/tree/main/fla/ops/wall_attn
 
-Score for pair (i, j) is ``sum_n q_in k_jn exp2(P_in - P_jn) * scale * log2(e)``
-with ``P`` the per-channel log2 prefix of the gate.  The decay is folded into the
-operands per block: with an anchor ``R``, ``q_til = q*exp2(P_q - R)`` and
-``k_til = k*exp2(R - P_k)``, so the score is a plain dot product of rescaled
-operands.
+"""Fused Wall attention forward kernel for Ascend.
 
-A single KV loop covers both the fully-causal blocks (anchor = the program's
-first query row) and the diagonal block (local anchor, per-tile causal mask).
-The anchored operands are bounded by the raw q/k, so all blocks share one score
-range and no online max / accumulator rescale is needed: that bookkeeping was
-measured to be most of this kernel's time on Ascend.
+The first query row's gate prefix anchors the Q/K rescaling for every KV
+tile. The kernel applies causal and optional window masks before accumulating
+exponential weights and weighted values.
 """
 
 import triton
@@ -107,10 +121,7 @@ def _wall_fwd_kernel(
         b_pk = tl.load(g_cumsum + pk_col[None, :] + rn[:, None],
                        mask=msk_s[None, :] & msk_n[:, None], other=0.0).to(tl.float32)
 
-        # One anchor for every block (the program's first query row): q is
-        # rescaled once outside the loop, only k is rescaled per block.  The
-        # decay over one block keeps the exponent small for realistic gates, and
-        # is clamped so pathological gates cannot overflow.
+        # Cap the key exponent before rescaling in the shared anchor frame.
         b_k_use = (b_k.to(tl.float32)
                    * exp2(tl.minimum(b_R[:, None] - b_pk, 76.0))).to(b_k.dtype)
         b_s = tl.dot(b_qt, b_k_use)
@@ -126,7 +137,7 @@ def _wall_fwd_kernel(
         b_p = exp2(b_s)
         b_acc += tl.sum(b_p, 1)
         if PV_FP32:
-            # fp16 cannot hold the unnormalised exponential weights.
+            # Keep unnormalized probabilities in FP32 for FP16 inputs.
             b_o += tl.dot(b_p, b_v.to(tl.float32))
         else:
             b_o += tl.dot(b_p.to(b_v.dtype), b_v)

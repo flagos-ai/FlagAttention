@@ -1,15 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Triton implementation of the per-channel gate prefix sum.
-
-``P[b, t, h, k] = sum_{t' <= t} g[b, t', h, k]`` for every ``(b, h, k)`` lane.
-
-The sequence is walked in tiles of ``BT`` positions: the in-tile inclusive
-prefix is a dot product with a lower-triangular ones matrix (``O(BT^2 BK)`` on
-the cube, cheap), and a per-channel carry is accumulated across tiles.  That
-keeps the whole scan in one Triton kernel with a fixed launch shape — no
-library cumsum involved.
-"""
+"""Inclusive gate prefix sums with an FP32 carry across sequence tiles."""
 
 import torch
 import triton
@@ -35,7 +26,7 @@ def _prefix_sum_kernel(
     rk = i_k * BK + tl.arange(0, BK)
     rt_local = tl.arange(0, BT)
     m_k = rk < K
-    # lower-triangular ones: prefix = L @ x
+    # Multiplying by a lower-triangular ones matrix computes the local prefix.
     b_l = (rt_local[:, None] >= rt_local[None, :]).to(tl.float32)
     base = ((i_b * T) * HQ + i_hq) * K
     carry = tl.zeros([BK], dtype=tl.float32)
@@ -85,7 +76,7 @@ def _prefix_sum_scalar_kernel(
         rt = i_t * BT + rt_local
         m_t = rt < T
         x = tl.load(g + base + rt * HQ, mask=m_t, other=0.0).to(tl.float32)
-        # column 0 carries the values, the other columns stay zero so the dot is legal
+        # Pad to the Cube tile width. Only column zero carries gate values.
         tile = tl.where(pad[None, :] == 0, x[:, None], tl.zeros([BT, 16], dtype=tl.float32))
         c = tl.dot(b_l, tile) + carry
         col0 = tl.sum(tl.where(pad[None, :] == 0, c, tl.zeros([BT, 16], dtype=tl.float32)), 1)

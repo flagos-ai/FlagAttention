@@ -1,5 +1,27 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Upstream: https://github.com/fla-org/flash-linear-attention/tree/main/fla/ops/wall_attn
+
 """Ascend forward specializations for the public Wall attention API.
 
 Dense FP16/BF16 inputs with K=V=64 use Ascend kernels; scalar gates and other
@@ -26,8 +48,7 @@ _BS = 128
 _BK = 64
 _BV = 64
 _WARPS = 4
-#: Route names reported through the generic module's ``get_last_route()`` so the
-#: repo benchmark keeps reporting something meaningful on Ascend.
+# Route names returned by get_last_route().
 _ROUTE_FAST = "ascend_fast"
 #: Dense forward with materialized scores for inputs outside the global path.
 _ROUTE_FAST_SPLIT = "ascend_fast_split"
@@ -87,8 +108,7 @@ def _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlen
     ):
         return False
     if g_scalar is not None:
-        # the scalar-gate prefix kernel crashes the bishengir compiler on this
-        # CANN build, so keep that combination on the generic implementation.
+        # Scalar gates use the generic path.
         return False
     if window_size is not None and window_size <= 0:
         return False
@@ -146,7 +166,6 @@ class _WallAscendFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar=None):
-        # The dense fast path uses the dedicated Triton gate prefix kernel.
         P = gate_prefix_sum(g, scale=RCP_LN2)
         c = (
             gate_prefix_sum_scalar(g_scalar) * RCP_LN2
@@ -278,6 +297,3 @@ def parallel_wall_attn(
     )
     _route(_ROUTE_FALLBACK)
     return o
-
-
-__all__ = ["parallel_wall_attn"]

@@ -1,5 +1,27 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Upstream: https://github.com/fla-org/flash-linear-attention/tree/main/fla/ops/wall_attn
+
 """Split forward kernels for dense causal Wall attention on Ascend.
 
 A prefix scan produces FP32 log2 gate prefixes. QK rescales query/key tiles
@@ -7,9 +29,8 @@ around an anchor and stores causal FP16 scores with padded row strides. PV
 exponentiates the scores in UB, computes row sums and weighted values, and
 normalizes the output without allocating a separate probabilities tensor.
 
-The even-length path shares an anchor across two query tiles and uses unmasked
-loads for fully covered KV tiles. Other lengths use masked loads. Sink/scalar
-gates, sliding windows and packed sequences use another implementation.
+The aligned path shares an anchor across two query tiles and uses unmasked
+loads for complete KV tiles. Sequence tails use masked loads.
 """
 
 import torch
@@ -21,7 +42,7 @@ from .cumsum import gate_prefix_sum
 from .raw_exp_sum import exp_sum_op
 
 _RCP_LN2 = 1.4426950216
-#: extra columns per score row so the row stride is never a 4 KiB multiple.
+# Extra columns per score row to shift the tile-aligned row stride.
 _ROW_PAD = 128
 
 
@@ -56,7 +77,6 @@ def _wall_qk_kernel(
     rn = tl.arange(0, BK)
     msk_n = rn < K
 
-    # q tile and its gate prefix, rescaled once with the program anchor R
     q_row = ((bos + rm) * HQ + i_hq) * K
     r_row = ((bos + i_t * BT) * HQ + i_hq) * K
     b_R = tl.load(P + r_row + rn, mask=msk_n, other=0.0).to(tl.float32)
@@ -71,15 +91,12 @@ def _wall_qk_kernel(
                        mask=msk_m[:, None] & msk_n[None, :], other=0.0).to(tl.float32)
     b_qt = (b_q.to(tl.float32) * exp2(b_pq - b_R[None, :]) * (scale * RCP_LN2)).to(b_q.dtype)
 
-    # rm is already the global row, so the tile start must not be added again
     s_base = scores + (i_b * HQ + i_hq) * (T * LD_S)
     o_rs = tl.arange(0, BS)
-    # the PV kernel reads whole PV_BT-wide tiles, so the diagonal over-cover
-    # must be written too (all of those columns are future rows -> -inf)
+    # Initialize the entire diagonal PV tile, including masked future scores.
     n_tiles = (((i_t * BT + BT + COV - 1) // COV) * COV) // BS
     if EVEN:
-        # bulk: every column of these tiles is <= the first query row, so the
-        # causal mask is a no-op and nothing can be out of bounds.
+        # All keys in these tiles are visible to the first query row.
         n_full = (i_t * BT) // BS
         for i_s in tl.range(0, n_full):
             o_k = i_s * BS + o_rs
@@ -94,7 +111,7 @@ def _wall_qk_kernel(
             b_pk = tl.load(P + (((bos + o_k) * HQ + i_hq) * K)[None, :] + rn[:, None]).to(tl.float32)
             b_ku = (b_k.to(tl.float32) * exp2(tl.minimum(b_R[:, None] - b_pk, 76.0))).to(b_k.dtype)
             b_s = tl.dot(b_qt, b_ku)
-            # -inf is exact in fp16 and exp2(-inf) == 0, so PV needs no mask
+            # Future scores yield zero weight when PV exponentiates them.
             b_s = tl.where(rm[:, None] >= o_k[None, :], b_s, float("-inf"))
             tl.store(s_base + rm[:, None] * LD_S + o_k[None, :], b_s.to(tl.float16))
     else:
@@ -139,12 +156,9 @@ def _wall_qk2_kernel(
     COV: tl.constexpr,
     LD_S: tl.constexpr,
 ):
-    """Two query tiles per program, sharing one anchor and one tilted K tile.
+    """Compute two query tiles with a shared rescaled K tile.
 
-    Halving the number of q-tile programs halves the k/P loads, the exp2 of the
-    decay factor and the loop bookkeeping per score element (measured -16% at
-    T=4096).  The anchor is the *second* tile's first row, so the score range
-    is halved as well, which is also slightly more accurate.
+    The first row of the second query tile supplies the shared gate anchor.
     """
     i_t = tl.program_id(0)
     i_hq = tl.program_id(1)
@@ -180,7 +194,6 @@ def _wall_qk2_kernel(
         b_k = tl.load(k + (((bos + o_k) * H + i_h) * K)[:, None] + rn[None, :])
         b_pk = tl.load(P + (((bos + o_k) * HQ + i_hq) * K)[:, None] + rn[None, :]).to(tl.float32)
         b_ku = (b_k.to(tl.float32) * exp2(tl.minimum(b_R[None, :] - b_pk, 76.0))).to(b_k.dtype)
-        # -inf is exact in fp16 and exp2(-inf) == 0, so PV needs no mask
         s1 = tl.where(rm1[:, None] >= o_k[None, :], tl.dot(b_qt1, tl.trans(b_ku)), float("-inf"))
         s2 = tl.where(rm2[:, None] >= o_k[None, :], tl.dot(b_qt2, tl.trans(b_ku)), float("-inf"))
         tl.store(s_base + rm1[:, None] * LD_S + o_k[None, :], s1.to(tl.float16))
@@ -222,12 +235,10 @@ def _wall_pv_kernel(
     b_den16 = tl.zeros([BT, 16], dtype=tl.float32)
     b_ones = tl.full([BS, 16], 1.0, dtype=tl.float16)
 
-    # rm is already the global row, so the tile start must not be added again
     s_base = scores + (i_b * HQ + i_hq) * (T * LD_S)
     n_tiles = (i_t * BT + BT + BS - 1) // BS
     if EVEN:
-        # the QK kernel already wrote every column of every tile (future
-        # columns are -inf and exp2(-inf) == 0), so no mask is needed here
+        # QK already initializes future scores to negative infinity.
         for i_s in tl.range(0, n_tiles):
             o_k = i_s * BS + o_rs
             b_s = tl.load(s_base + rm[:, None] * LD_S + o_k[None, :])
@@ -281,13 +292,10 @@ def _wall_pv_kernel(
 
 
 def _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar):
-    """Dense non-varlen split forward (the benchmark contract)."""
+    """Run dense causal split forward for K=V=64."""
     B, T, HQ, K = q.shape
     H = k.shape[2]
     V = v.shape[-1]
-    # the split kernels implement plain causal attention only: a sliding window
-    # or a sink/scalar gate must go to the generic fused kernel, which has the
-    # masking for them.
     if (cu_seqlens is not None or sink_bias is not None or g_scalar is not None
             or window_size is not None):
         return None
@@ -300,10 +308,9 @@ def _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_sc
     # Align QK coverage with PV tiles so diagonal padding is initialized.
     qk_bt, qk_bs, qk_bk = 128, 128, 64
     pv_bt, pv_bs, pv_bv = 128, 256, 64
-    #: the wide-tile path needs T divisible by 2*qk_bt == pv_bs == 256
+    # The unmasked path requires complete query tile pairs and PV tiles.
     even = (T % (2 * qk_bt) == 0) and (T % pv_bs == 0)
     if even:
-        # two query tiles per program: shared K tilt, half the loop overhead
         _wall_qk2_kernel[(T // (2 * qk_bt), HQ, B)](
             q, k, P, scores, scale, T, H=H, HQ=HQ, K=K, BT=qk_bt, BS=qk_bs,
             COV=pv_bs, LD_S=ld_s)
