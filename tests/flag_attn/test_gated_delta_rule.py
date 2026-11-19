@@ -1472,9 +1472,14 @@ class TestPackedGatedDeltaRule:
     @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @torch.inference_mode()
     def test_public_exports_and_untouched_padding(self):
+        from flag_attn.runtime.backend._nvidia import dispatch
         from flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
 
-        assert flag_attn.chunk_gated_delta_rule_fwd is chunk_gated_delta_rule_fwd
+        # The public name is a dispatch facade, not the implementation itself:
+        # it picks an architecture on first call. Assert what it resolves to
+        # here rather than object identity, which the facade cannot satisfy.
+        assert callable(flag_attn.chunk_gated_delta_rule_fwd)
+        assert dispatch._resolve("chunk_gated_delta_rule_fwd") is chunk_gated_delta_rule_fwd
         assert callable(flag_attn.fused_recurrent_gated_delta_rule_fwd)
         c = make_packed_case(n=3)
         c["ssm_state_indices"][0] = 0
