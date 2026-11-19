@@ -37,16 +37,26 @@ produce the two projections consumed downstream:
     w = Tm @ (beta * gamma * k)        u = Tm @ (beta * v)
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from flag_attn.FLA.index import prepare_chunk_indices
 
-# Products of the triangular inverse need true FP32 arithmetic; TF32 loses too
-# many mantissa bits in the squaring chain to stay inside the operator's
-# tolerance. "ieee" keeps tl.dot exact on backends that honour it.
-_DOT_PRECISION: tl.constexpr = tl.constexpr("ieee")
+# Precision of the squaring chain that builds the triangular inverse. Plain
+# "tf32" drops to ~4e-5 relative error here, which the solve amplifies; "ieee"
+# holds ~1e-8 but has no tensor-core path and measured ~36x slower on sm_100.
+# "tf32x3" reaches the same ~1e-8 at tensor-core speed, so it is the default,
+# with the env var left as an escape hatch for backends that lack it.
+_TRIL_PRECISION = os.environ.get("FLAG_ATTN_GDN_TRIL_PRECISION", "tf32x3")
+if _TRIL_PRECISION not in ("ieee", "tf32", "tf32x3"):
+    raise ValueError(
+        "FLAG_ATTN_GDN_TRIL_PRECISION must be one of 'ieee', 'tf32', 'tf32x3'; "
+        f"got {_TRIL_PRECISION!r}"
+    )
+_DOT_PRECISION: tl.constexpr = tl.constexpr(_TRIL_PRECISION)
 
 
 @triton.jit
