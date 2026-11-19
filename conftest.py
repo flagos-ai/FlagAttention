@@ -51,6 +51,7 @@ _BENCHMARK_METRIC_FIELDS = (
     "tflops",
     "utilization",
     "compared_speedup",
+    "base_miss_reason",
     "error_msg",
 )
 
@@ -348,20 +349,25 @@ def _normalize_benchmark_detail(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError("benchmark result property must be a mapping")
     detail = {field: value[field] for field in _BENCHMARK_DETAIL_FIELDS[:-1]}
+    if value.get("native_baseline_skip_reason"):
+        detail["native_baseline_skip_reason"] = value["native_baseline_skip_reason"]
     phase = value.get("phase")
     metrics = []
     for source in value["result"]:
         if not isinstance(source, Mapping):
             raise TypeError("benchmark metric must be a mapping")
-        # Neither the upload summary nor FlagGems can compute a comparable
-        # speedup without two valid timings. Keep baseline-free measurements
-        # out of both reports rather than inventing a comparison.
-        if not _has_valid_baseline_speedup(source):
+        has_local = _has_valid_baseline_speedup(source)
+        has_compared = _has_valid_compared_speedup(source)
+        if not has_local and not has_compared and not _has_valid_latency(source):
             continue
         metric = {field: source.get(field) for field in _BENCHMARK_METRIC_FIELDS}
-        metric["latency_base"] = float(metric["latency_base"])
         metric["latency"] = float(metric["latency"])
-        metric["speedup"] = metric["latency_base"] / metric["latency"]
+        if has_local:
+            metric["latency_base"] = float(metric["latency_base"])
+            metric["speedup"] = metric["latency_base"] / metric["latency"]
+        else:
+            metric["latency_base"] = None
+            metric["speedup"] = None
         shape = metric["shape_detail"]
         if isinstance(shape, tuple) and all(
             isinstance(dimension, int) and not isinstance(dimension, bool)
@@ -380,6 +386,19 @@ def _normalize_benchmark_detail(value: Any) -> dict[str, Any]:
     return detail
 
 
+def _has_valid_latency(metric: Mapping[str, Any]) -> bool:
+    if metric.get("error_msg") is not None:
+        return False
+    latency = metric.get("latency")
+    if not isinstance(latency, Real) or isinstance(latency, bool):
+        return False
+    try:
+        latency = float(latency)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(latency) and latency > 0
+
+
 def _has_valid_baseline_speedup(metric: Mapping[str, Any]) -> bool:
     if metric.get("error_msg") is not None:
         return False
@@ -394,6 +413,20 @@ def _has_valid_baseline_speedup(metric: Mapping[str, Any]) -> bool:
         return False
     return all(math.isfinite(value) and value > 0
                for value in (baseline, latency, ratio))
+
+
+def _has_valid_compared_speedup(metric: Mapping[str, Any]) -> bool:
+    if metric.get("error_msg") is not None:
+        return False
+    compared, latency = metric.get("compared_speedup"), metric.get("latency")
+    if any(not isinstance(value, Real) or isinstance(value, bool)
+           for value in (compared, latency)):
+        return False
+    try:
+        compared, latency = float(compared), float(latency)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return all(math.isfinite(value) and value > 0 for value in (compared, latency))
 
 
 def _upload_shape_key(shape: Any) -> str:
@@ -439,9 +472,12 @@ def _upload_performance_data(details: list[dict[str, Any]]) -> dict[str, Any]:
         dtype = str(detail["dtype"]).removeprefix("torch.")
         shapes = rows_by_dtype.setdefault(dtype, {})
         for metric in detail["result"]:
-            if not _has_valid_baseline_speedup(metric):
+            if _has_valid_baseline_speedup(metric):
+                baseline = float(metric["latency_base"])
+            elif _has_valid_compared_speedup(metric):
+                baseline = float(metric["latency"]) * float(metric["compared_speedup"])
+            else:
                 continue
-            baseline = float(metric["latency_base"])
             latency = float(metric["latency"])
             key = (
                 _upload_shape_key(metric["shape_detail"]),

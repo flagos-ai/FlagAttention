@@ -27,6 +27,7 @@ FLAGGEMS_METRIC_FIELDS = {
     "tflops",
     "utilization",
     "compared_speedup",
+    "base_miss_reason",
     "error_msg",
 }
 UPLOAD_SUMMARY_FIELDS = {"timestamp", "env", "result"}

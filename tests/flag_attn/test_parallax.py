@@ -31,15 +31,15 @@ FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
 logger = logging.getLogger(__name__)
 
 
-def _cuda_available() -> bool:
+def _backend_available() -> bool:
     return test_backend.supports_operator("parallel_parallax")
 
 
 pytestmark = [
     pytest.mark.parallel_parallax,
     pytest.mark.skipif(
-        not _cuda_available(),
-        reason="parallel_parallax tests require CUDA",
+        not _backend_available(),
+        reason="parallel_parallax is unavailable on this backend",
     ),
 ]
 
