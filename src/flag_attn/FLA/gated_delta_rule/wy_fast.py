@@ -1,59 +1,37 @@
-# This file contains code copied from the flash-linear-attention project.
-# The original source code was licensed under the MIT license and included
-# the following copyright notice:
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-# ruff: noqa: E501
+"""WY-representation projections from a materialized UT transform.
 
-import os
+The portable forward folds this work into its prepare kernel, which keeps the
+transform in registers. This module recomputes the same projections from an
+explicit ``A`` matrix for callers that hold one:
+
+    w = A @ (beta * exp(G) * k)        u = A @ (beta * v)
+
+Portable Triton only: explicit pointer arithmetic with masks.
+"""
 
 import torch
 import triton
 import triton.language as tl
 
-from flag_attn import runtime
-from flag_attn.FLA.compat import libentry, libtuner
-from flag_attn.utils import has_triton_tle
 from flag_attn.FLA.index import prepare_chunk_indices
 
-if has_triton_tle(3, 6, 0):
-    try:
-        import triton.experimental.tle.language as tle
 
-        HAS_TLE_RECOMPUTE_W_U = True
-    except ImportError:
-        tle = None
-        HAS_TLE_RECOMPUTE_W_U = False
-else:
-    tle = None
-    HAS_TLE_RECOMPUTE_W_U = False
-
-
-def _use_tle_recompute_w_u(cu_seqlens: torch.Tensor | None) -> bool:
-    value = os.environ.get("FLAG_ATTN_CHUNK_GDR_RECOMPUTE_TLE", "1").lower()
-    return HAS_TLE_RECOMPUTE_W_U and cu_seqlens is None and value not in {"0", "false", "off", "no"}
-
-
-def maybe_set_tle_recompute_allocator(device: torch.device, cu_seqlens: torch.Tensor | None) -> None:
-    if not (HAS_TLE_RECOMPUTE_W_U and cu_seqlens is None):
-        return
-
-    def alloc_fn(size: int, align: int, stream):
-        _ = align
-        _ = stream
-        return torch.empty(size, dtype=torch.int8, device=device)
-
-    triton.set_allocator(alloc_fn)
-
-
-@libentry()
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@libtuner(
-    configs=runtime.get_tuned_config("recompute_w_u_fwd_kernel"),
-    key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
-)
 @triton.jit(do_not_specialize=["T"])
-def recompute_w_u_fwd_kernel(
+def _recompute_w_u_fwd_kernel(
     k,
     v,
     beta,
@@ -75,164 +53,45 @@ def recompute_w_u_fwd_kernel(
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
+    i_hg = i_h // (H // Hg)
+
     if IS_VARLEN:
-        i_n, i_t = (
-            tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
-        )
-        bos, eos = (
-            tl.load(cu_seqlens + i_n).to(tl.int32),
-            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
-        )
+        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+        i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
     else:
-        bos, eos = i_b * T, i_b * T + T
-    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    p_g = tl.make_block_ptr(g + (bos * H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT,
-        (T, BT),
-        (H * BT, 1),
-        (i_t * BT, 0),
-        (BT, BT),
-        (1, 0),
-    )
-    b_beta = tl.load(p_beta, boundary_check=(0,), padding_option="zero")
-    b_A = tl.load(p_A, boundary_check=(0, 1), padding_option="zero")
-    b_g = tl.exp(tl.load(p_g, boundary_check=(0,), padding_option="zero").to(tl.float32))
-
-    for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(
-            v + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
-        p_u = tl.make_block_ptr(
-            u + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
-        b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
-        b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
-        b_u = tl.dot(b_A, b_vb, allow_tf32=False)
-        tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
-
-    for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
-            (T, K),
-            (Hg * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        p_w = tl.make_block_ptr(
-            w + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
-        b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
-        b_w = tl.dot(b_A, b_kb)
-        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
-
-
-if HAS_TLE_RECOMPUTE_W_U:
-
-    @libentry()
-    @libtuner(
-        configs=runtime.get_tuned_config("recompute_w_u_fwd_tle_kernel"),
-        key=["H", "K", "V", "BT", "BK", "BV", "PIPE_STAGES"],
-    )
-    @triton.jit(do_not_specialize=["T"])
-    def recompute_w_u_fwd_tle_kernel(
-        k,
-        v,
-        beta,
-        w,
-        u,
-        A,
-        g,
-        T,
-        H: tl.constexpr,
-        Hg: tl.constexpr,
-        K: tl.constexpr,
-        V: tl.constexpr,
-        BT: tl.constexpr,
-        BK: tl.constexpr,
-        BV: tl.constexpr,
-        PIPE_STAGES: tl.constexpr,
-    ):
-        i_t, i_bh = tl.program_id(0), tl.program_id(1)
-        i_b, i_h = i_bh // H, i_bh % H
         bos = i_b * T
 
-        p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        p_A = tl.make_block_ptr(
-            A + (bos * H + i_h) * BT,
-            (T, BT),
-            (H * BT, 1),
-            (i_t * BT, 0),
-            (BT, BT),
-            (1, 0),
-        )
-        b_beta = tl.load(p_beta, boundary_check=(0,), padding_option="zero")
-        b_A = tl.load(p_A, boundary_check=(0, 1), padding_option="zero")
-        b_g = tl.exp(tl.load(p_g, boundary_check=(0,), padding_option="zero").to(tl.float32))
+    o_t = tl.arange(0, BT)
+    pos = i_t * BT + o_t
+    m_t = pos < T
+    row = bos + pos
 
-        for i_v in tl.range(0, tl.cdiv(V, BV), 1, num_stages=PIPE_STAGES):
-            p_v = tl.make_block_ptr(
-                v + (bos * H + i_h) * V,
-                (T, V),
-                (H * V, 1),
-                (i_t * BT, i_v * BV),
-                (BT, BV),
-                (1, 0),
-            )
-            p_u = tl.make_block_ptr(
-                u + (bos * H + i_h) * V,
-                (T, V),
-                (H * V, 1),
-                (i_t * BT, i_v * BV),
-                (BT, BV),
-                (1, 0),
-            )
-            b_v = tle.load(p_v, boundary_check=(0, 1), padding_option="zero", is_async=True)
-            b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
-            b_u = tl.dot(b_A, b_vb, allow_tf32=False)
-            tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
+    b_beta = tl.load(beta + row * H + i_h, mask=m_t, other=0.0).to(tl.float32)
+    b_g = tl.load(g + row * H + i_h, mask=m_t, other=0.0).to(tl.float32)
+    p_A = A + row[:, None] * (H * BT) + i_h * BT + o_t[None, :]
+    b_A = tl.load(p_A, mask=m_t[:, None] & m_t[None, :], other=0.0)
 
-        for i_k in tl.range(0, tl.cdiv(K, BK), 1, num_stages=PIPE_STAGES):
-            p_k = tl.make_block_ptr(
-                k + (bos * Hg + i_h // (H // Hg)) * K,
-                (T, K),
-                (Hg * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
-            )
-            p_w = tl.make_block_ptr(
-                w + (bos * H + i_h) * K,
-                (T, K),
-                (H * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
-            )
-            b_k = tle.load(p_k, boundary_check=(0, 1), padding_option="zero", is_async=True)
-            b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
-            b_w = tl.dot(b_A, b_kb)
-            tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
+    for i_v in range(tl.cdiv(V, BV)):
+        off_v = i_v * BV + tl.arange(0, BV)
+        m_tv = m_t[:, None] & (off_v < V)[None, :]
+        p_v = v + row[:, None] * (H * V) + i_h * V + off_v[None, :]
+        b_v = tl.load(p_v, mask=m_tv, other=0.0).to(tl.float32)
+        b_u = tl.dot(b_A, (b_v * b_beta[:, None]).to(b_A.dtype))
+        p_u = u + row[:, None] * (H * V) + i_h * V + off_v[None, :]
+        tl.store(p_u, b_u.to(u.dtype.element_ty), mask=m_tv)
+
+    b_scale = b_beta * tl.exp(b_g)
+    for i_k in range(tl.cdiv(K, BK)):
+        off_k = i_k * BK + tl.arange(0, BK)
+        m_tk = m_t[:, None] & (off_k < K)[None, :]
+        p_k = k + row[:, None] * (Hg * K) + i_hg * K + off_k[None, :]
+        b_k = tl.load(p_k, mask=m_tk, other=0.0).to(tl.float32)
+        b_w = tl.dot(b_A, (b_k * b_scale[:, None]).to(b_A.dtype))
+        p_w = w + row[:, None] * (H * K) + i_h * K + off_k[None, :]
+        tl.store(p_w, b_w.to(w.dtype.element_ty), mask=m_tk)
 
 
 def recompute_w_u_fwd(
@@ -245,42 +104,19 @@ def recompute_w_u_fwd(
     block_v: int | None = None,
     pipe_stages: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    B, T, Hg, K, V = *k.shape, v.shape[-1]
-    H = v.shape[-2]
+    """Return ``(w, u)`` from a materialized UT transform ``A``."""
+    del pipe_stages  # Scheduling hint of the Hopper route; unused here.
+    B, T, Hg, K = k.shape
+    H, V = v.shape[-2], v.shape[-1]
     BT = A.shape[-1]
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BK = 64
-    BV = block_v or 64
+
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
-    if _use_tle_recompute_w_u(cu_seqlens):
-        recompute_w_u_fwd_tle_kernel[(NT, B * H)](
-            k=k,
-            v=v,
-            beta=beta,
-            w=w,
-            u=u,
-            A=A,
-            g=g_cumsum,
-            T=T,
-            H=H,
-            Hg=Hg,
-            K=K,
-            V=V,
-            BT=BT,
-            BK=BK,
-            BV=BV,
-            PIPE_STAGES=pipe_stages,
-        )
-        return w, u
-
-    # Varlen kernels get the sequence from chunk_indices; i_b is unused in the
-    # IS_VARLEN path, so H programs cover every chunk/head exactly once even
-    # when the packed storage has B > 1.
-    NH = H if cu_seqlens is not None else B * H
-    recompute_w_u_fwd_kernel[(NT, NH)](
+    grid = (NT, (H if cu_seqlens is not None else B * H))
+    _recompute_w_u_fwd_kernel[grid](
         k=k,
         v=v,
         beta=beta,
@@ -296,7 +132,9 @@ def recompute_w_u_fwd(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
+        BK=min(64, triton.next_power_of_2(K)),
+        BV=min(block_v or 64, triton.next_power_of_2(V)),
+        IS_VARLEN=cu_seqlens is not None,
+        num_warps=4,
     )
     return w, u

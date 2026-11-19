@@ -460,7 +460,7 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         and torch.cuda.get_device_capability(k.device)[0] == 9
         and output_dtype == k.dtype
     ):
-        from flag_attn.FLA.gated_delta_rule.chunk_fused_tle_prepare import prepare_fused_tle_inputs
+        from flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk_fused_tle_prepare import prepare_fused_tle_inputs
 
         needs_gated = use_g_in_kkt or output_gated_from_ungated
         result = prepare_fused_tle_inputs(
