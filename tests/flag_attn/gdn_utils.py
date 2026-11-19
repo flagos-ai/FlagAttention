@@ -136,7 +136,9 @@ def check_close(out, state, ref_out, ref_state):
 
 
 def record_recurrent_launch(monkeypatch):
-    import flag_attn.FLA.gated_delta_rule.fused_recurrent as module
+    # Both callers are TLE-gated, so the recurrence under test is the Hopper
+    # one; the generic package has no packed-decode route to record.
+    import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.fused_recurrent as module
 
     kernel = module._recurrent_fwd_kernel
     calls = []

@@ -12,191 +12,158 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FP32 GDN recurrence over V tiles, with indexed per-token state snapshots."""
+"""Portable GDN recurrence for inference, with indexed state snapshots.
+
+The token-by-token form of the operator, for decode and short MTP windows
+where the chunked decomposition has nothing to amortize. One program owns a
+``[BV, BK]`` tile of one request's state and walks its tokens:
+
+    S <- exp(g) * S
+    delta = (v - S @ k) * beta
+    S <- S + delta outer k
+    o = S^T (q * scale)
+
+State uses the ``[pool, HV, V, K]`` cache layout; ``ssm_state_indices``
+selects which pool rows to read and write, so speculative decoding can keep
+one snapshot per accepted token. Portable Triton only: explicit pointer
+arithmetic with masks, FP32 recurrence, no tensor cores.
+"""
 
 import torch
 import triton
 import triton.language as tl
-import triton.experimental.tle.language as tle
-
-
-@triton.jit
-def _load(ptr, mask, USE_TLE: tl.constexpr, ASYNC: tl.constexpr = False, CG: tl.constexpr = False):
-    if USE_TLE:
-        if CG:
-            return tle.load(ptr, mask=mask, other=0, is_async=ASYNC, cache_modifier=".cg")
-        return tle.load(ptr, mask=mask, other=0, is_async=ASYNC)
-    if CG:
-        return tl.load(ptr, mask=mask, other=0, cache_modifier=".cg")
-    return tl.load(ptr, mask=mask, other=0)
 
 
 @triton.jit(do_not_specialize=["T"])
 def _recurrent_fwd_kernel(
-    Q,
-    Kp,
-    Vp,
-    G,
-    Beta,
-    H0,
-    HT,
-    O,
-    Cu,
-    Indices,
-    Accepted,
-    ALog,
-    DtBias,
-    T: tl.int64,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    o,
+    h0,
+    ht,
+    cu_seqlens,
+    indices,
+    accepted,
+    scale,
+    T,
+    stride_q_b,
+    stride_q_t,
+    stride_q_h,
+    stride_v_b,
+    stride_v_t,
+    stride_v_h,
+    stride_o_b,
+    stride_o_t,
+    stride_o_h,
+    stride_s_pool,
+    stride_s_h,
+    stride_s_v,
+    stride_g_b,
+    stride_g_t,
+    stride_idx_n,
+    stride_idx_t,
     H: tl.constexpr,
     HV: tl.constexpr,
     DK: tl.constexpr,
     DV: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    QS: tl.constexpr,
-    KS: tl.constexpr,
-    VS: tl.constexpr,
-    GS: tl.constexpr,
-    BS: tl.constexpr,
-    HS: tl.constexpr,
-    OS: tl.constexpr,
-    FS: tl.constexpr,
-    IS: tl.constexpr,
-    ACCEPT_STRIDE: tl.constexpr,
-    SCALE: tl.constexpr,
-    VARLEN: tl.constexpr,
-    HAS_INDICES: tl.constexpr,
-    SPEC: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    USE_INDICES: tl.constexpr,
+    USE_ACCEPTED: tl.constexpr,
     INPLACE: tl.constexpr,
     VECTOR_BETA: tl.constexpr,
     NORMALIZE: tl.constexpr,
-    USE_TLE: tl.constexpr,
-    ASYNC_STATE: tl.constexpr,
-    FUSED_GATES: tl.constexpr,
-    SPLIT_GRID: tl.constexpr,
-    WIDE_OFFSETS: tl.constexpr,
-    LAYOUT: tl.constexpr,
-    CACHE_STATE: tl.constexpr,
-    REUSE_PACKED_STATE: tl.constexpr,
 ):
-    tl.static_assert(not REUSE_PACKED_STATE or (FUSED_GATES and INPLACE))
-    if REUSE_PACKED_STATE and H0.dtype.element_ty != tl.float32:
-        HT = H0
-    iv = tl.program_id(0)
-    if SPLIT_GRID:
-        n, hv = tl.program_id(2), tl.program_id(1)
-    else:
-        nh = tl.program_id(1)
-        n, hv = nh // HV, nh % HV
-    h = hv // (HV // H)
-    if WIDE_OFFSETS:
-        n, hv, h = n.to(tl.int64), hv.to(tl.int64), h.to(tl.int64)
-    if VARLEN:
-        bos = tl.load(Cu + n).to(tl.int64)
-        end = tl.load(Cu + n + 1).to(tl.int64)
-        length = end - bos
-        qb, kb, vb = bos * QS[1], bos * KS[1], bos * VS[1]
-        gb, bb = bos * GS[1], bos * BS[1]
-        ob = bos * OS[1]
-    else:
-        bos = n * T
-        length = 1 if FUSED_GATES else T
-        qb, kb, vb = n * QS[0], n * KS[0], n * VS[0]
-        gb, bb = n * GS[0], n * BS[0]
-        ob = n * OS[0]
-    if length == 0:
-        return
-    state_idx = n.to(tl.int64)
-    if HAS_INDICES:
-        it = 0
-        if SPEC:
-            it = tl.load(Accepted + n * ACCEPT_STRIDE).to(tl.int64) - 1
-        state_idx = tl.load(Indices + n * IS[0] + it * IS[1]).to(tl.int64)
-    rk = tl.arange(0, BK)
-    rv = iv * BV + tl.arange(0, BV)
-    if LAYOUT is not None:
-        rk = tle.gpu.set_layout(rk, tle.gpu.SlicedEncoding(0, LAYOUT))
-        rv = tle.gpu.set_layout(rv, tle.gpu.SlicedEncoding(1, LAYOUT))
-    if WIDE_OFFSETS:
-        rk, rv = rk.to(tl.int64), rv.to(tl.int64)
-    mk, mv = rk < DK, rv < DV
-    mh = mv[:, None] & mk[None, :]
-    if HAS_INDICES and state_idx <= 0:
-        for t in range(length):
-            pos = t.to(tl.int64) if WIDE_OFFSETS else t
-            tl.store(O + ob + pos * OS[1] + hv * OS[2] + rv * OS[3], 0, mask=mv)
-            if not INPLACE:
-                tl.store(
-                    HT + (bos + pos) * FS[0] + hv * FS[1] + rv[:, None] * FS[2] + rk[None, :] * FS[3],
-                    0,
-                    mask=mh,
-                )
-        return
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
 
-    state = _load(
-        H0 + state_idx * HS[0] + hv * HS[1] + rv[:, None] * HS[2] + rk[None, :] * HS[3],
-        mh,
-        USE_TLE,
-        ASYNC_STATE,
-        CACHE_STATE,
-    ).to(tl.float32)
-    for t in range(length):
-        pos = t.to(tl.int64) if WIDE_OFFSETS else t
-        query_k = rk if LAYOUT is None else rk[None, :]
-        query_mask = mk if LAYOUT is None else mk[None, :]
-        q = _load(Q + qb + pos * QS[1] + h * QS[2] + query_k * QS[3], query_mask, USE_TLE).to(tl.float32)
-        if FUSED_GATES:
-            # Q/K/V share the packed projection base pointer.
-            k = _load(Q + H * DK + kb + h * KS[2] + query_k, query_mask, USE_TLE).to(tl.float32)
-            v = _load(Q + 2 * H * DK + vb + hv * VS[2] + rv, mv, USE_TLE).to(tl.float32)
-        else:
-            k = _load(Kp + kb + pos * KS[1] + h * KS[2] + query_k * KS[3], query_mask, USE_TLE).to(tl.float32)
-            v = _load(Vp + vb + pos * VS[1] + hv * VS[2] + rv * VS[3], mv, USE_TLE).to(tl.float32)
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        seq_len = eos - bos
+        i_b, t0 = 0, bos
+    else:
+        seq_len = T
+        i_b, t0 = i_n, 0
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_k = o_k < DK
+    m_v = o_v < DV
+    m_s = m_v[:, None] & m_k[None, :]
+
+    # Pick the pool row to read: with speculative decoding the caller passes
+    # accepted[n], and accepted-1 selects the last committed snapshot.
+    read_row = i_n
+    if USE_INDICES:
+        col = 0
+        if USE_ACCEPTED:
+            col = tl.load(accepted + i_n).to(tl.int32) - 1
+        read_row = tl.load(indices + i_n * stride_idx_n + col * stride_idx_t).to(tl.int32)
+        # A non-positive row marks a padded request: emit zeros, touch nothing.
+        if read_row <= 0:
+            for i_t in range(seq_len):
+                p_o = o + i_b * stride_o_b + (t0 + i_t) * stride_o_t + i_hv * stride_o_h + o_v
+                tl.store(p_o, tl.zeros([BV], dtype=o.dtype.element_ty), mask=m_v)
+            return
+
+    # [BV, BK] state tile, mirroring the [pool, HV, V, K] cache layout.
+    p_h0 = h0 + read_row.to(tl.int64) * stride_s_pool + i_hv * stride_s_h + o_v[:, None] * stride_s_v + o_k[None, :]
+    b_s = tl.load(p_h0, mask=m_s, other=0.0).to(tl.float32)
+
+    for i_t in range(seq_len):
+        t = t0 + i_t
+        p_q = q + i_b * stride_q_b + t * stride_q_t + i_h * stride_q_h + o_k
+        p_k = k + i_b * stride_q_b + t * stride_q_t + i_h * stride_q_h + o_k
+        b_q = tl.load(p_q, mask=m_k, other=0.0).to(tl.float32)
+        b_k = tl.load(p_k, mask=m_k, other=0.0).to(tl.float32)
         if NORMALIZE:
-            if LAYOUT is None:
-                q = q / tl.sqrt(tl.sum(q * q) + 1.0e-6)
-                k = k / tl.sqrt(tl.sum(k * k) + 1.0e-6)
-            else:
-                q = q / tl.sqrt(tl.sum(q * q, 1, keep_dims=True) + 1.0e-6)
-                k = k / tl.sqrt(tl.sum(k * k, 1, keep_dims=True) + 1.0e-6)
-        q = q * SCALE
-        if LAYOUT is None:
-            q, k = q[None, :], k[None, :]
-        g = tl.load(G + gb + pos * GS[1] + hv * GS[2]).to(tl.float32)
-        if FUSED_GATES:
-            a_log = tl.load(ALog + hv).to(tl.float32)
-            dt_bias = tl.load(DtBias + hv).to(tl.float32)
-            x = g + dt_bias
-            g = -tl.exp(a_log) * tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
-        state = state * tl.exp(g)
-        delta = v - tl.sum(state * k, 1)
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1.0e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1.0e-6)
+        p_v = v + i_b * stride_v_b + t * stride_v_t + i_hv * stride_v_h + o_v
+        b_v = tl.load(p_v, mask=m_v, other=0.0).to(tl.float32)
+        b_g = tl.load(g + i_b * stride_g_b + t * stride_g_t + i_hv).to(tl.float32)
         if VECTOR_BETA:
-            beta = _load(Beta + bb + pos * BS[1] + hv * BS[2] + rv * BS[3], mv, USE_TLE).to(tl.float32)
+            b_beta = tl.load(beta + (i_b * stride_g_b + t * stride_g_t + i_hv) * DV + o_v, mask=m_v, other=0.0)
+            b_beta = b_beta.to(tl.float32)
         else:
-            beta = tl.load(Beta + bb + pos * BS[1] + hv * BS[2]).to(tl.float32)
-        if FUSED_GATES:
-            beta = tl.sigmoid(beta).to(Beta.dtype.element_ty).to(tl.float32)
-        delta = delta * beta
-        state = state + delta[:, None] * k
-        out = tl.sum(state * q, 1)
-        tl.store(O + ob + pos * OS[1] + hv * OS[2] + rv * OS[3], out, mask=mv)
+            b_beta = tl.load(beta + i_b * stride_g_b + t * stride_g_t + i_hv).to(tl.float32)
+
+        b_s = b_s * tl.exp(b_g)
+        b_delta = (b_v - tl.sum(b_s * b_k[None, :], axis=1)) * b_beta
+        b_s = b_s + b_delta[:, None] * b_k[None, :]
+        b_o = tl.sum(b_s * (b_q * scale)[None, :], axis=1)
+        p_o = o + i_b * stride_o_b + t * stride_o_t + i_hv * stride_o_h + o_v
+        tl.store(p_o, b_o.to(o.dtype.element_ty), mask=m_v)
+
+        # Snapshot per token when the caller supplied write indices.
         if INPLACE:
-            target = state_idx if REUSE_PACKED_STATE else n.to(tl.int64)
-            if HAS_INDICES and not REUSE_PACKED_STATE:
-                target = tl.load(Indices + n * IS[0] + pos * IS[1]).to(tl.int64)
-            if not HAS_INDICES or target > 0:
-                tl.store(
-                    HT + target * FS[0] + hv * FS[1] + rv[:, None] * FS[2] + rk[None, :] * FS[3],
-                    state,
-                    mask=mh,
+            write_row = i_n
+            if USE_INDICES:
+                write_row = tl.load(indices + i_n * stride_idx_n + i_t * stride_idx_t).to(tl.int32)
+            if (not USE_INDICES) or write_row > 0:
+                p_ht = (
+                    ht
+                    + write_row.to(tl.int64) * stride_s_pool
+                    + i_hv * stride_s_h
+                    + o_v[:, None] * stride_s_v
+                    + o_k[None, :]
                 )
+                tl.store(p_ht, b_s.to(ht.dtype.element_ty), mask=m_s)
         else:
-            target = bos + pos
-            tl.store(
-                HT + target * FS[0] + hv * FS[1] + rv[:, None] * FS[2] + rk[None, :] * FS[3],
-                state,
-                mask=mh,
+            p_ht = (
+                ht
+                + (i_b * T + i_t).to(tl.int64) * (HV * DV * DK)
+                + i_hv * (DV * DK)
+                + o_v[:, None] * DK
+                + o_k[None, :]
             )
+            tl.store(p_ht, b_s.to(ht.dtype.element_ty), mask=m_s)
 
 
 def _launch(
@@ -216,156 +183,78 @@ def _launch(
     final_state,
     *,
     config=None,
-    use_tle=True,
+    use_tle=False,
     gate_parameters=None,
 ):
-    """Launch the shared recurrence with caller-provided output and state buffers."""
-    direct_packed = gate_parameters is not None and k is None
-    if direct_packed:
-        HV, DV, DK = initial_state.shape[1:]
-        B, T = q.shape[0], 1
-        H = (q.shape[1] - HV * DV) // (2 * DK)
-    else:
-        B, T, H, DK = k.shape
-        HV, DV = v.shape[2:]
+    """Launch the recurrence into caller-provided output and state buffers."""
+    if gate_parameters is not None or k is None:
+        raise NotImplementedError(
+            "the portable GDN recurrence does not implement the packed projection "
+            "route; it is provided by the Hopper backend"
+        )
+    del use_tle
+    B, T, H, DK = k.shape
+    HV, DV = v.shape[2:]
     N = B if cu_seqlens is None else cu_seqlens.numel() - 1
     if N == 0 or T == 0:
         return None
-    layout_vec = 0
-    cache_state = reuse_packed_state = False
-    # Trade live FP32 state registers against repeated Q/K and gate work.
-    if config is None:
-        threshold = 256 if gate_parameters is not None else 128
-        tile = 4 if N * HV < threshold else 8
-        if initial_state.dtype != torch.float32:
-            if gate_parameters is not None:
-                # Cap packed FP32 state at 2048 elements per CTA.
-                tile = 4 if N * HV < 64 else 8
-                if N * HV >= 512:
-                    tile = min(16, 2048 // triton.next_power_of_2(DK))
-            elif N * HV >= 128:
-                # Half-size snapshots favor wider tiles once the grid is large.
-                tile = min(32, 4096 // triton.next_power_of_2(DK))
-        config = (tile, 1, False)
-        dense_cache = initial_state.stride()[1:] == (DV * DK, DK, 1)
-        vector_cache = (
-            use_tle
-            and DK == 128
-            and DV >= 64
-            and DV % 16 == 0
-            and dense_cache
-            and torch.cuda.get_device_capability(q.device)[0] == 9
-        )
-        if vector_cache and initial_state.dtype in (torch.float32, torch.bfloat16):
-            state_bytes = N * HV * DK * DV * initial_state.element_size()
-            tokens_per_request = B * T // N
-            if (
-                direct_packed
-                and inplace_final_state
-                and final_state is initial_state
-                and ssm_state_indices is not None
-                and ssm_state_indices.ndim == 1
-                and num_accepted_tokens is None
-                and state_bytes >= 64 * 1024**2
-            ):
-                # Large caches favor fewer CTAs; packed decode writes the slot it read.
-                config = (32, 1, False)
-                cache_state = reuse_packed_state = True
-            elif (
-                gate_parameters is None
-                and tokens_per_request > 1
-                and state_bytes * (tokens_per_request + 1) >= 64 * 1024**2
-                and hasattr(tle.gpu, "set_layout")
-                and q.stride(-1) == 1
-                and k.stride(-1) == 1
-            ):
-                # Put warps on V so the K reductions stay within a warp.
-                warps, layout_vec = (4, 4) if initial_state.dtype == torch.float32 else (1, 8)
-                config = (16, warps, False)
-    BV, warps, async_state = config
-    BV = min(triton.next_power_of_2(DV), BV)
-    layout = None
-    if layout_vec:
-        threads_k = min(32, triton.next_power_of_2(DK) // layout_vec)
-        layout = tle.gpu.BlockEncoding([1, layout_vec], [32 // threads_k, threads_k], [warps, 1], [1, 0])
+
+    BK = triton.next_power_of_2(DK)
+    BV = min(config[0] if config else 64, triton.next_power_of_2(DV))
     idx_strides = (1, 0)
     if ssm_state_indices is not None:
-        idx_strides = (ssm_state_indices.stride(0), 0) if ssm_state_indices.ndim == 1 else ssm_state_indices.stride()
+        idx_strides = (
+            (ssm_state_indices.stride(0), 0)
+            if ssm_state_indices.ndim == 1
+            else ssm_state_indices.stride()
+        )
 
-    # Canonicalize unused B=1 strides to avoid recompiling for each token count.
-    def strides(x):
-        s = x.stride()
-        return (0, *s[1:]) if cu_seqlens is not None else s
-
-    if direct_packed:
-        # Strides of [N,1,H,K] and [N,1,HV,V] views into mixed_qkv.
-        qs = ks = (q.stride(0), 0, DK, 1)
-        vs = (q.stride(0), 0, DV, 1)
-        gs = (g.stride(0), HV, 1)
-        bs = (beta.stride(0), HV, 1)
-    else:
-        qs, ks, vs, gs, bs = map(strides, (q, k, v, g, beta))
-
-    split_grid = N * HV > 65535
-
-    # Pool indices are int64; promote other offsets only for spans above INT32_MAX.
-    def span(x, start=0):
-        return sum(max(d - 1, 0) * abs(s) for d, s in zip(x.shape[start:], x.stride()[start:]))
-
-    address_inputs = (q, k, v, g, beta, out, ssm_state_indices, num_accepted_tokens)
-    wide_offsets = any(x is not None and span(x) > 2**31 - 1 for x in address_inputs)
-    state_inputs = (initial_state,) if final_state is initial_state else (initial_state, final_state)
-    wide_offsets |= any(span(x, 1) > 2**31 - 1 for x in state_inputs)
-    grid = (triton.cdiv(DV, BV), HV, N) if split_grid else (triton.cdiv(DV, BV), N * HV)
-    return _recurrent_fwd_kernel[grid](
-        q,
-        k if gate_parameters is None else None,
-        v if gate_parameters is None else None,
-        g,
-        beta,
-        initial_state,
-        final_state,
-        out,
-        cu_seqlens,
-        ssm_state_indices,
-        num_accepted_tokens,
-        None if gate_parameters is None else gate_parameters[0],
-        None if gate_parameters is None else gate_parameters[1],
-        T,
-        H,
-        HV,
-        DK,
-        DV,
-        triton.next_power_of_2(DK),
-        BV,
-        qs,
-        ks,
-        vs,
-        gs,
-        bs,
-        initial_state.stride(),
-        strides(out),
-        final_state.stride(),
-        idx_strides,
-        0 if num_accepted_tokens is None else num_accepted_tokens.stride(0),
-        scale,
-        cu_seqlens is not None,
-        ssm_state_indices is not None,
-        num_accepted_tokens is not None,
-        inplace_final_state,
-        beta.ndim == 4,
-        normalize,
-        use_tle,
-        async_state,
-        gate_parameters is not None,
-        split_grid,
-        wide_offsets,
-        layout,
-        cache_state,
-        reuse_packed_state,
-        num_warps=warps,
-        num_stages=1,
+    grid = (triton.cdiv(DV, BV), N * HV)
+    _recurrent_fwd_kernel[grid](
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        o=out,
+        h0=initial_state,
+        ht=final_state,
+        cu_seqlens=cu_seqlens,
+        indices=ssm_state_indices,
+        accepted=num_accepted_tokens,
+        scale=float(scale),
+        T=T,
+        stride_q_b=q.stride(0),
+        stride_q_t=q.stride(1),
+        stride_q_h=q.stride(2),
+        stride_v_b=v.stride(0),
+        stride_v_t=v.stride(1),
+        stride_v_h=v.stride(2),
+        stride_o_b=out.stride(0),
+        stride_o_t=out.stride(1),
+        stride_o_h=out.stride(2),
+        stride_s_pool=initial_state.stride(0),
+        stride_s_h=initial_state.stride(1),
+        stride_s_v=initial_state.stride(2),
+        stride_g_b=g.stride(0),
+        stride_g_t=g.stride(1),
+        stride_idx_n=idx_strides[0],
+        stride_idx_t=idx_strides[1],
+        H=H,
+        HV=HV,
+        DK=DK,
+        DV=DV,
+        BK=BK,
+        BV=BV,
+        IS_VARLEN=cu_seqlens is not None,
+        USE_INDICES=ssm_state_indices is not None,
+        USE_ACCEPTED=num_accepted_tokens is not None,
+        INPLACE=inplace_final_state,
+        VECTOR_BETA=beta.ndim == 4,
+        NORMALIZE=normalize,
+        num_warps=4,
     )
+    return None
 
 
 def fused_recurrent_gated_delta_rule_fwd(
@@ -382,85 +271,40 @@ def fused_recurrent_gated_delta_rule_fwd(
     num_accepted_tokens=None,
     use_qk_l2norm_in_kernel=False,
 ):
-    """Compute scalar GDN outputs and updated states (forward inference only).
+    """Compute GDN outputs and updated states (forward inference only).
 
-    Q/K: [B,T,H,K], V: [B,T,HV,V], g: [B,T,HV] (log decay),
-    beta: [B,T,HV] or [B,T,HV,V]. HV must be divisible by H.
-    initial_state: [pool,HV,V,K]; dense no-index mode uses one row per sequence.
-    Packed variable lengths require B=1 and contiguous cu_seqlens [N+1].
-    K and V must be in 1..256. N and HV must each fit the CUDA Y/Z-grid limit 65535.
-    A selected initial index <=0 marks a padded request: its outputs and returned
-    snapshots are zero and cache is untouched. For an active request, nonpositive
-    per-token write indices suppress only that store; recurrence/output continues.
-    In-place writes must not alias another request's read or write slots.
-
-    With indices [N,L], accepted[n]-1 selects the previous state to read and
-    indices[n,t] receives every new state. In non-inplace mode all per-token
-    snapshots are returned in [B*T,HV,V,K]. Indices and offsets are caller
-    metadata; they must be valid and remain device resident (no host sync).
+    Q/K: ``[B,T,H,K]``, V: ``[B,T,HV,V]``, g: ``[B,T,HV]`` (log decay),
+    beta: ``[B,T,HV]`` or ``[B,T,HV,V]``; HV must be divisible by H.
+    ``initial_state`` uses the ``[pool,HV,V,K]`` cache layout. Packed
+    variable-length inputs require ``B=1`` and a contiguous ``cu_seqlens``.
+    A selected index <= 0 marks a padded request: its outputs are zero and
+    the cache is left untouched.
     """
     tensors = (q, k, v, g, beta, initial_state)
-    if any(x.device != q.device for x in tensors) or q.device.type != "cuda":
-        raise ValueError("all tensors must be on the same CUDA device")
-    if any(x.requires_grad for x in tensors) and torch.is_grad_enabled():
+    if any(x.device != q.device for x in tensors):
+        raise ValueError("all tensors must be on the same device")
+    if torch.is_grad_enabled() and any(x.requires_grad for x in tensors):
         raise RuntimeError("fused recurrent GDN supports forward inference only")
     if q.ndim != 4 or v.ndim != 4 or k.shape != q.shape or v.shape[:2] != q.shape[:2]:
         raise ValueError("expected matching [B,T,H,K] Q/K and [B,T,HV,V] V")
     B, T, H, DK = q.shape
     HV, DV = v.shape[2:]
-    if H <= 0 or HV <= 0 or HV % H or g.shape != (B, T, HV) or beta.shape not in ((B, T, HV), (B, T, HV, DV)):
+    if HV % H or g.shape != (B, T, HV) or beta.shape not in ((B, T, HV), (B, T, HV, DV)):
         raise ValueError("invalid grouped heads, gate, or beta shape")
-    if q.dtype != k.dtype or q.dtype != v.dtype or q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise ValueError("Q/K/V must have the same FP16, BF16 or FP32 dtype")
-    if g.dtype not in (torch.float16, torch.bfloat16, torch.float32) or beta.dtype not in (
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-    ):
-        raise ValueError("g and beta must be FP16, BF16 or FP32")
     if initial_state.ndim != 4 or initial_state.shape[1:] != (HV, DV, DK):
         raise ValueError("state must use [pool,HV,V,K] layout")
-    if initial_state.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise ValueError("state must be FP16, BF16 or FP32")
     if cu_seqlens is not None and (B != 1 or cu_seqlens.ndim != 1):
         raise ValueError("packed variable-length inputs require B=1 and 1D offsets")
-    if cu_seqlens is not None and cu_seqlens.stride(0) != 1:
-        raise ValueError("cu_seqlens must be contiguous")
     if num_accepted_tokens is not None and ssm_state_indices is None:
         raise ValueError("accepted-token counts require state indices")
-    if ssm_state_indices is not None and ssm_state_indices.ndim not in (1, 2):
-        raise ValueError("state indices must be 1D or 2D")
-    N = B if cu_seqlens is None else cu_seqlens.numel() - 1
-    if N < 0:
-        raise ValueError("cu_seqlens must contain at least one offset")
-    if N > 65535 or HV > 65535:
-        raise ValueError("request and value-head counts must each not exceed 65535")
-    for metadata in (cu_seqlens, ssm_state_indices, num_accepted_tokens):
-        if metadata is not None and (metadata.device != q.device or metadata.dtype not in (torch.int32, torch.int64)):
-            raise ValueError("offsets, indices and counts must be CUDA int32/int64 tensors")
-    if ssm_state_indices is not None and ssm_state_indices.shape[0] != N:
-        raise ValueError("state indices need one row per sequence")
-    if ssm_state_indices is not None and ssm_state_indices.ndim == 2:
-        required_columns = max(T, 1) if cu_seqlens is None and inplace_final_state else 1
-        if ssm_state_indices.shape[1] < required_columns:
-            raise ValueError("state indices have too few token columns")
-    if num_accepted_tokens is not None and ssm_state_indices.ndim != 2:
-        raise ValueError("speculative state selection requires 2D state indices")
-    if num_accepted_tokens is not None and (num_accepted_tokens.ndim != 1 or num_accepted_tokens.numel() != N):
-        raise ValueError("accepted-token counts need one element per sequence")
-    if ssm_state_indices is None and initial_state.shape[0] < N:
-        raise ValueError("dense state needs one row per sequence")
     if not (0 < DK <= 256 and 0 < DV <= 256):
         raise ValueError("supported K and V dimensions are 1..256")
+
     out = torch.empty_like(v, memory_format=torch.contiguous_format)
     final = (
         initial_state
         if inplace_final_state
-        else torch.empty(
-            (B * T, HV, DV, DK),
-            dtype=initial_state.dtype,
-            device=q.device,
-        )
+        else torch.empty((B * T, HV, DV, DK), dtype=initial_state.dtype, device=q.device)
     )
     _launch(
         q,

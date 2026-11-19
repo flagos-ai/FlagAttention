@@ -11,3 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""NVIDIA backend operator overrides.
+
+Entries resolve to :mod:`flag_attn.runtime.backend._nvidia.dispatch`, which
+picks the Hopper or Blackwell implementation from the running device's
+compute capability. ``op_registry`` caches one symbol per vendor, so the
+architecture choice has to happen behind these facades rather than here.
+"""
+
+import importlib
+
+from .dispatch import _OPERATOR_EXPORTS
+
+__all__ = sorted(_OPERATOR_EXPORTS)
+
+
+def __getattr__(name):
+    try:
+        module_name, attribute_name = _OPERATOR_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(importlib.import_module(module_name, __name__), attribute_name)
+    globals()[name] = value
+    return value

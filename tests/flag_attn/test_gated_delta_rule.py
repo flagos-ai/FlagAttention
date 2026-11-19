@@ -23,10 +23,21 @@ import triton
 
 import flag_attn
 from flag_attn import chunk_gated_delta_rule
-from flag_attn.FLA.gated_delta_rule import chunk_gated_delta_rule_fwd
+from flag_attn.FLA.gated_delta_rule import chunk_gated_delta_rule_fwd as generic_chunk_gated_delta_rule_fwd
 from flag_attn.testing import backend as test_backend
 from flag_attn.utils import has_triton_tle
 from gdn_utils import check_close, make_case, make_packed_case, reference, reference_packed, unpack_reference_case
+
+
+# The TLE routes (full/recompute/two-kernel/hybrid) and the env vars that select
+# them live only in the Hopper implementation; the generic package is plain
+# Triton and ignores them. White-box tests below therefore reach into
+# ``HOPPER_PKG`` rather than ``flag_attn.FLA.gated_delta_rule``, and go through
+# the public dispatched entry points when they mean "whatever this device runs".
+HOPPER_PKG = "flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule"
+
+# Dispatched by compute capability: Hopper here, generic elsewhere.
+chunk_gated_delta_rule_fwd = flag_attn.chunk_gated_delta_rule_fwd
 
 
 ASSERT_RATIO = 0.01
@@ -241,7 +252,7 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
 def _two_kernel_configs():
     if not _cuda_tle_available():
         return [None]
-    from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import (
+    from flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk_fused_forward import (
         _chunk_gdn_two_kernel_fwd_kernel,
     )
 
@@ -336,7 +347,7 @@ class TestChunkGatedDeltaRule:
     @pytest.mark.parametrize("shape", GDN_TWO_KERNEL_TEST_SHAPES)
     @torch.inference_mode()
     def test_chunk_gated_delta_rule_fwd_two_kernel_matches_native(self, dtype, shape, monkeypatch):
-        import flag_attn.FLA.gated_delta_rule.chunk as implementation
+        import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk as implementation
 
         calls = []
         original = implementation.chunk_gdn_two_kernel_fwd
@@ -370,7 +381,7 @@ class TestChunkGatedDeltaRule:
     @pytest.mark.parametrize("config", _two_kernel_configs())
     @torch.inference_mode()
     def test_chunk_gated_delta_rule_two_kernel_configs(self, dtype, config):
-        from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import (
+        from flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk_fused_forward import (
             _chunk_gdn_two_kernel_fwd_kernel,
         )
 
@@ -486,7 +497,7 @@ class TestChunkGatedDeltaRule:
         if not hasattr(tle, "pipe") or torch.cuda.get_device_capability()[0] != 9:
             pytest.skip("requires Hopper and TLE pipes")
         reference = pytest.importorskip("fla.ops.gated_delta_rule").chunk_gated_delta_rule
-        import flag_attn.FLA.gated_delta_rule.chunk_fused_tle as fused
+        import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk_fused_tle as fused
 
         original_fwd = fused._tle_chunk_gated_delta_rule_fwd
         calls = []
@@ -590,7 +601,7 @@ class TestChunkGatedDeltaRule:
     def test_raw_chunk_fused_contract(self, dtype, fp32_gates, monkeypatch):
         if torch.cuda.get_device_capability()[0] != 9:
             pytest.skip("fused chunk path requires Hopper")
-        import flag_attn.FLA.gated_delta_rule.chunk_fused_tle as module
+        import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk_fused_tle as module
 
         calls = []
         original = module._tle_chunk_gated_delta_rule_fwd
@@ -659,7 +670,7 @@ class TestChunkGatedDeltaRule:
     @torch.inference_mode()
     def test_stateful_packed_chunk_keeps_fallback(self, dtype, monkeypatch):
         fla = pytest.importorskip("fla.ops.gated_delta_rule").chunk_gated_delta_rule
-        import flag_attn.FLA.gated_delta_rule.chunk_fused_tle as module
+        import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk_fused_tle as module
 
         def unexpected_fast_path(*args, **kwargs):
             raise AssertionError("stateful ragged prefill must retain its existing path")
@@ -685,10 +696,10 @@ class TestChunkGatedDeltaRule:
         if torch.cuda.get_device_capability()[0] != 9:
             pytest.skip("Hopper fusion contract")
         fla = pytest.importorskip("fla.ops.gated_delta_rule").chunk_gated_delta_rule
-        import flag_attn.FLA.gated_delta_rule.api as api
-        import flag_attn.FLA.gated_delta_rule.chunk as implementation
-        import flag_attn.FLA.gated_delta_rule.chunk_fused_forward as two_kernel
-        import flag_attn.FLA.gated_delta_rule.chunk_fused_tle as fused
+        import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.api as api
+        import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk as implementation
+        import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk_fused_forward as two_kernel
+        import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk_fused_tle as fused
 
         def unexpected_fusion(*args, **kwargs):
             raise AssertionError("materialized auxiliaries require the staged path")
@@ -795,7 +806,7 @@ class TestChunkGatedDeltaRule:
     def test_preparation_all_configs_initialize_dense_outputs(self, dtype, length, block_k, warps, outputs):
         if torch.cuda.get_device_capability()[0] != 9:
             pytest.skip("register preparation requires Hopper")
-        from flag_attn.FLA.gated_delta_rule.chunk_fused_tle_prepare import _prepare_kernel
+        from flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk_fused_tle_prepare import _prepare_kernel
 
         torch.manual_seed(73)
         dk = 128 if length == 64 else 60
@@ -873,7 +884,7 @@ class TestChunkGatedDeltaRule:
         if torch.cuda.get_device_capability()[0] != 9:
             pytest.skip("register preparation requires Hopper")
         from gdn_utils import make_case
-        import flag_attn.FLA.gated_delta_rule.chunk_fused_tle_prepare as preparation
+        import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk_fused_tle_prepare as preparation
 
         calls = []
         original = preparation._prepare_kernel.run
@@ -992,7 +1003,7 @@ class TestChunkGatedDeltaRule:
     def test_single_key_tile_fp32_gates(self, dtype, heads, gates, config_index, monkeypatch):
         if torch.cuda.get_device_capability()[0] != 9:
             pytest.skip("FP32 two-kernel gates require Hopper")
-        import flag_attn.FLA.gated_delta_rule.chunk_fused_forward as fused
+        import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk_fused_forward as fused
         from gdn_utils import make_case
 
         h, hv, dv = heads
@@ -1145,7 +1156,7 @@ class TestRecurrentGatedDeltaRule:
 
     @pytest.mark.fused_recurrent_gated_delta_rule_fwd
     def test_recurrent_preallocated_kernel_is_exercised(self):
-        from flag_attn.FLA.gated_delta_rule.fused_recurrent import _launch
+        from flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.fused_recurrent import _launch
 
         case = make_case(2, 4, 2, 4, spec=True)
         expected = reference(case)
@@ -1323,7 +1334,7 @@ class TestPackedGatedDeltaRule:
     @pytest.mark.parametrize("seed", [0, 17])
     @torch.inference_mode()
     def test_packed_reference(self, dtype, dims, seed, monkeypatch):
-        import flag_attn.FLA.gated_delta_rule.packed_decode as module
+        import flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.packed_decode as module
 
         original = module._launch
         calls = []
@@ -1461,9 +1472,14 @@ class TestPackedGatedDeltaRule:
     @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
     @torch.inference_mode()
     def test_public_exports_and_untouched_padding(self):
-        from flag_attn.FLA.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
+        from flag_attn.runtime.backend._nvidia import dispatch
+        from flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
 
-        assert flag_attn.chunk_gated_delta_rule_fwd is chunk_gated_delta_rule_fwd
+        # The public name is a dispatch facade, not the implementation itself:
+        # it picks an architecture on first call. Assert what it resolves to
+        # here rather than object identity, which the facade cannot satisfy.
+        assert callable(flag_attn.chunk_gated_delta_rule_fwd)
+        assert dispatch._resolve("chunk_gated_delta_rule_fwd") is chunk_gated_delta_rule_fwd
         assert callable(flag_attn.fused_recurrent_gated_delta_rule_fwd)
         c = make_packed_case(n=3)
         c["ssm_state_indices"][0] = 0
@@ -1507,7 +1523,7 @@ class TestPackedGatedDeltaRule:
     @pytest.mark.parametrize("dims", [(128, 128), (256, 64), (64, 256)])
     @torch.inference_mode()
     def test_low_precision_cache_large_parallelism(self, state_dtype, dims):
-        from flag_attn.FLA.gated_delta_rule.packed_decode import _launch_packed
+        from flag_attn.runtime.backend._nvidia.hopper.gated_delta_rule.packed_decode import _launch_packed
         from gdn_utils import make_case, reference
 
         c = make_packed_case(n=64, h=4, hv=8, kdim=dims[0], vdim=dims[1], state_dtype=state_dtype)

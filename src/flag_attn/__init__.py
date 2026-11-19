@@ -67,7 +67,7 @@ _OPERATOR_EXPORTS = {
         "chunk_log_linear_attn",
     ),
     "chunk_gated_delta_rule": (
-        "flag_attn.FLA.gated_delta_rule",
+        "flag_attn.FLA.gated_delta_rule.api",
         "chunk_gated_delta_rule",
     ),
     "chunk_gla": (
