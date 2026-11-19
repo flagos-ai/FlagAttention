@@ -1,5 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
+
 """Ascend paged relative attention with Cube, Vector decode and split-KV.
 
 Queries occupy the last q_len positions of each cached sequence. Relative
@@ -18,13 +19,12 @@ _BLOCK_M = 64
 _BLOCK_N = 64
 _SMALL_Q_BLOCK_M = 16
 _SMALL_Q_BLOCK_N = 128
-#: Query length up to which the short-query tile is used.
 _SMALL_Q = 64
 _NUM_WARPS = 4
 _COMBINE_ROWS = 16
 _MAX_HEAD_DIM = 256
 _MAX_SPLITS = 32  # Automatic scheduling limit.
-#: Programs we want in flight (roughly three waves of the 40 AI cores).
+# Target grid size for automatic split-KV scheduling.
 _TARGET_PROGRAMS = 128
 
 
@@ -88,7 +88,7 @@ def _resolve_window(causal, window_size):
         left, right = None, None
     if left is None and right == 0:
         return True, None, None
-    # A non-positive right bound already implies causality; retain KV clipping.
+    # A non-positive right bound allows causal KV clipping.
     return bool(causal) or (right is not None and right <= 0), left, right
 
 
@@ -193,9 +193,7 @@ def inkling_fa4_rel_attention(
     selected = (backend or "auto").strip().lower()
     if selected not in {"auto", "triton", "base", "tle", "triton_tle", "triton-tle"}:
         raise ValueError(f"unknown Inkling FA4 backend={selected!r}")
-    # ``backend`` (``triton``/``tle``) selects the upstream CUDA variants; on
-    # Ascend this module is the only implementation, so it is accepted and
-    # ignored to keep the public signature identical.
+    # Accept common backend aliases for call compatibility.
     del backend
     _check(q, key_cache, value_cache, block_table, cache_seqlens, cu_seqlens_q,
            rel_logits, rel_extent, out, max_seqlen_q, window_size, num_splits)

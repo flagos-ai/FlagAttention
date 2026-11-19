@@ -1,5 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
+
 """Ascend Triton kernels for Inkling FA4 paged relative attention."""
 
 import triton
@@ -183,9 +184,7 @@ def _rel_attn_paged_kernel(
                 else:
                     scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * softmax_scale
 
-            # Relative index of the first column of this tile; the index grows by one
-            # per column, so the whole slice is one contiguous row run and the per-row
-            # base can be hoisted out of the elementwise address math.
+            # Start each bias row at the relative index of the tile's first key.
             bias_start = q_pos - ((iter_hi - 1) - j0)
             bias_row = (
                 rel_ptr
@@ -272,10 +271,7 @@ def _rel_attn_paged_kernel(
             m_i = m_new
 
     if SPLIT_KV:
-        # Store the *normalised* partial output plus the log-sum-exp.  The combine
-        # weights are exp(lse - max_lse), which already contains the split's own
-        # sum, so the partial must be divided by it here (an unnormalised
-        # numerator would be scaled by sum_s a second time).
+        # Normalize each partial output because the combine uses LSE weights.
         l_has = l_i > 0.0
         l_safe = tl.where(l_has, l_i, 1.0)
         lse = tl.where(l_has, m_i + tl.log(l_safe), -float("inf"))
@@ -329,7 +325,7 @@ def _combine_splits_kernel(
     BLOCK_D: tl.constexpr,
     ROWS: tl.constexpr,
 ):
-    """Merge ``NUM_SPLITS`` partial attentions: out = sum_s w_s*acc_s / sum_s w_s."""
+    """Merge normalized partial outputs using their log-sum-exp weights."""
     pid = tl.program_id(0)
     rows = pid * ROWS + tl.arange(0, ROWS)
     row_valid = rows < total_rows
