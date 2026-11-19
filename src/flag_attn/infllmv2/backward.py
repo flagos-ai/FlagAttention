@@ -75,6 +75,7 @@ def _dq_kernel(
     CAUSAL: tl.constexpr,
     M: tl.constexpr,
     BD: tl.constexpr,
+    CHECK_BLOCK_BOUNDS: tl.constexpr = False,
 ):
     qi, hk, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     qs, qe = tl.load(CuQ + batch), tl.load(CuQ + batch + 1)
@@ -93,7 +94,10 @@ def _dq_kernel(
     limit = ke - ks - (qe - qs) + qi + 1
     for rank in tl.range(0, TOPK):
         block = tl.load(Selected + (hk * TOTAL_Q + qs + qi) * TOPK + rank)
-        if block >= 0:
+        legal = block >= 0
+        if CHECK_BLOCK_BOUNDS:
+            legal = legal & (block < tl.cdiv(ke - ks, BS))
+        if legal:
             pos = block * BS + n
             valid = pos < ke - ks
             if CAUSAL:
@@ -139,6 +143,7 @@ def _dkdv_kernel(
     QUERY_SPLIT: tl.constexpr,
     SCALE: tl.constexpr,
     CAUSAL: tl.constexpr,
+    QUERY_TILE: tl.constexpr = 0,
 ):
     task = tl.program_id(0)
     owner, start = tl.load(Tasks + task * 2), tl.load(Tasks + task * 2 + 1)
@@ -159,6 +164,9 @@ def _dkdv_kernel(
     for offset in tl.range(start, end, M // GP):
         slot = offset + m // GP
         qi = tl.load(Queries + owner * MAX_Q + slot, slot < end, 0)
+        if QUERY_TILE:
+            multiplicity = qi // QUERY_TILE + 1
+            qi = qi % QUERY_TILE
         valid_m = (slot < end) & (m % GP < G)
         qoff = (qs + qi[:, None]) * HQ * D + head[:, None] * D + d[None, :]
         q = tl.load(Q + qoff, valid_m[:, None] & (d[None, :] < D), 0)
@@ -170,8 +178,12 @@ def _dkdv_kernel(
             valid = valid & (pos[None, :] < ke - ks - (qe - qs) + qi[:, None] + 1)
         logits = tl.dot(q, tl.trans(k)) * SCALE
         p = tl.where(valid, tl.exp(logits - lse[:, None]), 0.0)
+        if QUERY_TILE:
+            p = p * multiplicity[:, None]
         dp = tl.dot(do, tl.trans(v))
         ds = p * (dp - delta[:, None]) * SCALE
+        if QUERY_TILE:
+            ds = tl.where(valid, ds, 0.0)
         dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
         dv += tl.dot(tl.trans(p.to(do.dtype)), do)
     # One update per element per QUERY_SPLIT contributors, not per query.
@@ -187,6 +199,11 @@ def sparse_backward(
     Host reads for max_K/task count synchronize CUDA. Timing must include the
     whole function, not only the two attention-gradient kernel launches.
     """
+    if q.device.type == "npu":
+        from flag_attn.runtime.backend._ascend.infllmv2.backward import sparse_backward as ascend_backward
+
+        return ascend_backward(q, k, v, out, dout, lse, selected, cu_q, cu_k,
+                               max_q, block_size, softmax_scale, causal)
     total_q, hq, d = q.shape
     hkv = k.shape[1]
     group = hq // hkv
