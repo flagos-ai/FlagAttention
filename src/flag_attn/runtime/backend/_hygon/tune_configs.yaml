@@ -79,3 +79,45 @@ _fused_attnres_fwd_kernel:
   - META: {}
     num_warps: 4
     num_stages: 2
+
+# Hygon MoBA launch policies and autotune candidates.
+_moba_attention:
+  - META: {BLOCK_M: 64, BLOCK_N: 64}
+    num_warps: 4
+    num_stages: 2
+_moba_attention_d256:
+  - META: {BLOCK_M: 32, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+_moba_routed_attention:
+  - META: {BLOCK_M: 64, BLOCK_N: 64}
+    num_warps: 4
+    num_stages: 1
+_moba_routed_attention_d256:
+  - META: {BLOCK_M: 32, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+_moba_fused_merge:
+  - META: {BLOCK_D: 64}
+    num_warps: 4
+  - META: {BLOCK_D: 128}
+    num_warps: 4
+_moba_gather_q:
+  - META: {BLOCK_ROWS: 4, BYPASS_L1: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_ROWS: 4, BYPASS_L1: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_ROWS: 8, BYPASS_L1: false}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_ROWS: 8, BYPASS_L1: true}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_ROWS: 16, BYPASS_L1: false}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_ROWS: 16, BYPASS_L1: true}
+    num_warps: 8
+    num_stages: 1
