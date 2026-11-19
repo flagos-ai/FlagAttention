@@ -104,7 +104,10 @@ def _candidates(name: str) -> list[tuple[str, str]]:
 def _resolve(name: str):
     errors = []
     for module_name, symbol in _candidates(name):
-        package = __name__ if module_name.startswith(".") else None
+        # Relative candidates are anchored at this module's package, not at
+        # the module itself -- ``__name__`` here is ``..._nvidia.dispatch``,
+        # which is not a package, so every relative import would fail.
+        package = __package__ if module_name.startswith(".") else None
         try:
             return getattr(import_module(module_name, package), symbol)
         except (AttributeError, ImportError) as exc:
