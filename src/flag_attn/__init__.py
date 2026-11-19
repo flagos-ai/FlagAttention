@@ -32,6 +32,18 @@ except ImportError:
     version_tuple = (0, 0, 0)
 
 _OPERATOR_EXPORTS = {
+    "chunk_gated_delta_rule_fwd": (
+        "flag_attn.FLA.gated_delta_rule.chunk",
+        "chunk_gated_delta_rule_fwd",
+    ),
+    "fused_recurrent_gated_delta_rule_packed_decode": (
+        "flag_attn.FLA.gated_delta_rule.packed_decode",
+        "fused_recurrent_gated_delta_rule_packed_decode",
+    ),
+    "fused_recurrent_gated_delta_rule_fwd": (
+        "flag_attn.FLA.gated_delta_rule.fused_recurrent",
+        "fused_recurrent_gated_delta_rule_fwd",
+    ),
     "piecewise_attention": ("flag_attn.piecewise", "attention"),
     "flash_attention": ("flag_attn.flash", "attention"),
     "flash_attention_split_kv": ("flag_attn.split_kv", "attention"),
@@ -124,6 +136,9 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "chunk_gated_delta_rule_fwd",
+    "fused_recurrent_gated_delta_rule_packed_decode",
+    "fused_recurrent_gated_delta_rule_fwd",
     "sage_attention",
     "parallel_nsa",
     "parallel_nsa_compression",

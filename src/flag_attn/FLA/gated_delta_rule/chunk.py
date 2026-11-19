@@ -50,6 +50,7 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
 ):
     logger.debug("GEMS CHUNK GATED DELTA RULE FWD")
+    gate_dtype = g.dtype
     q_contiguous = q.is_contiguous()
     k_contiguous = k.is_contiguous()
     v_contiguous = v.is_contiguous()
@@ -83,6 +84,18 @@ def chunk_gated_delta_rule_fwd(
 
     chunk_size = _chunk_size_for_sequence(q.shape[1], cu_seqlens is not None)
     maybe_set_tle_recompute_allocator(q.device, cu_seqlens)
+
+    from flag_attn.FLA.gated_delta_rule.api import _can_use_fused_tle_chunk
+
+    if _can_use_fused_tle_chunk(q, k, v, beta, g, initial_state, output_final_state, cu_seqlens):
+        from flag_attn.FLA.gated_delta_rule.api import _set_tle_descriptor_allocator
+        from flag_attn.FLA.gated_delta_rule.chunk_fused_tle import _tle_chunk_gated_delta_rule_fwd
+        from flag_attn.FLA.gated_delta_rule.chunk_fused_tle_prepare import prepare_fused_tle_inputs
+
+        _set_tle_descriptor_allocator(q.device)
+        g_tle, a_zero, a_gated = prepare_fused_tle_inputs(k, g, beta, output_gated=True)
+        o, final_state = _tle_chunk_gated_delta_rule_fwd(q, k, v, g_tle, beta, a_zero, scale=float(scale))
+        return g_tle.to(gate_dtype), o, a_gated, final_state, None, None, None
 
     if initial_state is None and output_final_state:
         try:
@@ -139,7 +152,7 @@ def chunk_gated_delta_rule_fwd(
                         chunk_size=chunk_size,
                         output_dtype=k.dtype,
                     )
-                return g_tle, o, A_g, final_state, None, None, None
+                return g_tle.to(gate_dtype), o, A_g, final_state, None, None, None
         except ImportError:
             pass
 
@@ -170,7 +183,7 @@ def chunk_gated_delta_rule_fwd(
             g=g,
             scale=float(scale),
         )
-        return g, o, A, final_state, None, None, None
+        return g.to(gate_dtype), o, A, final_state, None, None, None
 
     g, A = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         g=g,
@@ -212,7 +225,7 @@ def chunk_gated_delta_rule_fwd(
             initial_state=initial_state,
             scale=scale,
         )
-        return g, o, A, final_state, None, None, None
+        return g.to(gate_dtype), o, A, final_state, None, None, None
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -234,6 +247,6 @@ def chunk_gated_delta_rule_fwd(
         chunk_size=chunk_size,
     )
     if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
+        return g.to(gate_dtype), o, A, final_state, None, None, None
     elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, final_state, w, h, v_new
+        return g.to(gate_dtype), o, A, final_state, w, h, v_new

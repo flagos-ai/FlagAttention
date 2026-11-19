@@ -31,16 +31,10 @@ else:
 
 def _use_tle_recompute_w_u(cu_seqlens: torch.Tensor | None) -> bool:
     value = os.environ.get("FLAG_ATTN_CHUNK_GDR_RECOMPUTE_TLE", "1").lower()
-    return (
-        HAS_TLE_RECOMPUTE_W_U
-        and cu_seqlens is None
-        and value not in {"0", "false", "off", "no"}
-    )
+    return HAS_TLE_RECOMPUTE_W_U and cu_seqlens is None and value not in {"0", "false", "off", "no"}
 
 
-def maybe_set_tle_recompute_allocator(
-    device: torch.device, cu_seqlens: torch.Tensor | None
-) -> None:
+def maybe_set_tle_recompute_allocator(device: torch.device, cu_seqlens: torch.Tensor | None) -> None:
     if not (HAS_TLE_RECOMPUTE_W_U and cu_seqlens is None):
         return
 
@@ -93,9 +87,7 @@ def recompute_w_u_fwd_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
-    p_beta = tl.make_block_ptr(
-        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-    )
+    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     p_g = tl.make_block_ptr(g + (bos * H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
     p_A = tl.make_block_ptr(
         A + (bos * H + i_h) * BT,
@@ -105,9 +97,9 @@ def recompute_w_u_fwd_kernel(
         (BT, BT),
         (1, 0),
     )
-    b_beta = tl.load(p_beta, boundary_check=(0,))
-    b_A = tl.load(p_A, boundary_check=(0, 1))
-    b_g = tl.exp(tl.load(p_g, boundary_check=(0,)).to(tl.float32))
+    b_beta = tl.load(p_beta, boundary_check=(0,), padding_option="zero")
+    b_A = tl.load(p_A, boundary_check=(0, 1), padding_option="zero")
+    b_g = tl.exp(tl.load(p_g, boundary_check=(0,), padding_option="zero").to(tl.float32))
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(
@@ -126,7 +118,7 @@ def recompute_w_u_fwd_kernel(
             (BT, BV),
             (1, 0),
         )
-        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
         b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
         b_u = tl.dot(b_A, b_vb, allow_tf32=False)
         tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
@@ -148,7 +140,7 @@ def recompute_w_u_fwd_kernel(
             (BT, BK),
             (1, 0),
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
         b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
         b_w = tl.dot(b_A, b_kb)
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
@@ -184,9 +176,7 @@ if HAS_TLE_RECOMPUTE_W_U:
         i_b, i_h = i_bh // H, i_bh % H
         bos = i_b * T
 
-        p_beta = tl.make_block_ptr(
-            beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-        )
+        p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
         p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
         p_A = tl.make_block_ptr(
             A + (bos * H + i_h) * BT,
@@ -196,9 +186,9 @@ if HAS_TLE_RECOMPUTE_W_U:
             (BT, BT),
             (1, 0),
         )
-        b_beta = tl.load(p_beta, boundary_check=(0,))
-        b_A = tl.load(p_A, boundary_check=(0, 1))
-        b_g = tl.exp(tl.load(p_g, boundary_check=(0,)).to(tl.float32))
+        b_beta = tl.load(p_beta, boundary_check=(0,), padding_option="zero")
+        b_A = tl.load(p_A, boundary_check=(0, 1), padding_option="zero")
+        b_g = tl.exp(tl.load(p_g, boundary_check=(0,), padding_option="zero").to(tl.float32))
 
         for i_v in tl.range(0, tl.cdiv(V, BV), 1, num_stages=PIPE_STAGES):
             p_v = tl.make_block_ptr(
@@ -217,7 +207,7 @@ if HAS_TLE_RECOMPUTE_W_U:
                 (BT, BV),
                 (1, 0),
             )
-            b_v = tle.load(p_v, boundary_check=(0, 1), is_async=True)
+            b_v = tle.load(p_v, boundary_check=(0, 1), padding_option="zero", is_async=True)
             b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
             b_u = tl.dot(b_A, b_vb, allow_tf32=False)
             tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
@@ -239,7 +229,7 @@ if HAS_TLE_RECOMPUTE_W_U:
                 (BT, BK),
                 (1, 0),
             )
-            b_k = tle.load(p_k, boundary_check=(0, 1), is_async=True)
+            b_k = tle.load(p_k, boundary_check=(0, 1), padding_option="zero", is_async=True)
             b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
             b_w = tl.dot(b_A, b_kb)
             tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
@@ -259,9 +249,7 @@ def recompute_w_u_fwd(
     H = v.shape[-2]
     BT = A.shape[-1]
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = block_v or 64
