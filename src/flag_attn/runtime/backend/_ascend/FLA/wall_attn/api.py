@@ -1,16 +1,13 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Ascend implementation of Wall attention (forward only).
+"""Ascend forward specializations for the public Wall attention API.
 
-The public entry mirrors ``flag_attn.FLA.wall_attn.parallel.parallel_wall_attn``.
-The forward pass uses the dedicated Ascend Triton kernel for the benchmark
-contract (K = V = 64, dense non-varlen, causal + optional window/sink/scalar
-gate); every other combination falls back to the generic Triton implementation.
-
-The backward pass is **not** implemented here: it falls back to the generic
-Triton dq/dkv kernels (read-only import).  Those kernels have not been validated
-on Ascend yet -- treat training as unsupported until that is re-measured.
+Dense FP16/BF16 inputs with K=V=64 use Ascend kernels; scalar gates and other
+contracts use the generic implementation. Backward delegates to the generic
+kernels and has not been validated on Ascend.
 """
+
+import math
 
 import torch
 import triton
@@ -20,6 +17,7 @@ from flag_attn.FLA.wall_attn import parallel as _generic
 from flag_attn.FLA.wall_attn.parallel import RCP_LN2
 
 from .cumsum import gate_prefix_sum, gate_prefix_sum_scalar
+from .global_fwd import _wall_global_impl
 from .kernels import _wall_fwd_kernel
 from .split import _wall_split_impl
 
@@ -31,25 +29,46 @@ _WARPS = 4
 #: Route names reported through the generic module's ``get_last_route()`` so the
 #: repo benchmark keeps reporting something meaningful on Ascend.
 _ROUTE_FAST = "ascend_fast"
-#: No-grad benchmark path: QK and PV in separate kernels with the scores in GM
-#: (measured faster than the fused kernel at every benchmark length).
+#: Dense forward with materialized scores for inputs outside the global path.
 _ROUTE_FAST_SPLIT = "ascend_fast_split"
+_ROUTE_FAST_GLOBAL = "ascend_fast_global"
 _ROUTE_FALLBACK = "official_fallback"
 
 
-def _route(name: str) -> None:
-    try:
-        _generic._LAST_ROUTE.set(name)
-    except Exception:  # pragma: no cover - reporting only
-        pass
+def _route(name: str | None) -> None:
+    _generic._LAST_ROUTE.set(name)
+
+
+def _global_path_supported(q, k, v, g, sink_bias, scale, window_size):
+    """Additional requirements after the common dense forward checks."""
+    B, T, HQ, _ = q.shape
+    return (
+        sink_bias is None
+        and window_size is None
+        and 128 <= T <= 4096
+        and T % 128 == 0
+        and B > 0
+        and B * HQ * (T // 128) <= 32768
+        and isinstance(scale, (int, float))
+        and math.isfinite(scale)
+    )
 
 
 def _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlens) -> bool:
     if cu_seqlens is not None:
         return False
-    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4 or g.dim() != 4:
+    tensors = (q, k, v, g)
+    if any(tensor.ndim != 4 for tensor in tensors):
+        return False
+    if any(tensor.layout != torch.strided for tensor in tensors):
+        return False
+    if q.device.type != "npu" or any(tensor.device != q.device for tensor in tensors):
         return False
     if q.shape[-1] != _BK or k.shape[-1] != _BK or v.shape[-1] != _BV:
+        return False
+    if q.shape != g.shape or q.shape[:2] != k.shape[:2] or k.shape[:3] != v.shape[:3]:
+        return False
+    if min(q.shape[:3]) <= 0 or k.shape[2] <= 0:
         return False
     if q.dtype not in (torch.bfloat16, torch.float16):
         return False
@@ -61,11 +80,15 @@ def _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlen
         return False
     if sink_bias is not None and sink_bias.shape != (q.shape[2],):
         return False
+    if sink_bias is not None and (
+        sink_bias.device != q.device
+        or sink_bias.layout != torch.strided
+        or not sink_bias.is_contiguous()
+    ):
+        return False
     if g_scalar is not None:
         # the scalar-gate prefix kernel crashes the bishengir compiler on this
         # CANN build, so keep that combination on the generic implementation.
-        return False
-    if g_scalar is not None and g_scalar.shape != q.shape[:-1]:
         return False
     if window_size is not None and window_size <= 0:
         return False
@@ -74,7 +97,7 @@ def _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlen
 
 def _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar):
     """Run the Ascend kernel and return ``(o, P, lse, sink_scaled, c)``."""
-    P = gate_prefix_sum(g) * RCP_LN2
+    P = gate_prefix_sum(g, scale=RCP_LN2)
     c = (
         gate_prefix_sum_scalar(g_scalar) * RCP_LN2
         if g_scalar is not None
@@ -124,7 +147,7 @@ class _WallAscendFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar=None):
         # The dense fast path uses the dedicated Triton gate prefix kernel.
-        P = gate_prefix_sum(g) * RCP_LN2
+        P = gate_prefix_sum(g, scale=RCP_LN2)
         c = (
             gate_prefix_sum_scalar(g_scalar) * RCP_LN2
             if g_scalar is not None
@@ -205,18 +228,19 @@ class _WallAscendFunction(torch.autograd.Function):
 
 
 def parallel_wall_attn(
-    q,
-    k,
-    v,
-    g,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
     *,
-    g_scalar=None,
-    sink_bias=None,
-    scale=None,
-    window_size=None,
-    cu_seqlens=None,
-):
+    g_scalar: torch.Tensor | None = None,
+    sink_bias: torch.Tensor | None = None,
+    scale: float | None = None,
+    window_size: int | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+) -> torch.Tensor:
     """Wall attention forward (Ascend kernel) with a generic fallback."""
+    _route(None)
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if g_scalar is not None and g_scalar.shape != q.shape[:-1]:
@@ -226,18 +250,22 @@ def parallel_wall_attn(
     if sink_bias is not None and sink_bias.shape != (q.shape[2],):
         raise ValueError(f"`sink_bias` must be [HQ]; got {sink_bias.shape}")
     if _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlens):
-        if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v, g)):
+        if _generic._requires_backward(q, k, v, g, sink_bias, g_scalar):
+            o = _WallAscendFunction.apply(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
             _route(_ROUTE_FAST)
-            return _WallAscendFunction.apply(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
+            return o
+        if _global_path_supported(q, k, v, g, sink_bias, scale, window_size):
+            o = _wall_global_impl(q, k, v, g, scale)
+            _route(_ROUTE_FAST_GLOBAL)
+            return o
         split = _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
         if split is not None:
             _route(_ROUTE_FAST_SPLIT)
             return split[0]
-        _route(_ROUTE_FAST)
         o, _, _, _, _ = _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
+        _route(_ROUTE_FAST)
         return o
-    _route(_ROUTE_FALLBACK)
-    return _generic._parallel_wall_attn_default(
+    o = _generic._parallel_wall_attn_default(
         q,
         k,
         v,
@@ -248,6 +276,8 @@ def parallel_wall_attn(
         window_size=window_size,
         cu_seqlens=cu_seqlens,
     )
+    _route(_ROUTE_FALLBACK)
+    return o
 
 
 __all__ = ["parallel_wall_attn"]

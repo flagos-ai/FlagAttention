@@ -25,6 +25,7 @@ def _prefix_sum_kernel(
     K: tl.constexpr,
     BK: tl.constexpr,
     BT: tl.constexpr,
+    SCALE: tl.constexpr,
 ):
     i_k = tl.program_id(0)
     i_bh = tl.program_id(1)
@@ -46,17 +47,17 @@ def _prefix_sum_kernel(
         mask = m_t[:, None] & m_k[None, :]
         x = tl.load(g + ptrs, mask=mask, other=0.0).to(tl.float32)
         c = tl.dot(b_l, x) + carry[None, :]
-        tl.store(out + ptrs, c, mask=mask)
+        tl.store(out + ptrs, c * SCALE, mask=mask)
         carry += tl.sum(x, 0)
 
 
-def gate_prefix_sum(g: torch.Tensor) -> torch.Tensor:
-    """``cumsum(g, dim=1)`` in float32, implemented as a Triton scan."""
+def gate_prefix_sum(g: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Scaled ``cumsum(g, dim=1)`` in float32, implemented as a Triton scan."""
     B, T, HQ, K = g.shape
     out = torch.empty((B, T, HQ, K), dtype=torch.float32, device=g.device)
     BK = 64
     grid = (triton.cdiv(K, BK), B * HQ)
-    _prefix_sum_kernel[grid](g, out, T, HQ=HQ, K=K, BK=BK, BT=64)
+    _prefix_sum_kernel[grid](g, out, T, HQ=HQ, K=K, BK=BK, BT=64, SCALE=scale)
     return out
 
 

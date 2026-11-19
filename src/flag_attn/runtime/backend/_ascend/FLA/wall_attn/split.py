@@ -1,52 +1,24 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""GM-split forward for Wall attention on Ascend (Triton).
+"""Split forward kernels for dense causal Wall attention on Ascend.
 
-Why split at all: in one kernel the loop body is ``dot -> elementwise ->
-dot``; this backend lowers that with a large scalar cost per KV tile (measured
-~14.5 us/tile-pair, 89% of the kernel, vs ~0.1 us/tile-pair for the official
-AscendC attention).  Splitting the softmax out of the QK/PV loop leaves every
-kernel with at most one ``tl.dot`` per iteration, which the backend lowers
-cheaply (loop microbenchmarks: a load+dot or load+elementwise loop costs ~0).
+A prefix scan produces FP32 log2 gate prefixes. QK rescales query/key tiles
+around an anchor and stores causal FP16 scores with padded row strides. PV
+exponentiates the scores in UB, computes row sums and weighted values, and
+normalizes the output without allocating a separate probabilities tensor.
 
-Structure (causal, dense, non-varlen -- the benchmark contract):
-
-1. ``gate_prefix_sum`` (cumsum.py) -> ``P`` fp32.
-2. ``_wall_qk_kernel``: per (query tile, head) program, rescale ``q`` once with
-   the program anchor ``R = P[q0]``, then loop over the causal KV tiles:
-   ``k_use = k * exp2(min(R - P_k, 76))`` (always <= 1 because the anchor sits
-   at the query-tile start and every KV tile processed lies at or before it),
-   ``s = dot(q_til, k_use)`` -> causal mask on the diagonal tile -> store
-   fp16 scores to GM.  Row stride is padded so it is never a 4 KiB multiple
-   (this backend degrades such stores; the hy3 prefill kernel discovered the
-   same and pads by 128 elements).
-3. ``_wall_pv_kernel``: per (query tile, head) program, loop over the same KV
-   tiles: load the fp16 scores tile, ``p = exp2(s)`` in fp16 (zero shift: the
-   anchored operands bound the score, and fp16 scores clamp it to +-15; the
-   clamped pair then utterly dominates its row so the clamp is exact enough),
-   accumulate the row sums in fp32 and ``dot(p, v)``, then normalise and store
-   ``o`` and ``lse``.
-
-No probabilities tensor is materialised: the softmax lives inside the PV loop
-as an elementwise step *before* the dot, which is cheap on this backend.
-
-Two exact specialisations keep the inner loops free of predication (masked
-loads cost about twice as much as unmasked ones on this backend, and the
-causal ``where`` is only needed for the tiles that straddle the diagonal):
-
-* ``EVEN`` (``T % (2*BT) == 0``, i.e. every KV tile of every program is in
-  bounds): no bounds masks anywhere, and the QK loop is split into a bulk loop
-  over the fully-causal tiles (no mask at all) plus a short tail loop over the
-  diagonal tiles (causal ``where`` only).  This covers every benchmark length.
-* otherwise the fully masked path runs (used by the odd-length correctness
-  cases only).
+The even-length path shares an anchor across two query tiles and uses unmasked
+loads for fully covered KV tiles. Other lengths use masked loads. Sink/scalar
+gates, sliding windows and packed sequences use another implementation.
 """
 
 import torch
 import triton
 import triton.language as tl
+import triton.experimental.tle.language.raw as raw
 
 from .cumsum import gate_prefix_sum
+from .raw_exp_sum import exp_sum_op
 
 _RCP_LN2 = 1.4426950216
 #: extra columns per score row so the row stride is never a 4 KiB multiple.
@@ -198,19 +170,19 @@ def _wall_qk2_kernel(
     n_full = q0 // BS
     for i_s in tl.range(0, n_full):
         o_k = i_s * BS + o_rs
-        b_k = tl.load(k + (((bos + o_k) * H + i_h) * K)[None, :] + rn[:, None])
-        b_pk = tl.load(P + (((bos + o_k) * HQ + i_hq) * K)[None, :] + rn[:, None]).to(tl.float32)
-        b_ku = (b_k.to(tl.float32) * exp2(tl.minimum(b_R[:, None] - b_pk, 76.0))).to(b_k.dtype)
-        tl.store(s_base + rm1[:, None] * LD_S + o_k[None, :], tl.dot(b_qt1, b_ku).to(tl.float16))
-        tl.store(s_base + rm2[:, None] * LD_S + o_k[None, :], tl.dot(b_qt2, b_ku).to(tl.float16))
+        b_k = tl.load(k + (((bos + o_k) * H + i_h) * K)[:, None] + rn[None, :])
+        b_pk = tl.load(P + (((bos + o_k) * HQ + i_hq) * K)[:, None] + rn[None, :]).to(tl.float32)
+        b_ku = (b_k.to(tl.float32) * exp2(tl.minimum(b_R[None, :] - b_pk, 76.0))).to(b_k.dtype)
+        tl.store(s_base + rm1[:, None] * LD_S + o_k[None, :], tl.dot(b_qt1, tl.trans(b_ku)).to(tl.float16))
+        tl.store(s_base + rm2[:, None] * LD_S + o_k[None, :], tl.dot(b_qt2, tl.trans(b_ku)).to(tl.float16))
     for i_s in tl.range(n_full, n_tiles):
         o_k = i_s * BS + o_rs
-        b_k = tl.load(k + (((bos + o_k) * H + i_h) * K)[None, :] + rn[:, None])
-        b_pk = tl.load(P + (((bos + o_k) * HQ + i_hq) * K)[None, :] + rn[:, None]).to(tl.float32)
-        b_ku = (b_k.to(tl.float32) * exp2(tl.minimum(b_R[:, None] - b_pk, 76.0))).to(b_k.dtype)
+        b_k = tl.load(k + (((bos + o_k) * H + i_h) * K)[:, None] + rn[None, :])
+        b_pk = tl.load(P + (((bos + o_k) * HQ + i_hq) * K)[:, None] + rn[None, :]).to(tl.float32)
+        b_ku = (b_k.to(tl.float32) * exp2(tl.minimum(b_R[None, :] - b_pk, 76.0))).to(b_k.dtype)
         # -inf is exact in fp16 and exp2(-inf) == 0, so PV needs no mask
-        s1 = tl.where(rm1[:, None] >= o_k[None, :], tl.dot(b_qt1, b_ku), float("-inf"))
-        s2 = tl.where(rm2[:, None] >= o_k[None, :], tl.dot(b_qt2, b_ku), float("-inf"))
+        s1 = tl.where(rm1[:, None] >= o_k[None, :], tl.dot(b_qt1, tl.trans(b_ku)), float("-inf"))
+        s2 = tl.where(rm2[:, None] >= o_k[None, :], tl.dot(b_qt2, tl.trans(b_ku)), float("-inf"))
         tl.store(s_base + rm1[:, None] * LD_S + o_k[None, :], s1.to(tl.float16))
         tl.store(s_base + rm2[:, None] * LD_S + o_k[None, :], s2.to(tl.float16))
 
@@ -220,8 +192,6 @@ def _wall_pv_kernel(
     scores,
     v,
     o,
-    lse,
-    scale_dummy,
     T,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -248,11 +218,7 @@ def _wall_pv_kernel(
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_den = tl.zeros([BT], dtype=tl.float32)
-    # The fp32 row sum of the probability tile is the most expensive vector op
-    # in this loop (315 us at T=4096), and the cube can do it for free:
-    # dot(p, ones[BS,16]) yields 16 identical copies of sum_j p_ij.  Whether
-    # that is a win is dtype dependent on this backend (measured: bf16 -12%,
-    # fp16 +25% at T=4096, 3 interleaved reps each), so the wrapper picks.
+    # BF16 uses Cube row sums; FP16 uses the in-place Raw exp/sum operation.
     b_den16 = tl.zeros([BT, 16], dtype=tl.float32)
     b_ones = tl.full([BS, 16], 1.0, dtype=tl.float16)
 
@@ -265,11 +231,18 @@ def _wall_pv_kernel(
         for i_s in tl.range(0, n_tiles):
             o_k = i_s * BS + o_rs
             b_s = tl.load(s_base + rm[:, None] * LD_S + o_k[None, :])
-            b_p = tl.exp2(b_s)
             if DOTDEN:
+                b_p = tl.exp2(b_s)
                 b_den16 += tl.dot(b_p, b_ones)
             else:
-                b_den += tl.sum(b_p.to(tl.float32), 1)
+                tl.static_assert(BS == 256 and BT % 16 == 0)
+                sums = tl.full((1, BT), 0, tl.float32)
+                scratch = tl.full((16, 256), 0, tl.float32)
+                b_p, sums, scratch = raw.call(
+                    exp_sum_op, [b_s, sums, scratch], output_indices=[0, 1, 2]
+                )
+                b_sum = tl.sum(sums, 0)
+                b_den += b_sum
             b_v = tl.load(v + (((bos + o_k) * H + i_h) * V)[:, None] + rv[None, :])
             b_o += tl.dot(b_p, b_v.to(b_p.dtype))
     else:
@@ -279,11 +252,18 @@ def _wall_pv_kernel(
             msk_s = o_k < T
             b_s = tl.load(s_base + rm[:, None] * LD_S + o_k[None, :],
                           mask=msk_m[:, None] & msk_s[None, :], other=float("-inf"))
-            b_p = tl.exp2(b_s.to(scores.dtype.element_ty))
             if DOTDEN:
+                b_p = tl.exp2(b_s.to(scores.dtype.element_ty))
                 b_den16 += tl.dot(b_p, b_ones)
             else:
-                b_den += tl.sum(b_p.to(tl.float32), 1)
+                tl.static_assert(BS == 256 and BT % 16 == 0)
+                sums = tl.full((1, BT), 0, tl.float32)
+                scratch = tl.full((16, 256), 0, tl.float32)
+                b_p, sums, scratch = raw.call(
+                    exp_sum_op, [b_s, sums, scratch], output_indices=[0, 1, 2]
+                )
+                b_sum = tl.sum(sums, 0)
+                b_den += b_sum
             b_v = tl.load(v + (((bos + o_k) * H + i_h) * V)[:, None] + rv[None, :],
                           mask=msk_s[:, None] & msk_v[None, :], other=0.0)
             b_o += tl.dot(b_p, b_v.to(b_p.dtype))
@@ -294,13 +274,10 @@ def _wall_pv_kernel(
     q_row = ((bos + rm) * HQ + i_hq) * V
     if EVEN:
         tl.store(o + q_row[:, None] + rv[None, :], b_o.to(o.dtype.element_ty))
-        tl.store(lse + (bos * HQ) + i_hq + rm * HQ, log2(tl.where(b_den > 0.0, b_den, 1.0)))
     else:
         msk_m = rm < T
         tl.store(o + q_row[:, None] + rv[None, :], b_o.to(o.dtype.element_ty),
                  mask=msk_m[:, None] & msk_v[None, :])
-        tl.store(lse + (bos * HQ) + i_hq + rm * HQ, log2(tl.where(b_den > 0.0, b_den, 1.0)),
-                 mask=msk_m)
 
 
 def _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar):
@@ -316,15 +293,11 @@ def _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_sc
         return None
     if K != 64 or V != 64:
         return None
-    P = gate_prefix_sum(g) * _RCP_LN2
+    P = gate_prefix_sum(g, scale=_RCP_LN2)
     ld_s = T + _ROW_PAD
     scores = torch.empty((B * HQ * T, ld_s), dtype=torch.float16, device=q.device)
     o = torch.empty((B, T, HQ, V), dtype=q.dtype, device=q.device)
-    lse = torch.empty((B, T, HQ), dtype=torch.float32, device=q.device)
-    # Tile choices measured on card 7 (see S0_REPORT.md): once the inner loops
-    # are mask-free the per-iteration overhead dominates, so both kernels want
-    # fewer, wider KV tiles -- QK 128x128, PV 128x256 (a wider PV tile would
-    # need more UB than the 192 KiB available).
+    # Align QK coverage with PV tiles so diagonal padding is initialized.
     qk_bt, qk_bs, qk_bk = 128, 128, 64
     pv_bt, pv_bs, pv_bv = 128, 256, 64
     #: the wide-tile path needs T divisible by 2*qk_bt == pv_bs == 256
@@ -340,7 +313,7 @@ def _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_sc
             B=B, H=H, HQ=HQ, K=K, BT=qk_bt, BS=qk_bs, BK=qk_bk,
             LD_S=ld_s, COV=pv_bs, EVEN=even)
     pv_grid = (triton.cdiv(T, pv_bt), HQ, B)
-    _wall_pv_kernel[pv_grid](scores, v, o, lse, scale, T,
+    _wall_pv_kernel[pv_grid](scores, v, o, T,
                              B=B, H=H, HQ=HQ, K=K, V=V, BT=pv_bt, BS=pv_bs, BV=pv_bv,
                              LD_S=ld_s, EVEN=even, DOTDEN=q.dtype == torch.bfloat16)
-    return o, lse
+    return o, None
