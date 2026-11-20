@@ -3,10 +3,9 @@
 """Guarded FP32 factorization for dense causal Wall attention.
 
 With P the gate prefix and R half its final value, Qg=q*exp(P-R) and
-Kg=k*exp(R-P) factor the gated score without a quadratic score allocation.
-HF32 dot retains FP32 exponent range. Device metadata bounds transformed
-operands and logits before using an unshifted softmax; other inputs use direct
-gated scores with stable online normalization. Neither path drops KV pairs.
+Kg=k*exp(R-P) factor the gated score. Unshifted softmax requires bounded
+rescaled operands and logits. Other inputs use direct gated scores and
+online softmax.
 """
 
 from pathlib import Path
@@ -56,7 +55,6 @@ def _wall_prepare(
     r = tl.arange(0, 64)
     d = tl.program_id(1) * 16 + tl.arange(0, 16)
     field = tl.arange(0, 8)[:, None]
-    # Raw owns the running sums, extrema and squared norms across blocks.
     state = tl.where(field == 3, tl.full((8, 16), -float('inf'), tl.float32), tl.full((8, 16), 0.0, tl.float32))
     for c in range(T // 64):
         rows = c * 64 + r
@@ -76,14 +74,12 @@ def _wall_prepare(
     km = tl.max(tl.max(tl.where(field == 5, state, 0.0), 0), 0)
     vm = tl.max(tl.max(tl.where(field == 6, state, 0.0), 0), 0)
     center = total * 0.5
-    # Each channel magnitude is bounded by its group L2 norm. The margin
-    # covers FP32 reduction rounding without separate amplitude reductions.
+    # The group L2 norm bounds each channel, with a margin for FP32 rounding.
     bound = tl.abs(center) + 0.5 * tl.log(tl.maximum(1.0, tl.maximum(qm, km) + 2.0))
     # Nonpositive gates bound causal channel weights by one. The exponent
     # and V bounds protect the factorization and unnormalized FP32 numerator.
     safe = tl.min(((gmax <= 0.0) & (bound < 88.0)).to(tl.int32), 0) & (qm < 1022.0).to(tl.int32) & (km < 1022.0).to(tl.int32) & (vm < 3.402823466e+38 / (T * 1.1420073898e+26 * 32.0)).to(tl.int32)
-    # Four groups bound full Q/K norms. Floor+2 conservatively covers FP32
-    # reduction rounding; only the metadata is capped, never the input data.
+    # Round each partial squared norm upward for the four-group reduction.
     qi = tl.minimum(qm, 1021.0).to(tl.int32) + 2
     ki = tl.minimum(km, 1021.0).to(tl.int32) + 2
     meta = safe << 30 | (qi & 1023) << 10 | ki & 1023
@@ -125,7 +121,6 @@ def _wall_global_fwd(
     rows = m * BM + tl.arange(0, BM)
     d = tl.arange(0, 64)
     n = tl.arange(0, BN)
-    # Scalar integer loads keep the predicate independent of vector reductions.
     m0 = tl.load(META + bh * 4)
     m1 = tl.load(META + bh * 4 + 1)
     m2 = tl.load(META + bh * 4 + 2)

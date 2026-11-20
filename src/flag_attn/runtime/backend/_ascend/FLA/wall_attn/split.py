@@ -24,13 +24,8 @@
 
 """Split forward kernels for dense causal Wall attention on Ascend.
 
-A prefix scan produces FP32 log2 gate prefixes. QK rescales query/key tiles
-around an anchor and stores causal FP16 scores with padded row strides. PV
-exponentiates the scores in UB, computes row sums and weighted values, and
-normalizes the output without allocating a separate probabilities tensor.
-
-The aligned path shares an anchor across two query tiles and uses unmasked
-loads for complete KV tiles. Sequence tails use masked loads.
+QK rescales query and key tiles with FP32 log2 gate prefixes and stores
+causal FP16 scores. PV exponentiates the scores and normalizes the output.
 """
 
 import torch
@@ -42,7 +37,6 @@ from .cumsum import gate_prefix_sum
 from .raw_exp_sum import exp_sum_op
 
 _RCP_LN2 = 1.4426950216
-# Extra columns per score row to shift the tile-aligned row stride.
 _ROW_PAD = 128
 
 
@@ -231,7 +225,6 @@ def _wall_pv_kernel(
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_den = tl.zeros([BT], dtype=tl.float32)
-    # BF16 uses Cube row sums; FP16 uses the in-place Raw exp/sum operation.
     b_den16 = tl.zeros([BT, 16], dtype=tl.float32)
     b_ones = tl.full([BS, 16], 1.0, dtype=tl.float16)
 

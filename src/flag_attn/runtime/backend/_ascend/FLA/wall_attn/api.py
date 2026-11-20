@@ -47,7 +47,6 @@ _BK = 64
 _BV = 64
 _WARPS = 4
 # Route names returned by get_last_route().
-#: Dense forward with materialized scores for inputs outside the global path.
 _ROUTE_FAST_SPLIT = "ascend_fast_split"
 _ROUTE_FAST_GLOBAL = "ascend_fast_global"
 _ROUTE_FALLBACK = "ascend_fused_fallback"
@@ -112,26 +111,25 @@ def _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlen
     return True
 
 
-def _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, g_scalar, *, save_lse=False, buffers=None):
+def _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, g_scalar, *, save_stats=False, buffers=None):
     """Run the fused Ascend fallback with base-2 gate prefixes."""
     B, T, HQ, K = q.shape
     V = v.shape[-1]
     H = k.shape[2]
     if buffers is None:
-        o = v.new_empty((B, T, HQ, V), dtype=torch.float32 if save_lse else v.dtype)
-        lse = q.new_empty((B, T, HQ), dtype=torch.float32) if save_lse else None
+        o = v.new_empty((B, T, HQ, V), dtype=torch.float32 if save_stats else v.dtype)
+        stats = q.new_empty((B, T, HQ, 2), dtype=torch.float32) if save_stats else None
         P = c = None
     else:
-        o, lse, P, c = buffers
+        o, stats, P, c = buffers
     if not q.numel():
-        if save_lse:
+        if save_stats:
             P = torch.empty_like(g, dtype=torch.float32)
             c = torch.empty_like(g_scalar, dtype=torch.float32) if g_scalar is not None else None
-        return o, lse, P, c
+        return o, stats, P, c
     P = gate_prefix_scan(g, RCP_LN2, out=P)
     if g_scalar is not None:
         c = gate_prefix_scan(g_scalar, RCP_LN2, out=c)
-    # Bound scratch for wider heads and keep the anchor near its query rows.
     bt, bs = 32, 64
     bk = max(16, triton.next_power_of_2(K))
     bv = min(_BV, max(16, triton.next_power_of_2(V)))
@@ -151,7 +149,7 @@ def _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, g_scalar, *, save_
         sink_bias if sink_bias is not None else q,
         safe,
         o,
-        lse if lse is not None else o,
+        stats if stats is not None else o,
         scale,
         T,
         w,
@@ -166,24 +164,24 @@ def _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, g_scalar, *, save_
         USE_WINDOW=window_size is not None,
         USE_SINK=sink_bias is not None,
         USE_SCALAR_G=c is not None,
-        SAVE_LSE=save_lse,
+        SAVE_STATS=save_stats,
         num_warps=_WARPS,
     )
-    return o, lse, P, c
+    return o, stats, P, c
 
 
 class _WallAscendFunction(torch.autograd.Function):
-    """Save the prefixes and pre-cast output used by the Ascend backward."""
+    """Save gate prefixes, FP32 output and row statistics for backward."""
 
     @staticmethod
     def forward(ctx, q, k, v, g, sink_bias, scale, window_size, g_scalar, offsets):
         if offsets is not None:
-            o, lse, P, c = _wall_packed_forward(
-                q, k, v, g, sink_bias, scale, window_size, g_scalar, offsets, save_lse=True,
+            o, stats, P, c = _wall_packed_forward(
+                q, k, v, g, sink_bias, scale, window_size, g_scalar, offsets, save_stats=True,
             )
         else:
-            o, lse, P, c = _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, g_scalar, save_lse=True)
-        ctx.save_for_backward(q, k, v, o, P, lse, sink_bias, c)
+            o, stats, P, c = _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, g_scalar, save_stats=True)
+        ctx.save_for_backward(q, k, v, o, P, stats, sink_bias, c)
         ctx.scale = scale
         ctx.window_size = window_size
         ctx.offsets = (0, q.shape[1]) if offsets is None else offsets
@@ -193,9 +191,9 @@ class _WallAscendFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, P, lse, sink_bias, c = ctx.saved_tensors
+        q, k, v, o, P, stats, sink_bias, c = ctx.saved_tensors
         dq, dk, dv, dg, dsink, dg_scalar = wall_attn_backward(
-            q, k, v, o, P, c, lse, sink_bias, do, ctx.scale, ctx.window_size,
+            q, k, v, o, P, c, stats, sink_bias, do, ctx.scale, ctx.window_size,
             ctx.offsets, ctx.gate_dtype, ctx.scalar_dtype,
         )
         return dq, dk, dv, dg, dsink, None, None, dg_scalar, None
@@ -246,11 +244,11 @@ def _packed_offsets(cu_seqlens, length):
     return offsets
 
 
-def _wall_packed_forward(q, k, v, g, sink_bias, scale, window_size, g_scalar, offsets, *, save_lse=False):
-    out = v.new_empty((*q.shape[:-1], v.shape[-1]), dtype=torch.float32 if save_lse else v.dtype)
-    lse = q.new_empty(q.shape[:-1], dtype=torch.float32) if save_lse else None
-    P = torch.empty_like(g, dtype=torch.float32) if save_lse else None
-    c = torch.empty_like(g_scalar, dtype=torch.float32) if save_lse and g_scalar is not None else None
+def _wall_packed_forward(q, k, v, g, sink_bias, scale, window_size, g_scalar, offsets, *, save_stats=False):
+    out = v.new_empty((*q.shape[:-1], v.shape[-1]), dtype=torch.float32 if save_stats else v.dtype)
+    stats = q.new_empty((*q.shape[:-1], 2), dtype=torch.float32) if save_stats else None
+    P = torch.empty_like(g, dtype=torch.float32) if save_stats else None
+    c = torch.empty_like(g_scalar, dtype=torch.float32) if save_stats and g_scalar is not None else None
     for start, end in zip(offsets, offsets[1:]):
         if start == end:
             continue
@@ -258,17 +256,19 @@ def _wall_packed_forward(q, k, v, g, sink_bias, scale, window_size, g_scalar, of
         qs, ks, vs, gs = (t[:, rows] for t in (q, k, v, g))
         scalar = g_scalar[:, rows] if g_scalar is not None else None
         fast = _fast_path_supported(qs, ks, vs, gs, scalar, sink_bias, window_size, None)
-        if not save_lse and fast and _global_path_supported(qs, ks, vs, gs, sink_bias, scale, window_size):
+        if not save_stats and fast and _global_path_supported(qs, ks, vs, gs, sink_bias, scale, window_size):
             _wall_global_impl(qs, ks, vs, gs, scale, out=out[:, rows])
         else:
             buffers = (
                 out[:, rows],
-                lse[:, rows] if lse is not None else None,
+                stats[:, rows] if stats is not None else None,
                 P[:, rows] if P is not None else None,
                 c[:, rows] if c is not None else None,
             )
-            _wall_fwd_impl(qs, ks, vs, gs, sink_bias, scale, window_size, scalar, save_lse=save_lse, buffers=buffers)
-    return out, lse, P, c
+            _wall_fwd_impl(
+                qs, ks, vs, gs, sink_bias, scale, window_size, scalar, save_stats=save_stats, buffers=buffers,
+            )
+    return out, stats, P, c
 
 
 def parallel_wall_attn(

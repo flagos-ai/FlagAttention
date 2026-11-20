@@ -16,10 +16,9 @@ extern "C" __aiv__ void _mlir_ciface_stats_bounds(
   auto ss=state->aligned+state->offset;
   auto w=work->aligned+work->offset;
   auto a=aux->aligned+aux->offset;
-  // The loaded FP32 tiles are dead after this call and serve as local scratch.
-  // State row 0 holds channel sums; rows 3..6 hold scalar g/Q/K/V bounds.
+  // This operation clobbers the g, q, k, and v tiles.
+  // State row 0 stores channel sums. Rows 3 through 6 store g, Q, K, and V bounds.
   const int rows=g->sizes[0];
-  // Independent elementwise operations precede their first reductions.
   set_mask_count(); set_vector_mask(0,rows*16);
   vmul(qq,qq,qq,1,1,1,1,8,8,8);
   vmul(kk,kk,kk,1,1,1,1,8,8,8);
@@ -27,7 +26,6 @@ extern "C" __aiv__ void _mlir_ciface_stats_bounds(
   vadds(w,gg,0.f,1,1,1,8,8);
   pipe_barrier(PIPE_V);
 
-  // Separate auxiliary segments keep the four reductions independent.
   set_mask_norm();set_vector_mask(0,0xffff);
   vcadd(a,qq,rows,1,1,2,0);
   vcadd(a+64,kk,rows,1,1,2,0);
@@ -38,7 +36,6 @@ extern "C" __aiv__ void _mlir_ciface_stats_bounds(
   vadd(w,w,w+(rows/2)*16,1,1,1,1,8,8,8);
   pipe_barrier(PIPE_V);
 
-  // Reduce the partial maxima alongside the gate sum tree.
   set_mask_norm();set_vector_mask(0,~(uint64_t)0);
   vcmax(qq,a,1,1,1,8,2);
   vcmax(kk,a+64,1,1,1,8,2);

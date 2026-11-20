@@ -33,7 +33,7 @@ def _row_delta(O, DO, DELTA, N, offset, V: tl.constexpr, BM: tl.constexpr, BV: t
 
 @triton.jit
 def _wall_grad_tile(
-    Q, KEY, VALUE, P, C, LSE, DO, DELTA, OUT, DPQ, DC_OUT, scale, T, W, offset,
+    Q, KEY, VALUE, P, C, STATS, DO, DELTA, OUT, DPQ, DC_OUT, scale, T, W, offset,
     H: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
     MODE: tl.constexpr, HAS_WINDOW: tl.constexpr, HAS_SCALAR: tl.constexpr,
@@ -96,8 +96,10 @@ def _wall_grad_tile(
             cq = tl.load(C + rq, mr, 0)
             ck_scalar = tl.load(C + cp, mc, 0)
             score += cq[:, None] - ck_scalar[None, :]
-        lse = tl.load(LSE + rq, mr, 0)
-        prob = tl.exp2(tl.where(valid, score - lse[:, None], -float("inf")))
+        row_max = tl.load(STATS + 2 * rq, mr, 0)
+        log_denom = tl.load(STATS + 2 * rq + 1, mr, 0)
+        log_prob = (score - row_max[:, None]) - log_denom[:, None]
+        prob = tl.exp2(tl.where(valid, log_prob, -float("inf")))
 
         if MODE == 2:
             vf = v_start + f
@@ -169,16 +171,18 @@ def _reduce_kv_heads(PARTS, OUT, N, offset, H: tl.constexpr, HQ: tl.constexpr,
 
 
 @triton.jit
-def _sink_grad(SINK, LSE, DELTA, OUT, N, HQ: tl.constexpr, BT: tl.constexpr):
+def _sink_grad(SINK, STATS, DELTA, OUT, N, HQ: tl.constexpr, BT: tl.constexpr):
     h = tl.program_id(0)
     sink = tl.load(SINK + h).to(tl.float32) * 1.4426950216
     r = tl.arange(0, BT)
     acc = tl.zeros((BT,), tl.float32)
     for block in range(tl.cdiv(N, BT)):
         t = block * BT + r
-        lse = tl.load(LSE + t * HQ + h, t < N, 0)
+        row = t * HQ + h
+        row_max = tl.load(STATS + 2 * row, t < N, 0)
+        log_denom = tl.load(STATS + 2 * row + 1, t < N, 0)
         delta = tl.load(DELTA + t * HQ + h, t < N, 0)
-        p = tl.exp2(tl.where(t < N, sink - lse, -float("inf")))
+        p = tl.exp2(tl.where(t < N, (sink - row_max) - log_denom, -float("inf")))
         acc -= delta * p
     tl.store(OUT + h, tl.sum(acc, axis=0))
 
@@ -196,7 +200,7 @@ def cast_output(o, dtype):
     return out
 
 
-def _segment_backward(q, k, v, p, c, lse, do, delta, scale, window_size, dq, dk, dv, dg, dg_scalar):
+def _segment_backward(q, k, v, p, c, stats, do, delta, scale, window_size, dq, dk, dv, dg, dg_scalar):
     B, T, HQ, K = q.shape
     H, V = v.shape[2:]
     bt = 8 if K <= 64 else 4
@@ -212,7 +216,7 @@ def _segment_backward(q, k, v, p, c, lse, do, delta, scale, window_size, dq, dk,
         programs = tiles * (triton.cdiv(V, bv) if mode == 2 else 1)
         _launch(
             _wall_grad_tile, programs,
-            q, k, v, p, c if c is not None else p, lse, do, delta,
+            q, k, v, p, c if c is not None else p, stats, do, delta,
             out, dq_prefix, dc if dc is not None else delta, scale, T, w,
             H=H, HQ=HQ, K=K, V=V, BT=bt, BK=bk, BV=bv, MODE=mode,
             HAS_WINDOW=window_size is not None, HAS_SCALAR=c is not None,
@@ -231,11 +235,11 @@ def _segment_backward(q, k, v, p, c, lse, do, delta, scale, window_size, dq, dk,
                 H=H, HQ=HQ, D=dim, BLOCK=256)
 
 
-def wall_attn_backward(q, k, v, o, p, c, lse, sink_bias, do, scale, window_size,
+def wall_attn_backward(q, k, v, o, p, c, stats, sink_bias, do, scale, window_size,
                        offsets, gate_dtype, scalar_dtype):
     B, T, HQ, _ = q.shape
     do = do.contiguous()
-    delta = torch.empty_like(lse)
+    delta = stats.new_empty((B, T, HQ))
     _launch(_row_delta, triton.cdiv(delta.numel(), 16), o, do, delta, delta.numel(),
             V=v.shape[-1], BM=16, BV=32)
 
@@ -248,12 +252,12 @@ def wall_attn_backward(q, k, v, o, p, c, lse, sink_bias, do, scale, window_size,
         rows = slice(start, end)
         _segment_backward(
             q[:, rows], k[:, rows], v[:, rows], p[:, rows],
-            c[:, rows] if c is not None else None, lse[:, rows], do[:, rows], delta[:, rows],
+            c[:, rows] if c is not None else None, stats[:, rows], do[:, rows], delta[:, rows],
             scale, window_size, dq[:, rows], dk[:, rows], dv[:, rows], dg[:, rows],
             dg_scalar[:, rows] if dg_scalar is not None else None,
         )
 
     dsink = torch.empty_like(sink_bias) if sink_bias is not None else None
     if dsink is not None:
-        _sink_grad[(HQ,)](sink_bias, lse, delta, dsink, B * T, HQ=HQ, BT=128)
+        _sink_grad[(HQ,)](sink_bias, stats, delta, dsink, B * T, HQ=HQ, BT=128)
     return dq, dk, dv, dg, dsink, dg_scalar

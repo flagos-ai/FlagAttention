@@ -16,7 +16,6 @@ from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.wall_attn import parallel as provider
 from flag_attn.utils import has_triton_tle
 
-# Cover each dtype, head layout, and supported sequence length with representative pairs.
 FAST_CASES = [
     pytest.param("mha", 8, 512, "bf16", torch.bfloat16, id="bf16-t512-mha"),
     pytest.param("gqa", 2, 4096, "bf16", torch.bfloat16, id="bf16-t4096-gqa"),
@@ -286,6 +285,37 @@ def test_parallel_wall_attn_gradients_match_naive(monkeypatch):
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         assert torch.isfinite(actual_grad).all()
         torch.testing.assert_close(actual_grad, expected_grad, atol=0.05, rtol=0.05)
+
+
+@pytest.mark.parallel_wall_attn
+@pytest.mark.parametrize("with_sink", (False, True))
+@pytest.mark.skipif(
+    test_backend.runtime.device.vendor_name != "ascend" or not test_backend.supports_operator("parallel_wall_attn"),
+    reason="regression for the Ascend Wall attention backward",
+)
+def test_parallel_wall_attn_large_equal_logits_backward(with_sink):
+    t, hq, h, d = 128, 8, 2, 64
+    q = torch.zeros(1, t, hq, d, device=test_backend.device, dtype=torch.bfloat16)
+    k = torch.zeros(1, t, h, d, device=q.device, dtype=q.dtype)
+    q[..., 0] = k[..., 0] = 32768
+    v = torch.ones_like(k, requires_grad=True)
+    score = 32768**2 * d**-0.5
+    sink = torch.full((hq,), score, device=q.device, dtype=q.dtype, requires_grad=True) if with_sink else None
+
+    out = parallel_wall_attn(q, k, v, torch.zeros_like(q), sink_bias=sink)
+    grads = torch.autograd.grad(out, (v, sink) if with_sink else (v,), grad_outputs=torch.ones_like(out))
+
+    # Equal logits give one unit of mass to each causal key and to the optional sink.
+    num_keys = torch.arange(1, t + 1, dtype=torch.float32)
+    prob = (num_keys + int(with_sink)).reciprocal()
+    expected_out = (num_keys * prob).view(1, t, 1, 1).expand(out.shape)
+    keys_grad = (hq // h) * prob.flip(0).cumsum(0).flip(0)
+    expected_dv = keys_grad.view(1, t, 1, 1).expand(v.shape)
+    torch.testing.assert_close(out.detach().cpu().float(), expected_out, atol=2e-3, rtol=5e-3)
+    torch.testing.assert_close(grads[0].cpu().float(), expected_dv, atol=2e-3, rtol=5e-3)
+    if with_sink:
+        expected_dsink = (-d * (num_keys * prob.square()).sum()).expand(hq)
+        torch.testing.assert_close(grads[1].cpu().float(), expected_dsink, atol=2e-3, rtol=5e-3)
 
 
 @pytest.mark.parallel_wall_attn

@@ -79,11 +79,11 @@ def _wall_rescale_bounds(
 
 @triton.jit
 def _wall_stable_tile(
-    Q, K_IN, V_IN, P, C, SINK, O, LSE, scale, T, W, first, batch, head, v_start,
+    Q, K_IN, V_IN, P, C, SINK, O, STATS, scale, T, W, first, batch, head, v_start,
     H: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BS: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
     USE_WINDOW: tl.constexpr, USE_SINK: tl.constexpr, USE_SCALAR_G: tl.constexpr,
-    DIRECT: tl.constexpr, SAVE_LSE: tl.constexpr,
+    DIRECT: tl.constexpr, SAVE_STATS: tl.constexpr,
 ):
     kv_head = head // (HQ // H)
     r = first + tl.arange(0, BT)
@@ -166,17 +166,19 @@ def _wall_stable_tile(
         O + q_base[:, None] * V + v_cols[None, :], acc,
         row_mask[:, None] & (v_cols[None, :] < V),
     )
-    if SAVE_LSE:
+    if SAVE_STATS:
         if v_start == 0:
-            tl.store(LSE + q_base, mx + tl.log2(den), row_mask)
+            # Keep the shifted normalizer separate from the potentially large row max.
+            tl.store(STATS + 2 * q_base, mx, row_mask)
+            tl.store(STATS + 2 * q_base + 1, tl.log2(den), row_mask)
 
 
 @triton.jit
 def _wall_stable_fwd(
-    Q, K_IN, V_IN, P, C, SINK, SAFE, O, LSE, scale, T, W,
+    Q, K_IN, V_IN, P, C, SINK, SAFE, O, STATS, scale, T, W,
     H: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BS: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
-    USE_WINDOW: tl.constexpr, USE_SINK: tl.constexpr, USE_SCALAR_G: tl.constexpr, SAVE_LSE: tl.constexpr,
+    USE_WINDOW: tl.constexpr, USE_SINK: tl.constexpr, USE_SCALAR_G: tl.constexpr, SAVE_STATS: tl.constexpr,
 ):
     tile = tl.program_id(1)
     bh = tl.program_id(2)
@@ -186,12 +188,12 @@ def _wall_stable_fwd(
     first = tile * BT
     if tl.load(SAFE + bh * tl.num_programs(1) + tile) != 0:
         _wall_stable_tile(
-            Q, K_IN, V_IN, P, C, SINK, O, LSE, scale, T, W, first, batch, head, v_start,
-            H, HQ, K, V, BT, BS, BK, BV, USE_WINDOW, USE_SINK, USE_SCALAR_G, False, SAVE_LSE,
+            Q, K_IN, V_IN, P, C, SINK, O, STATS, scale, T, W, first, batch, head, v_start,
+            H, HQ, K, V, BT, BS, BK, BV, USE_WINDOW, USE_SINK, USE_SCALAR_G, False, SAVE_STATS,
         )
     else:
         for sub in range(BT // 16):
             _wall_stable_tile(
-                Q, K_IN, V_IN, P, C, SINK, O, LSE, scale, T, W, first + sub * 16, batch, head, v_start,
-                H, HQ, K, V, 16, 16, BK, BV, USE_WINDOW, USE_SINK, USE_SCALAR_G, True, SAVE_LSE,
+                Q, K_IN, V_IN, P, C, SINK, O, STATS, scale, T, W, first + sub * 16, batch, head, v_start,
+                H, HQ, K, V, 16, 16, BK, BV, USE_WINDOW, USE_SINK, USE_SCALAR_G, True, SAVE_STATS,
             )
