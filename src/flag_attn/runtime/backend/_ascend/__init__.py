@@ -26,6 +26,7 @@ _OPERATOR_EXPORTS = {
     "sage_attention": (".attn_qk_int8_per_block", "forward"),
     "sage_attention_forward": (".attn_qk_int8_per_block", "forward"),
     "sage_attention_per_block_int8": (".ops", "quant_per_block_int8"),
+    "parallel_forgetting_attn": (".forgetting_attention", "parallel_forgetting_attn"),
 }
 
 __all__ = sorted(_OPERATOR_EXPORTS)

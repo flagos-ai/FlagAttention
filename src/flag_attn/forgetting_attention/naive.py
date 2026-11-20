@@ -26,8 +26,8 @@ limitations under the License.
 # src/forgetting_transformer/ops/forgetting_attention.py
 # Original complete source SHA256:
 # 6a71b9ebef4dbfaf489ca32fb4ad32ed51a3dc474b6d681c21ddf026eef1b5d2
-# This forward-only extraction retains the original forward operations and
-# launch configuration. Loads use .ca for legal 4/8/16-byte async copies.
+# Loads use .ca for legal 4/8/16-byte async copies. Ascend uses its own
+# launch geometry and recomputes loop addresses for its compiler.
 # Backward and standalone upstream tests are excluded.
 import math
 from collections import defaultdict
@@ -113,9 +113,12 @@ class ForgettingAttention(torch.autograd.Function):
                 raise RuntimeError(f'adaptive_threshold must be either the string "auto" or broadcastable to (batch_size, num_heads) = ({B}, {H}), but got {adaptive_threshold.size()}.')
             assert adaptive_threshold.size() == (B, H)
 
+        is_npu = q.device.type == "npu"
         if seq_start is not None:
             has_seq_start = True
             assert seq_start.shape == (B,)
+            if is_npu:
+                seq_start = seq_start.contiguous()
         else:
             has_seq_start = False
             seq_start = torch.zeros((B,), device=q.device, dtype=torch.long)
@@ -146,16 +149,17 @@ class ForgettingAttention(torch.autograd.Function):
         q, k, v = maybe_contiguous(q), maybe_contiguous(k), maybe_contiguous(v)
 
         # to work around https://github.com/openai/triton/issues/2441
-        device = torch.cuda.device_of(q)
+        device_context = torch.npu.device(q.device.index) if is_npu else torch.cuda.device_of(q)
+        with device_context:
 
-        with torch.cuda.device(device):
-
-            if M > 1:
-                config = get_fwd_config(B, H, M, N, D, causal)
-                BLOCK_M, BLOCK_N, num_stages, num_warps = config
-            else:
+            if M <= 1:
                 BLOCK_N, num_stages, num_warps = min(128, max(16, triton.next_power_of_2(N))), 1, 4
                 BLOCK_M = 1
+            elif is_npu:
+                # A 128-row tile with D=128 can exceed Ascend's 192 KiB buffer.
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 128, 1, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = get_fwd_config(B, H, M, N, D, causal)
 
             divisible_m = M % BLOCK_M == 0
             divisible_n = N % BLOCK_N == 0
@@ -176,7 +180,7 @@ class ForgettingAttention(torch.autograd.Function):
                     B, H, M, N, P_SEQ,
                     BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
                     DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
-                    num_warps=1
+                    GUARD_SELF_KEY=is_npu, num_warps=1
                 )
                 if record_find_index_time:
                     ForgettingAttention.events[record_time_key]["fwd_find_index_end_event"].record()
@@ -206,6 +210,7 @@ class ForgettingAttention(torch.autograd.Function):
                 IS_CAUSAL=causal, LARGER_M=larger_m, HAS_SEQ_START=has_seq_start,
                 IS_ADAPTIVE=adaptive_threshold is not None,
                 DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
+                IS_NPU=is_npu,
                 num_warps=num_warps, num_stages=num_stages,
             )
 
@@ -344,6 +349,7 @@ def _fwd_kernel(
     IS_CAUSAL: tl.constexpr, LARGER_M: tl.constexpr, HAS_SEQ_START: tl.constexpr,
     IS_ADAPTIVE: tl.constexpr,
     DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
+    IS_NPU: tl.constexpr = False,
 ):
     input_dtype = Q.dtype.element_ty
     # -- grid id --
@@ -422,12 +428,12 @@ def _fwd_kernel(
     else:
         hi = N
 
-    offs_n_init = offs_n_base
-
     if HAS_SEQ_START:
         SEQ_START += off_z
         seq_start = tl.load(SEQ_START)
         lo = tl.minimum(seq_start, hi)
+        if IS_NPU:
+            lo = tl.maximum(lo, 0)
     else:
         lo = 0
         seq_start = 0
@@ -438,15 +444,21 @@ def _fwd_kernel(
         start_index = tl.load(START_INDEX)
         lo = tl.maximum(start_index, lo)
     lo = (lo // BLOCK_N) * BLOCK_N
-    offs_n_init += lo
 
     # loop over k, v and update accumulators
-    k_ptrs = K + (offs_k[:, None] * stride_kk + offs_n_init[None, :] * stride_kn) # (BLOCK_DMODEL, BLOCK_N)
-    v_ptrs = V + (offs_n_init[:, None] * stride_vn + offs_k[None, :] * stride_vk) # (BLOCK_N, BLOCK_DMODEL)
-    log_lambda_in_ptrs = LOG_LAMBDA + (offs_n_init * stride_log_lambda_n) # (BLOCK_N, BLOCK_DMODEL)
+    if not IS_NPU:
+        offs_n_init = offs_n_base + lo
+        k_ptrs = K + (offs_k[:, None] * stride_kk + offs_n_init[None, :] * stride_kn)
+        v_ptrs = V + (offs_n_init[:, None] * stride_vn + offs_k[None, :] * stride_vk)
+        log_lambda_in_ptrs = LOG_LAMBDA + (offs_n_init * stride_log_lambda_n)
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n = start_n + offs_n_base
+        if IS_NPU:
+            # Ascend's compiler cannot serialize loop-carried pointer tensors.
+            k_ptrs = K + (offs_k[:, None] * stride_kk + offs_n[None, :] * stride_kn)
+            v_ptrs = V + (offs_n[:, None] * stride_vn + offs_k[None, :] * stride_vk)
+            log_lambda_in_ptrs = LOG_LAMBDA + (offs_n * stride_log_lambda_n)
 
         # -- load k, v --
         if DIVISIBLE_N:
@@ -497,10 +509,10 @@ def _fwd_kernel(
         # -- update m_i and l_i --
         l_i = l_i * alpha + p_sum
         m_i = m_i_new
-        # update pointers
-        k_ptrs += BLOCK_N * stride_kn
-        v_ptrs += BLOCK_N * stride_vn
-        log_lambda_in_ptrs += BLOCK_N * stride_log_lambda_n
+        if not IS_NPU:
+            k_ptrs += BLOCK_N * stride_kn
+            v_ptrs += BLOCK_N * stride_vn
+            log_lambda_in_ptrs += BLOCK_N * stride_log_lambda_n
 
     # write back l & o
     if IS_CAUSAL and (LARGER_M or HAS_SEQ_START):
@@ -530,6 +542,7 @@ def _find_start_index_kernel(
     Z, H, M, N, P_SEQ,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
+    GUARD_SELF_KEY: tl.constexpr = False,
 ):
     # -- grid id --
     off_h = tl.program_id(0)
@@ -557,7 +570,9 @@ def _find_start_index_kernel(
         log_lambda_in = tl.load(LOG_LAMBDA + offset_n * stride_log_lambda_n)
         decay = log_lambda_out - log_lambda_in
 
-        while decay < threshold:
+        # A parallel FP32 prefix sum can round upward at a later block end
+        # on Ascend. The anchor's own key has zero decay and must survive ACP.
+        while (decay < threshold) and (not GUARD_SELF_KEY or offset_n < P_SEQ + start_m):
             start_index += BLOCK_N
 
             offset_n = start_index + BLOCK_N - 1
