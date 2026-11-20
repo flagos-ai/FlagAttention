@@ -245,7 +245,7 @@ def test_parallel_wall_attn_constant_gate_uses_safe_fallback(dtype):
 @pytest.mark.parametrize("change", ("tail", "noncontiguous", "window_size", "sink_bias", "g_scalar"))
 @pytest.mark.skipif(not test_backend.supports_operator("parallel_wall_attn"), reason=test_backend.skip_reason("parallel_wall_attn"))
 @torch.inference_mode()
-def test_parallel_wall_attn_real_fallback_matches_naive(change):
+def test_parallel_wall_attn_matches_naive_on_edge_cases(change):
     t = 257 if change == "tail" else 256
     q, k, v, g = _make_inputs(t, 2, 64, torch.bfloat16, seed=1)
     kwargs = {}
@@ -260,14 +260,13 @@ def test_parallel_wall_attn_real_fallback_matches_naive(change):
         kwargs[change] = torch.zeros(1, t, 8, device=q.device, dtype=q.dtype)
     expected = wall_attn.naive_wall_attn(q, k, v, g, scale=64**-0.5, **kwargs)
     actual = parallel_wall_attn(q, k, v, g, **kwargs)
-    assert provider.get_last_route() == "official_fallback"
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), expected, atol=0.05, rtol=0.05)
 
 
 @pytest.mark.parallel_wall_attn
 @pytest.mark.skipif(not test_backend.supports_operator("parallel_wall_attn"), reason=test_backend.skip_reason("parallel_wall_attn"))
-def test_parallel_wall_attn_real_fallback_gradients_match_naive(monkeypatch):
+def test_parallel_wall_attn_gradients_match_naive(monkeypatch):
     from flag_attn.FLA.wall_attn import naive as naive_provider
 
     def differentiable_cumsum(x, *, cu_seqlens=None, scale=1.0):
@@ -280,7 +279,6 @@ def test_parallel_wall_attn_real_fallback_gradients_match_naive(monkeypatch):
     candidate_inputs = tuple(x.detach().clone().requires_grad_(True) for x in inputs)
     expected = wall_attn.naive_wall_attn(*reference_inputs, scale=64**-0.5)
     actual = parallel_wall_attn(*candidate_inputs)
-    assert provider.get_last_route() == "official_fallback"
     grad = torch.randn_like(actual)
     expected_grads = torch.autograd.grad(expected, reference_inputs, grad)
     actual_grads = torch.autograd.grad(actual, candidate_inputs, grad)

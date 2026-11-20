@@ -32,120 +32,166 @@ exponential weights and weighted values.
 import triton
 import triton.language as tl
 
-_RCP_LN2 = 1.4426950216
-
-
 @triton.jit
-def exp2(x):
-    return tl.exp2(x)
-
-
-@triton.jit
-def log2(x):
-    return tl.log2(x)
-
-
-@triton.jit
-def _wall_fwd_kernel(
-    q,
-    k,
-    v,
-    o,
-    g_cumsum,
-    g_scalar_cumsum,
-    sink_bias,
-    lse,
-    scale,
-    T,
-    W,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    HQ: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
+def _wall_rescale_bounds(
+    Q, K_IN, P, SAFE, T, W,
+    H: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr,
+    BT: tl.constexpr, BS: tl.constexpr, BK: tl.constexpr,
     USE_WINDOW: tl.constexpr,
-    USE_SINK: tl.constexpr,
-    USE_SCALAR_G: tl.constexpr,
-    PV_FP32: tl.constexpr,
 ):
-    i_v = tl.program_id(0)
-    i_t = tl.program_id(1)
-    i_bh = tl.program_id(2)
-    i_b = i_bh // HQ
-    i_hq = i_bh - i_b * HQ
-    i_h = i_hq // (HQ // H)
-    bos = i_b * T
+    MAX_RESCALE_LOG2: tl.constexpr = 60.0 * 1.4426950216
+    tile = tl.program_id(0)
+    bh = tl.program_id(1)
+    batch = bh // HQ
+    head = bh % HQ
+    kv_head = head // (HQ // H)
+    first = tile * BT
+    end = tl.minimum(first + BT, T)
+    begin = tl.maximum(first - W + 1, 0) if USE_WINDOW else 0
+    d = tl.arange(0, BK)
+    r = first + tl.arange(0, BT)
+    anchor_ptr = ((batch * T + first) * HQ + head) * K + d
+    anchor = tl.load(P + anchor_ptr, d < K, 0)
+    q_ptr = ((batch * T + r[:, None]) * HQ + head) * K + d[None, :]
+    q_mask = (r[:, None] < end) & (d[None, :] < K)
+    pq = tl.load(P + q_ptr, q_mask, 0)
+    q_max = tl.max(tl.max(tl.where(q_mask, pq - anchor[None, :], 0.0), 0), 0)
+    safe = q_max <= MAX_RESCALE_LOG2
+    if Q.dtype.element_ty != tl.float16:
+        q = tl.load(Q + q_ptr, q_mask, 0).to(tl.float32)
+        safe = safe & (tl.max(tl.max(tl.abs(q), 0), 0) <= 1e6)
 
-    RCP_LN2: tl.constexpr = 1.4426950216
+    start = begin
+    while (start < end) & safe:
+        c = start + tl.arange(0, BS)
+        mask = (c[:, None] < end) & (d[None, :] < K)
+        p_ptr = ((batch * T + c[:, None]) * HQ + head) * K + d[None, :]
+        pk = tl.load(P + p_ptr, mask, 0)
+        k_max = tl.max(tl.max(tl.where(mask, anchor[None, :] - pk, 0.0), 0), 0)
+        safe = k_max <= MAX_RESCALE_LOG2
+        if K_IN.dtype.element_ty != tl.float16:
+            k_ptr = ((batch * T + c[:, None]) * H + kv_head) * K + d[None, :]
+            k = tl.load(K_IN + k_ptr, mask, 0).to(tl.float32)
+            safe = safe & (tl.max(tl.max(tl.abs(k), 0), 0) <= 1e6)
+        start += BS
+    tl.store(SAFE + bh * tl.num_programs(0) + tile, safe.to(tl.int32))
 
-    rm = i_t * BT + tl.arange(0, BT)
-    rn = tl.arange(0, BK)
-    rs = tl.arange(0, BS)
-    rv = i_v * BV + tl.arange(0, BV)
-    msk_m = rm < T
-    msk_n = rn < K
-    msk_v = rv < V
 
-    q_row = ((bos + rm) * HQ + i_hq) * K
-    b_q = tl.load(q + q_row[:, None] + rn[None, :], mask=msk_m[:, None] & msk_n[None, :], other=0.0)
-    b_pq = tl.load(g_cumsum + q_row[:, None] + rn[None, :],
-                   mask=msk_m[:, None] & msk_n[None, :], other=0.0).to(tl.float32)
-    # Program anchor: the first query row of this block.
-    r_row = ((bos + i_t * BT) * HQ + i_hq) * K
-    b_R = tl.load(g_cumsum + r_row + rn, mask=msk_n, other=0.0).to(tl.float32)
-    b_qt = (b_q.to(tl.float32) * exp2(b_pq - b_R[None, :]) * (scale * RCP_LN2)).to(b_q.dtype)
+@triton.jit
+def _wall_stable_tile(
+    Q, K_IN, V_IN, P, C, SINK, O, LSE, scale, T, W, first, batch, head, v_start,
+    H: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, BS: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+    USE_WINDOW: tl.constexpr, USE_SINK: tl.constexpr, USE_SCALAR_G: tl.constexpr,
+    DIRECT: tl.constexpr, SAVE_LSE: tl.constexpr,
+):
+    kv_head = head // (HQ // H)
+    r = first + tl.arange(0, BT)
+    d = tl.arange(0, BK)
+    v_cols = v_start + tl.arange(0, BV)
+    row_mask = r < T
+    q_base = (batch * T + r) * HQ + head
+    if not DIRECT:
+        q_ptr = q_base[:, None] * K + d[None, :]
+        q_mask = row_mask[:, None] & (d[None, :] < K)
+        anchor = tl.load(P + ((batch * T + first) * HQ + head) * K + d, d < K, 0)
+        q = tl.load(Q + q_ptr, q_mask, 0).to(tl.float32)
+        pq = tl.load(P + q_ptr, q_mask, 0)
+        q = q * tl.exp2(tl.where(q_mask, pq - anchor[None, :], 0.0))
 
     if USE_SCALAR_G:
-        b_cq = tl.load(g_scalar_cumsum + (bos + rm) * HQ + i_hq, mask=msk_m, other=0.0).to(tl.float32)
+        cq = tl.load(C + q_base, row_mask, 0)
 
-    i_start = tl.maximum((i_t * BT - W + 1) // BS * BS, 0) if USE_WINDOW else 0
-    i_end = min((i_t + 1) * BT, T)
-
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    b_acc = tl.zeros([BT], dtype=tl.float32)
-
-    for i_s in range(i_start, i_end, BS):
-        o_k = i_s + rs
-        msk_s = o_k < T
-        k_col = ((bos + o_k) * H + i_h) * K
-        pk_col = ((bos + o_k) * HQ + i_hq) * K
-        v_row = ((bos + o_k) * H + i_h) * V
-        b_k = tl.load(k + k_col[None, :] + rn[:, None],
-                      mask=msk_s[None, :] & msk_n[:, None], other=0.0)
-        b_v = tl.load(v + v_row[:, None] + rv[None, :],
-                      mask=msk_s[:, None] & msk_v[None, :], other=0.0)
-        b_pk = tl.load(g_cumsum + pk_col[None, :] + rn[:, None],
-                       mask=msk_s[None, :] & msk_n[:, None], other=0.0).to(tl.float32)
-
-        # Cap the key exponent before rescaling in the shared anchor frame.
-        b_k_use = (b_k.to(tl.float32)
-                   * exp2(tl.minimum(b_R[:, None] - b_pk, 76.0))).to(b_k.dtype)
-        b_s = tl.dot(b_qt, b_k_use)
-        b_s = tl.where((rm[:, None] >= o_k[None, :]) & msk_s[None, :], b_s, float("-inf"))
-        if USE_WINDOW:
-            b_s = tl.where(rm[:, None] - o_k[None, :] < W, b_s, float("-inf"))
-
-        if USE_SCALAR_G:
-            b_ck = tl.load(g_scalar_cumsum + (bos + o_k) * HQ + i_hq,
-                           mask=msk_s, other=0.0).to(tl.float32)
-            b_s += b_cq[:, None] - b_ck[None, :]
-
-        b_p = exp2(b_s)
-        b_acc += tl.sum(b_p, 1)
-        if PV_FP32:
-            # Keep unnormalized probabilities in FP32 for FP16 inputs.
-            b_o += tl.dot(b_p, b_v.to(tl.float32))
-        else:
-            b_o += tl.dot(b_p.to(b_v.dtype), b_v)
-
+    start = tl.maximum(first - W + 1, 0) if USE_WINDOW else 0
+    end = tl.minimum(first + BT, T)
+    acc = tl.zeros((BT, BV), tl.float32)
     if USE_SINK:
-        b_acc += exp2(tl.load(sink_bias + i_hq).to(tl.float32))
+        mx = tl.full((BT,), 0.0, tl.float32) + tl.load(SINK + head).to(tl.float32) * 1.4426950216
+        den = tl.full((BT,), 1.0, tl.float32)
+    else:
+        mx = tl.full((BT,), -float("inf"), tl.float32)
+        den = tl.zeros((BT,), tl.float32)
 
-    b_o = b_o / b_acc[:, None]
-    tl.store(o + q_row[:, None] + rv[None, :], b_o.to(o.dtype.element_ty),
-             mask=msk_m[:, None] & msk_v[None, :])
-    tl.store(lse + bos * HQ + i_hq + rm * HQ, log2(b_acc), mask=msk_m)
+    for block in range(start, end, BS):
+        c = block + tl.arange(0, BS)
+        col_mask = c < end
+        valid = row_mask[:, None] & col_mask[None, :] & (c[None, :] <= r[:, None])
+        if USE_WINDOW:
+            valid = valid & ((r[:, None] - c[None, :]) < W)
+        k_base = (batch * T + c) * H + kv_head
+        p_base = (batch * T + c) * HQ + head
+        if DIRECT:
+            # Use the same gated score without forming separate exponential factors.
+            score = tl.zeros((BT, BS), tl.float32)
+            for channel in range(tl.cdiv(K, 16)):
+                f = channel * 16 + tl.arange(0, 16)
+                q_ptr = q_base[:, None] * K + f[None, :]
+                k_ptr = k_base[:, None] * K + f[None, :]
+                p_ptr = p_base[:, None] * K + f[None, :]
+                q_mask = row_mask[:, None] & (f[None, :] < K)
+                k_mask = col_mask[:, None] & (f[None, :] < K)
+                q = tl.load(Q + q_ptr, q_mask, 0).to(tl.float32)
+                k = tl.load(K_IN + k_ptr, k_mask, 0).to(tl.float32)
+                pq = tl.load(P + q_ptr, q_mask, 0)
+                pk = tl.load(P + p_ptr, k_mask, 0)
+                delta = tl.where(valid[:, :, None], pq[:, None, :] - pk[None, :, :], 0.0)
+                score += tl.sum(q[:, None, :] * k[None, :, :] * tl.exp2(delta), 2)
+        else:
+            k_mask = col_mask[:, None] & (d[None, :] < K)
+            k = tl.load(K_IN + k_base[:, None] * K + d[None, :], k_mask, 0).to(tl.float32)
+            pk = tl.load(P + p_base[:, None] * K + d[None, :], k_mask, 0)
+            k = k * tl.exp2(tl.where(k_mask, anchor[None, :] - pk, 0.0))
+            score = tl.dot(q, tl.trans(k), input_precision="hf32")
+
+        score = score * (scale * 1.4426950216)
+        if USE_SCALAR_G:
+            ck = tl.load(C + p_base, col_mask, 0)
+            score += cq[:, None] - ck[None, :]
+        score = tl.where(valid, score, -float("inf"))
+
+        next_mx = tl.maximum(mx, tl.max(score, 1))
+        shift = tl.where(next_mx == -float("inf"), 0.0, next_mx)
+        old = den * tl.exp2(mx - shift)
+        prob = tl.exp2(score - shift[:, None])
+        den = old + tl.sum(prob, 1)
+        inv = 1.0 / tl.where(den > 0.0, den, 1.0)
+        value = tl.load(
+            V_IN + k_base[:, None] * V + v_cols[None, :],
+            col_mask[:, None] & (v_cols[None, :] < V), 0,
+        ).to(tl.float32)
+        acc = acc * (old * inv)[:, None] + tl.dot(prob * inv[:, None], value, input_precision="hf32")
+        mx = next_mx
+
+    tl.store(
+        O + q_base[:, None] * V + v_cols[None, :], acc,
+        row_mask[:, None] & (v_cols[None, :] < V),
+    )
+    if SAVE_LSE:
+        if v_start == 0:
+            tl.store(LSE + q_base, mx + tl.log2(den), row_mask)
+
+
+@triton.jit
+def _wall_stable_fwd(
+    Q, K_IN, V_IN, P, C, SINK, SAFE, O, LSE, scale, T, W,
+    H: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, BS: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+    USE_WINDOW: tl.constexpr, USE_SINK: tl.constexpr, USE_SCALAR_G: tl.constexpr, SAVE_LSE: tl.constexpr,
+):
+    tile = tl.program_id(1)
+    bh = tl.program_id(2)
+    batch = bh // HQ
+    head = bh % HQ
+    v_start = tl.program_id(0) * BV
+    first = tile * BT
+    if tl.load(SAFE + bh * tl.num_programs(1) + tile) != 0:
+        _wall_stable_tile(
+            Q, K_IN, V_IN, P, C, SINK, O, LSE, scale, T, W, first, batch, head, v_start,
+            H, HQ, K, V, BT, BS, BK, BV, USE_WINDOW, USE_SINK, USE_SCALAR_G, False, SAVE_LSE,
+        )
+    else:
+        for sub in range(BT // 16):
+            _wall_stable_tile(
+                Q, K_IN, V_IN, P, C, SINK, O, LSE, scale, T, W, first + sub * 16, batch, head, v_start,
+                H, HQ, K, V, 16, 16, BK, BV, USE_WINDOW, USE_SINK, USE_SCALAR_G, True, SAVE_LSE,
+            )

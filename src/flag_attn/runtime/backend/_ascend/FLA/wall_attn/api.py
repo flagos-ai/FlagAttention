@@ -22,11 +22,11 @@
 #
 # Upstream: https://github.com/fla-org/flash-linear-attention/tree/main/fla/ops/wall_attn
 
-"""Ascend forward specializations for the public Wall attention API.
+"""Ascend kernels for the public Wall attention API.
 
-Dense FP16/BF16 inputs with K=V=64 use Ascend kernels; scalar gates and other
-contracts use the generic implementation. Backward delegates to the generic
-kernels and has not been validated on Ascend.
+Global and split kernels handle dense FP16/BF16 inputs with K=V=64.
+The fused forward covers other supported inputs and saves FP32 statistics
+for the tiled backward.
 """
 
 import math
@@ -34,26 +34,24 @@ import math
 import torch
 import triton
 
-from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.wall_attn import parallel as _generic
 from flag_attn.FLA.wall_attn.parallel import RCP_LN2
 
-from .cumsum import gate_prefix_sum, gate_prefix_sum_scalar
+from .backward import cast_output, wall_attn_backward
+from .cumsum import gate_prefix_scan
 from .global_fwd import _wall_global_impl
-from .kernels import _wall_fwd_kernel
+from .kernels import _wall_rescale_bounds, _wall_stable_fwd
 from .split import _wall_split_impl
 
-_BT = 128
-_BS = 128
 _BK = 64
 _BV = 64
 _WARPS = 4
 # Route names returned by get_last_route().
-_ROUTE_FAST = "ascend_fast"
 #: Dense forward with materialized scores for inputs outside the global path.
 _ROUTE_FAST_SPLIT = "ascend_fast_split"
 _ROUTE_FAST_GLOBAL = "ascend_fast_global"
-_ROUTE_FALLBACK = "official_fallback"
+_ROUTE_FALLBACK = "ascend_fused_fallback"
+_ROUTE_PACKED = "ascend_packed"
 
 
 def _route(name: str | None) -> None:
@@ -108,142 +106,169 @@ def _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlen
     ):
         return False
     if g_scalar is not None:
-        # Scalar gates use the generic path.
         return False
     if window_size is not None and window_size <= 0:
         return False
     return True
 
 
-def _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar):
-    """Run the Ascend kernel and return ``(o, P, lse, sink_scaled, c)``."""
-    P = gate_prefix_sum(g, scale=RCP_LN2)
-    c = (
-        gate_prefix_sum_scalar(g_scalar) * RCP_LN2
-        if g_scalar is not None
-        else None
-    )
-    sink_bias_scaled = sink_bias * RCP_LN2 if sink_bias is not None else None
-
+def _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, g_scalar, *, save_lse=False, buffers=None):
+    """Run the fused Ascend fallback with base-2 gate prefixes."""
     B, T, HQ, K = q.shape
     V = v.shape[-1]
     H = k.shape[2]
-    o = torch.empty((B, T, HQ, V), dtype=q.dtype, device=q.device)
-    lse = torch.empty((B, T, HQ), dtype=torch.float32, device=q.device)
-    grid = (triton.cdiv(V, _BV), triton.cdiv(T, _BT), B * HQ)
-    _wall_fwd_kernel[grid](
+    if buffers is None:
+        o = v.new_empty((B, T, HQ, V), dtype=torch.float32 if save_lse else v.dtype)
+        lse = q.new_empty((B, T, HQ), dtype=torch.float32) if save_lse else None
+        P = c = None
+    else:
+        o, lse, P, c = buffers
+    if not q.numel():
+        if save_lse:
+            P = torch.empty_like(g, dtype=torch.float32)
+            c = torch.empty_like(g_scalar, dtype=torch.float32) if g_scalar is not None else None
+        return o, lse, P, c
+    P = gate_prefix_scan(g, RCP_LN2, out=P)
+    if g_scalar is not None:
+        c = gate_prefix_scan(g_scalar, RCP_LN2, out=c)
+    # Bound scratch for wider heads and keep the anchor near its query rows.
+    bt, bs = 32, 64
+    bk = max(16, triton.next_power_of_2(K))
+    bv = min(_BV, max(16, triton.next_power_of_2(V)))
+    tiles = triton.cdiv(T, bt)
+    safe = torch.empty((B * HQ, tiles), dtype=torch.int32, device=q.device)
+    w = window_size if window_size is not None else 0
+    _wall_rescale_bounds[tiles, B * HQ](
+        q, k, P, safe, T, w, H=H, HQ=HQ, K=K, BT=bt, BS=bt, BK=bk,
+        USE_WINDOW=window_size is not None,
+    )
+    _wall_stable_fwd[triton.cdiv(V, bv), tiles, B * HQ](
         q,
         k,
         v,
-        o,
         P,
         c if c is not None else q,
-        sink_bias_scaled if sink_bias_scaled is not None else q,
-        lse,
+        sink_bias if sink_bias is not None else q,
+        safe,
+        o,
+        lse if lse is not None else o,
         scale,
         T,
-        window_size if window_size is not None else 0,
-        B=B,
+        w,
         H=H,
         HQ=HQ,
         K=K,
         V=V,
-        BT=_BT,
-        BS=_BS,
-        BK=_BK,
-        BV=_BV,
+        BT=bt,
+        BS=bs,
+        BK=bk,
+        BV=bv,
         USE_WINDOW=window_size is not None,
-        USE_SINK=sink_bias_scaled is not None,
+        USE_SINK=sink_bias is not None,
         USE_SCALAR_G=c is not None,
-        PV_FP32=q.dtype == torch.float16,
+        SAVE_LSE=save_lse,
         num_warps=_WARPS,
     )
-    return o, P, lse, sink_bias_scaled, c
+    return o, lse, P, c
 
 
 class _WallAscendFunction(torch.autograd.Function):
-    """Forward on the Ascend kernel; backward on the generic Triton kernels."""
+    """Save the prefixes and pre-cast output used by the Ascend backward."""
 
     @staticmethod
-    def forward(ctx, q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar=None):
-        P = gate_prefix_sum(g, scale=RCP_LN2)
-        c = (
-            gate_prefix_sum_scalar(g_scalar) * RCP_LN2
-            if g_scalar is not None
-            else None
-        )
-        sink_bias_scaled = sink_bias * RCP_LN2 if sink_bias is not None else None
-
-        B, T, HQ, K = q.shape
-        V = v.shape[-1]
-        H = k.shape[2]
-        o = torch.empty((B, T, HQ, V), dtype=q.dtype, device=q.device)
-        lse = torch.empty((B, T, HQ), dtype=torch.float32, device=q.device)
-        grid = (triton.cdiv(V, _BV), triton.cdiv(T, _BT), B * HQ)
-        _wall_fwd_kernel[grid](
-            q,
-            k,
-            v,
-            o,
-            P,
-            c if c is not None else q,
-            sink_bias_scaled if sink_bias_scaled is not None else q,
-            lse,
-            scale,
-            T,
-            window_size if window_size is not None else 0,
-            B=B,
-            H=H,
-            HQ=HQ,
-            K=K,
-            V=V,
-            BT=_BT,
-            BS=_BS,
-            BK=_BK,
-            BV=_BV,
-            USE_WINDOW=window_size is not None,
-            USE_SINK=sink_bias_scaled is not None,
-            USE_SCALAR_G=c is not None,
-            PV_FP32=q.dtype == torch.float16,
-            num_warps=_WARPS,
-        )
-        ctx.save_for_backward(
-            q, k, v, o, P, lse,
-            sink_bias_scaled if sink_bias_scaled is not None else torch.empty(0, device=q.device, dtype=q.dtype),
-            c if c is not None else torch.empty(0, device=q.device, dtype=q.dtype),
-        )
+    def forward(ctx, q, k, v, g, sink_bias, scale, window_size, g_scalar, offsets):
+        if offsets is not None:
+            o, lse, P, c = _wall_packed_forward(
+                q, k, v, g, sink_bias, scale, window_size, g_scalar, offsets, save_lse=True,
+            )
+        else:
+            o, lse, P, c = _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, g_scalar, save_lse=True)
+        ctx.save_for_backward(q, k, v, o, P, lse, sink_bias, c)
         ctx.scale = scale
         ctx.window_size = window_size
-        ctx.cu_seqlens = cu_seqlens
-        ctx.has_scalar_g = g_scalar is not None
-        return o
+        ctx.offsets = (0, q.shape[1]) if offsets is None else offsets
+        ctx.gate_dtype = g.dtype
+        ctx.scalar_dtype = g_scalar.dtype if g_scalar is not None else None
+        return cast_output(o, v.dtype)
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, P, lse, sink_or_empty, c_or_empty = ctx.saved_tensors
-        sink_bias_scaled = sink_or_empty if sink_or_empty.numel() else None
-        c = c_or_empty if ctx.has_scalar_g else None
-        dq, dk, dv, dP, dsink_bias, dc = _generic.parallel_wall_attn_bwd(
-            q=q,
-            k=k,
-            v=v,
-            o=o,
-            g_cumsum=P,
-            lse=lse,
-            do=do,
-            sink_bias=sink_bias_scaled,
-            scale=ctx.scale,
-            g_scalar_cumsum=c,
-            window_size=ctx.window_size,
-            cu_seqlens=ctx.cu_seqlens,
+        q, k, v, o, P, lse, sink_bias, c = ctx.saved_tensors
+        dq, dk, dv, dg, dsink, dg_scalar = wall_attn_backward(
+            q, k, v, o, P, c, lse, sink_bias, do, ctx.scale, ctx.window_size,
+            ctx.offsets, ctx.gate_dtype, ctx.scalar_dtype,
         )
-        dg = chunk_global_cumsum(dP, cu_seqlens=ctx.cu_seqlens, reverse=True, scale=RCP_LN2)
-        dg_scalar = (
-            chunk_global_cumsum(dc, cu_seqlens=ctx.cu_seqlens, reverse=True)
-            if dc is not None
-            else None
-        )
-        return dq.to(q), dk.to(k), dv.to(v), dg, dsink_bias, None, None, None, dg_scalar
+        return dq, dk, dv, dg, dsink, None, None, dg_scalar, None
+
+
+def _validate_forward(q, k, v, g, sink_bias, g_scalar, scale, window_size):
+    tensors = (q, k, v, g)
+    if any(t.ndim != 4 for t in tensors):
+        raise ValueError("Wall attention requires four-dimensional Q, K, V and g")
+    if q.shape != g.shape:
+        raise ValueError("`g` must be [B, T, HQ, K] matching `q`")
+    if q.shape[:2] != k.shape[:2] or k.shape[:3] != v.shape[:3] or q.shape[-1] != k.shape[-1]:
+        raise ValueError("Q, K and V must agree on batch, sequence and head shapes")
+    if not k.shape[2] or not q.shape[2] or q.shape[2] % k.shape[2]:
+        raise ValueError("HQ must be divisible by a positive number of KV heads")
+    if not 0 < q.shape[-1] <= 256 or not v.shape[-1]:
+        raise ValueError("Wall attention requires 0 < K <= 256 and V > 0")
+    operands = (*tensors, *(t for t in (sink_bias, g_scalar) if t is not None))
+    if q.device.type != "npu" or any(t.device != q.device or t.layout != torch.strided for t in operands):
+        raise ValueError("Wall attention requires strided tensors on the same NPU")
+    if any(t.dtype not in (torch.float16, torch.bfloat16, torch.float32) for t in operands):
+        raise TypeError("Wall attention on Ascend supports FP16, BF16 and FP32 tensors")
+    if not isinstance(scale, (int, float)) or not math.isfinite(scale):
+        raise ValueError("Wall attention requires a finite numeric scale")
+    if window_size is not None and (not isinstance(window_size, int) or window_size <= 0):
+        raise ValueError("`window_size` must be a positive integer")
+
+
+def _wall_dense_forward(q, k, v, g, sink_bias, scale, window_size, g_scalar, fast):
+    if fast:
+        if _global_path_supported(q, k, v, g, sink_bias, scale, window_size):
+            return _wall_global_impl(q, k, v, g, scale), _ROUTE_FAST_GLOBAL
+        split = _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, None, g_scalar)
+        if split is not None:
+            return split[0], _ROUTE_FAST_SPLIT
+    o, _, _, _ = _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, g_scalar)
+    return o, _ROUTE_FALLBACK
+
+
+def _packed_offsets(cu_seqlens, length):
+    if cu_seqlens.ndim != 1 or cu_seqlens.dtype not in (torch.int32, torch.int64):
+        raise ValueError("`cu_seqlens` must be a one-dimensional integer tensor")
+    offsets = cu_seqlens.detach().cpu().tolist()
+    if not offsets or offsets[0] != 0 or offsets[-1] != length or any(
+        start > end for start, end in zip(offsets, offsets[1:])
+    ):
+        raise ValueError("`cu_seqlens` must be nondecreasing and span the packed sequence")
+    return offsets
+
+
+def _wall_packed_forward(q, k, v, g, sink_bias, scale, window_size, g_scalar, offsets, *, save_lse=False):
+    out = v.new_empty((*q.shape[:-1], v.shape[-1]), dtype=torch.float32 if save_lse else v.dtype)
+    lse = q.new_empty(q.shape[:-1], dtype=torch.float32) if save_lse else None
+    P = torch.empty_like(g, dtype=torch.float32) if save_lse else None
+    c = torch.empty_like(g_scalar, dtype=torch.float32) if save_lse and g_scalar is not None else None
+    for start, end in zip(offsets, offsets[1:]):
+        if start == end:
+            continue
+        rows = slice(start, end)
+        qs, ks, vs, gs = (t[:, rows] for t in (q, k, v, g))
+        scalar = g_scalar[:, rows] if g_scalar is not None else None
+        fast = _fast_path_supported(qs, ks, vs, gs, scalar, sink_bias, window_size, None)
+        if not save_lse and fast and _global_path_supported(qs, ks, vs, gs, sink_bias, scale, window_size):
+            _wall_global_impl(qs, ks, vs, gs, scale, out=out[:, rows])
+        else:
+            buffers = (
+                out[:, rows],
+                lse[:, rows] if lse is not None else None,
+                P[:, rows] if P is not None else None,
+                c[:, rows] if c is not None else None,
+            )
+            _wall_fwd_impl(qs, ks, vs, gs, sink_bias, scale, window_size, scalar, save_lse=save_lse, buffers=buffers)
+    return out, lse, P, c
 
 
 def parallel_wall_attn(
@@ -258,7 +283,7 @@ def parallel_wall_attn(
     window_size: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
 ) -> torch.Tensor:
-    """Wall attention forward (Ascend kernel) with a generic fallback."""
+    """Wall attention forward using the Ascend kernels."""
     _route(None)
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -268,32 +293,27 @@ def parallel_wall_attn(
         raise ValueError("`cu_seqlens` (varlen) requires batch size 1")
     if sink_bias is not None and sink_bias.shape != (q.shape[2],):
         raise ValueError(f"`sink_bias` must be [HQ]; got {sink_bias.shape}")
-    if _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlens):
-        if _generic._requires_backward(q, k, v, g, sink_bias, g_scalar):
-            o = _WallAscendFunction.apply(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
-            _route(_ROUTE_FAST)
-            return o
-        if _global_path_supported(q, k, v, g, sink_bias, scale, window_size):
-            o = _wall_global_impl(q, k, v, g, scale)
-            _route(_ROUTE_FAST_GLOBAL)
-            return o
-        split = _wall_split_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
-        if split is not None:
-            _route(_ROUTE_FAST_SPLIT)
-            return split[0]
-        o, _, _, _, _ = _wall_fwd_impl(q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar)
-        _route(_ROUTE_FAST)
+    fast = _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlens)
+    if not fast:
+        _validate_forward(q, k, v, g, sink_bias, g_scalar, scale, window_size)
+        q, k, v, g = (t.contiguous() for t in (q, k, v, g))
+        sink_bias = sink_bias.contiguous() if sink_bias is not None else None
+        g_scalar = g_scalar.contiguous() if g_scalar is not None else None
+        fast = _fast_path_supported(q, k, v, g, g_scalar, sink_bias, window_size, cu_seqlens)
+    requires_backward = _generic._requires_backward(q, k, v, g, sink_bias, g_scalar)
+    offsets = _packed_offsets(cu_seqlens, q.shape[1]) if cu_seqlens is not None else None
+    if requires_backward:
+        o = _WallAscendFunction.apply(q, k, v, g, sink_bias, scale, window_size, g_scalar, offsets)
+        _route(_ROUTE_PACKED if offsets is not None else _ROUTE_FALLBACK)
         return o
-    o = _generic._parallel_wall_attn_default(
-        q,
-        k,
-        v,
-        g,
-        g_scalar=g_scalar,
-        sink_bias=sink_bias,
-        scale=scale,
-        window_size=window_size,
-        cu_seqlens=cu_seqlens,
-    )
-    _route(_ROUTE_FALLBACK)
+    if offsets is not None:
+        o, _, _, _ = _wall_packed_forward(q, k, v, g, sink_bias, scale, window_size, g_scalar, offsets)
+        _route(_ROUTE_PACKED)
+        return o
+    if q.numel() == 0:
+        o = v.new_empty((*q.shape[:-1], v.shape[-1]))
+        _route(_ROUTE_FALLBACK)
+        return o
+    o, route = _wall_dense_forward(q, k, v, g, sink_bias, scale, window_size, g_scalar, fast)
+    _route(route)
     return o

@@ -91,3 +91,34 @@ def gate_prefix_sum_scalar(g: torch.Tensor) -> torch.Tensor:
     grid = (B * HQ,)
     _prefix_sum_scalar_kernel[grid](g, out, T, HQ=HQ, BT=64)
     return out
+
+
+@triton.jit
+def _gate_scan_kernel(G, P, T, C: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr,
+                      SCALE: tl.constexpr, REVERSE: tl.constexpr):
+    batch = tl.program_id(1)
+    cols = tl.program_id(0) * BC + tl.arange(0, BC)
+    rows = tl.arange(0, BT)
+    carry = tl.zeros((BC,), tl.float32)
+    for tile in range(tl.cdiv(T, BT)):
+        step = tile * BT + rows
+        ts = T - 1 - step if REVERSE else step
+        offsets = ((batch * T + ts[:, None]) * C) + cols[None, :]
+        valid = (step[:, None] < T) & (cols[None, :] < C)
+        gate = tl.load(G + offsets, valid, 0).to(tl.float32)
+        prefix = tl.cumsum(gate, axis=0) + carry[None, :]
+        tl.store(P + offsets, prefix * SCALE, valid)
+        carry += tl.sum(gate, axis=0)
+
+
+def gate_prefix_scan(
+    g: torch.Tensor, scale: float, out: torch.Tensor | None = None, *, reverse: bool = False,
+) -> torch.Tensor:
+    """Scan contiguous scalar or channel gates with FP32 accumulation."""
+    B, T = g.shape[:2]
+    C = g.shape[2] if g.ndim == 3 else g.shape[2] * g.shape[3]
+    if out is None:
+        out = torch.empty_like(g, dtype=torch.float32)
+    bc = min(16, triton.next_power_of_2(C))
+    _gate_scan_kernel[triton.cdiv(C, bc), B](g, out, T, C=C, BT=64, BC=bc, SCALE=scale, REVERSE=reverse)
+    return out

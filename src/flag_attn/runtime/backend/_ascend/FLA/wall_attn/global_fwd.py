@@ -203,13 +203,14 @@ def _wall_global_fwd(
             tl.store(O + ((batch * T + r[:, None]) * HQ + head) * 64 + tl.arange(0, 64)[None, :], acc, mask=r[:, None] < T)
 
 
-def _wall_global_impl(q, k, v, g, scale):
+def _wall_global_impl(q, k, v, g, scale, out=None):
     (B, T, HQ, _) = q.shape
     H = k.shape[2]
     limit = int((60.0 / abs(scale)) ** 2) if abs(scale) > 60.0 / 4092 else 4092 ** 2
     # One allocation holds FP32 Qg, Kg, centered prefixes and int32 metadata.
     w = torch.empty((3 * q.numel() + B * HQ * 4,), device=q.device, dtype=torch.float32)
-    out = torch.empty_like(q)
+    if out is None:
+        out = torch.empty_like(q)
     _wall_prepare[B * HQ, 4](q, k, v, g, w, T=T, H=H, HQ=HQ, B=B, SCALE=scale, LIMIT=limit)
     _wall_global_fwd[T // 128, B * HQ](q, k, v, w, out, T=T, H=H, HQ=HQ, B=B, SCALE=scale, LIMIT=limit)
     return out
