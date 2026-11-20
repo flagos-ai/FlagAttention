@@ -15,6 +15,7 @@ _OPERATOR_EXPORTS = {
         "fused_recurrent_gated_delta_rule_packed_decode",
     ),
     "chunk_gdn2": (".gdn2", "chunk_gdn2"),
+    "parallel_moba": (".FLA.moba.parallel", "parallel_moba"),
     "chunk_gla": (".FLA.gated_linear_attention.api", "chunk_gla"),
     "parallel_parallax": (".parallax", "parallel_parallax"),
     "parallax_decode": (".parallax", "parallax_decode"),
