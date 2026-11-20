@@ -78,6 +78,9 @@ include = [
 ]
 namespaces = false
 
+[tool.setuptools.package-data]
+"flag_attn.runtime.backend._ascend.infllmv2" = ["infllmv2_top64_raw.cpp"]
+
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
 testpaths = [

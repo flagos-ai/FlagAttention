@@ -49,6 +49,12 @@ def _check_cuda_contiguous(*tensors: torch.Tensor) -> None:
             raise ValueError("InfLLM-V2 Triton kernels require contiguous tensors")
 
 
+def _ascend_forward(name, *args, **kwargs):
+    from flag_attn.runtime.backend._ascend.infllmv2 import forward
+
+    return getattr(forward, name)(*args, **kwargs)
+
+
 @triton.jit
 def _compress_k_kernel(
     k_ptr,
@@ -92,6 +98,8 @@ def compress_k(
     stride: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton mean-pooling compression for packed ``[Tk, Hkv, D]`` keys."""
+    if k.device.type == "npu":
+        return _ascend_forward("compress_k", k, cu_seqlens_k, kernel_size, stride)
     _check_cuda_contiguous(k, cu_seqlens_k)
     if cu_seqlens_k.dtype != torch.int32:
         raise TypeError("cu_seqlens_k must be int32")
@@ -261,6 +269,10 @@ def stage1(
     *,
     _allow_tle: bool = True,
 ) -> torch.Tensor:
+    if q.device.type == "npu":
+        return _ascend_forward("stage1", q, k1, k2, cu_seqlens_q, cu_seqlens_k1,
+                               cu_seqlens_k2, max_seqlen_q, k1_stride, k2_stride,
+                               softmax_scale, causal, cu_seqlens_k, _allow_tle=_allow_tle)
     cu_seqlens_k = cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k
     _check_cuda_contiguous(q, k1, k2, cu_seqlens_q, cu_seqlens_k1, cu_seqlens_k2, cu_seqlens_k)
     total_q, hq, d = q.shape
@@ -447,6 +459,11 @@ def pool_scores(
     *,
     _valid_only: bool = False,
 ) -> torch.Tensor:
+    if score.device.type == "npu":
+        return _ascend_forward("pool_scores", score, cu_seqlens_q, cu_seqlens_k1,
+                               max_seqlen_q, kernel_size, kernel_stride, block_size,
+                               init_blocks, local_blocks, cu_seqlens_k, max_seqlen_k,
+                               _valid_only=_valid_only)
     cu_seqlens_k = cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k
     max_seqlen_k = max_seqlen_q if max_seqlen_k is None else max_seqlen_k
     _check_cuda_contiguous(score, cu_seqlens_q, cu_seqlens_k1, cu_seqlens_k)
@@ -589,6 +606,9 @@ def select_blocks(
     _allow_tle: bool = True,
 ) -> torch.Tensor:
     """Exact TopK with a shape-selected TLE radix or standard streaming kernel."""
+    if block_score.device.type == "npu":
+        return _ascend_forward("select_blocks", block_score, cu_seqlens_q, topk,
+                               block_size, cu_seqlens_k, _allow_tle=_allow_tle)
     cu_seqlens_k = cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k
     _check_cuda_contiguous(block_score, cu_seqlens_q, cu_seqlens_k)
     hkv, total_q, max_blocks = block_score.shape
@@ -896,6 +916,7 @@ def _sparse_attention_gqa_backward_kernel(
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_d: tl.constexpr,
+    check_block_bounds: tl.constexpr = False,
 ):
     """Tensor-Core backward, reducing a full GQA group before dK/dV atomics."""
     q_local = tl.program_id(0)
@@ -931,9 +952,14 @@ def _sparse_attention_gqa_backward_kernel(
 
     for rank in tl.range(0, topk):
         block = tl.load(selected_ptr + hk * total_q * topk + q_index * topk + rank)
-        safe_block = tl.maximum(block, 0)
+        legal = block >= 0
+        if check_block_bounds:
+            legal = legal & (block < tl.cdiv(k_len, sparse_block))
+            safe_block = tl.where(legal, block, 0)
+        else:
+            safe_block = tl.maximum(block, 0)
         pos = safe_block * sparse_block + offs_n
-        n_mask = (block >= 0) & (pos < k_len)
+        n_mask = legal & (pos < k_len)
         if causal:
             n_mask = n_mask & (pos < causal_limit)
         nd_mask = n_mask[:, None] & d_mask[None, :]
@@ -947,6 +973,8 @@ def _sparse_attention_gqa_backward_kernel(
         probs = tl.where(valid, tl.exp(logits - lse[:, None]), 0.0)
         dp = tl.dot(dov, tl.trans(vval), out_dtype=tl.float32)
         ds = probs * (dp - delta[:, None]) * scale
+        if check_block_bounds:
+            ds = tl.where(valid, ds, 0.0)
 
         dq += tl.dot(ds.to(kval.dtype), kval, out_dtype=tl.float32)
         dk_tile = tl.dot(tl.trans(ds.to(qv.dtype)), qv, out_dtype=tl.float32)
@@ -978,6 +1006,10 @@ def _sparse_attention_forward(
     causal: bool = True,
     store_lse: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if q.device.type == "npu":
+        return _ascend_forward("sparse_attention_forward", q, k, v, selected_blocks,
+                               cu_seqlens_q, cu_seqlens_k, max_seqlen_q, block_size,
+                               softmax_scale, causal, store_lse)
     _check_cuda_contiguous(q, k, v, selected_blocks, cu_seqlens_q, cu_seqlens_k)
     total_q, hq, d = q.shape
     hkv = k.shape[1]
@@ -1114,6 +1146,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
             block_m=block_m,
             block_n=ctx.block_size,
             block_d=triton.next_power_of_2(d),
+            check_block_bounds=q.device.type == "npu",
             num_warps=8,
             num_stages=3,
         )
@@ -1140,6 +1173,10 @@ def sparse_attention(
     _allow_tle: bool = True,
 ) -> torch.Tensor:
     """Differentiable sparse attention over selected blocks of continuous packed K/V."""
+    if q.device.type == "npu":
+        return _ascend_forward("sparse_attention", q, k, v, selected_blocks,
+                               cu_seqlens_q, cu_seqlens_k, max_seqlen_q, block_size,
+                               softmax_scale, causal, _allow_tle=_allow_tle)
     if not torch.is_grad_enabled() or not any(t.requires_grad for t in (q, k, v)):
         # The Hopper TLE path pays for Tensor Maps, mbarriers, one warpgroup per
         # CTA and one launch per KV head. Measurements put its crossover above
