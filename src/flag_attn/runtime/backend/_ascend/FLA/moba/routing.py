@@ -569,12 +569,12 @@ def _topk_park_plan(
         1,
         budget // (num_heads * min(batch_size, batches_per_launch)),
     )
-    group_tok = min(block_tok, 64 if cand_tiles <= 8 else 32)
     total_cand_lanes = cand_tiles * block_topk
     group_cand = min(total_cand_lanes, _GATHER_MAX_CAND_LANES)
-    # Ceil, not floor: the last group may be partially filled but must still be
-    # ranked, otherwise its candidates are silently dropped from the selection.
-    num_groups = cdiv(total_cand_lanes, group_cand)
+    num_groups = cdiv(total_cand_lanes, group_cand)  # Include the partial tail group.
+    group_tok = min(block_tok, 64 if cand_tiles <= 8 else 32)
+    if num_groups > 1 and block_topk == 2:  # Fit the Ascend unified buffer.
+        group_tok = min(group_tok, 8)
     return {
         "cand_tiles": cand_tiles,
         "block_chunk": block_chunk,
