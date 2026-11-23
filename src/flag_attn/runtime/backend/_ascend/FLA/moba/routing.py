@@ -540,17 +540,10 @@ def _topk_park_plan(
     num_heads: int,
     batch_size: int,
 ) -> dict:
-    """Launch and scratch geometry for the two-stage streaming selector.
+    """Plan candidate coverage, token tiling and scratch for the two stages.
 
-    Kept as a pure function so the three hard invariants are unit-testable
-    without a device:
-
-    * coverage: ``num_groups * group_cand`` spans every candidate lane, so the
-      partially filled last group is still ranked (T1);
-    * token tile: ``group_tok <= block_tok`` gives ``tokens_per_park >= 1`` for
-      every TopK tile (T3);
-    * budget: one park launch allocates at most ``_TOPK_PARK_BUDGET_BYTES`` of
-      score/id/count scratch (T4).
+    Callers split the head axis when ``num_heads > head_limit``. One token
+    block and one batch must fit both stages for each resulting head slice.
     """
     cand_tiles = max(1, cdiv(max_chunks_per_sequence, block_chunk))
     if cand_tiles > 8:
@@ -559,22 +552,26 @@ def _topk_park_plan(
         block_chunk = 32
         cand_tiles = max(1, cdiv(max_chunks_per_sequence, block_chunk))
     park_program_bytes = cand_tiles * block_topk * block_tok * 8 + 4
-    park_programs = max(1, _TOPK_PARK_BUDGET_BYTES // park_program_bytes)
+    park_programs = _TOPK_PARK_BUDGET_BYTES // park_program_bytes
+    if not park_programs:
+        raise ValueError(
+            f"one MoBA top-k park program needs {park_program_bytes} bytes, exceeding the "
+            f"{_TOPK_PARK_BUDGET_BYTES}-byte scratch budget; reduce max_seqlen or top-k"
+        )
     budget = min(_TOPK_PROGRAMS_PER_SLICE, _MAX_LAUNCH_GRID, park_programs)
-    # Stage 2 has no per-program scratch, so it keeps the full slice budget;
-    # tying it to the park budget would multiply its launch count for no reason.
     gather_budget = min(_TOPK_PROGRAMS_PER_SLICE, _MAX_LAUNCH_GRID)
-    batches_per_launch = max(1, budget // max(1, num_heads))
-    blocks_per_launch = max(
-        1,
-        budget // (num_heads * min(batch_size, batches_per_launch)),
-    )
     total_cand_lanes = cand_tiles * block_topk
     group_cand = min(total_cand_lanes, _GATHER_MAX_CAND_LANES)
     num_groups = cdiv(total_cand_lanes, group_cand)  # Include the partial tail group.
     group_tok = min(block_tok, 64 if cand_tiles <= 8 else 32)
     if num_groups > 1 and block_topk == 2:  # Fit the Ascend unified buffer.
         group_tok = min(group_tok, 8)
+    tokens_per_park = block_tok // group_tok
+    # A single parked token block expands to tokens_per_park gather programs
+    # per head and batch. Both stages must fit before slicing the token axis.
+    head_limit = min(budget, gather_budget // tokens_per_park)
+    batches_per_launch = max(1, head_limit // num_heads)
+    blocks_per_launch = max(1, budget // (num_heads * min(batch_size, batches_per_launch)))
     return {
         "cand_tiles": cand_tiles,
         "block_chunk": block_chunk,
@@ -582,10 +579,11 @@ def _topk_park_plan(
         "park_programs": park_programs,
         "budget": budget,
         "gather_budget": gather_budget,
+        "head_limit": head_limit,
         "batches_per_launch": batches_per_launch,
         "blocks_per_launch": blocks_per_launch,
         "group_tok": group_tok,
-        "tokens_per_park": block_tok // group_tok,
+        "tokens_per_park": tokens_per_park,
         "total_cand_lanes": total_cand_lanes,
         "group_cand": group_cand,
         "num_groups": num_groups,
@@ -616,7 +614,14 @@ def _compute_selected_chunks_batched_streaming_triton(
     max_chunks_per_sequence: int,
     topk: int,
     chunk_size: int | None = None,
+    *,
+    _out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Select historical IDs in rank-major order for a packed batch.
+
+    An existing output view supplies its own strides for a head slice.
+    The caller initializes its missing-route slots to -1.
+    """
     num_chunk_slots, num_kv_heads, head_dim = chunk_means.shape
     num_heads = q.shape[1]
     batch_size = cu_seqlens.numel() - 1
@@ -657,34 +662,29 @@ def _compute_selected_chunks_batched_streaming_triton(
     block_topk = max(2, triton.next_power_of_2(topk))
     if block_topk > 64:
         raise ValueError(f"streaming Top-K currently supports topk <= 64, got topk={topk}")
-    selected_chunks = torch.full(
-        (topk, num_heads, q.shape[0]),
-        -1,
-        device=q.device,
-        dtype=torch.int32,
-    )
-
     block_d = max(16, triton.next_power_of_2(head_dim))
     block_tok, block_chunk = _streaming_tile_shape(max_chunks_per_sequence, block_topk)
+    plan = _topk_park_plan(
+        max_chunks_per_sequence, block_chunk, block_topk, block_tok, num_heads, batch_size
+    )
+    selected_chunks = _out
+    if selected_chunks is None:
+        selected_chunks = torch.full(
+            (topk, num_heads, q.shape[0]), -1, device=q.device, dtype=torch.int32
+        )
+    if num_heads > plan["head_limit"]:
+        _select_topk_head_slices(
+            q, chunk_means, chunk_end, cu_seqlens, max_seqlen, max_chunks_per_sequence,
+            topk, chunk_size, selected_chunks, plan["head_limit"],
+        )
+        return selected_chunks
+
     num_token_blocks = cdiv(max_seqlen, block_tok)
     park_scores = None
     park_ids = None
     park_counts = None
-    # ``batch`` selects dense chunk slots, so it stays a global index via
-    # ``batch_offset``: both grid dimensions can then be partitioned.  The
-    # geometry (coverage, token tile, scratch budget) is a pure function so the
-    # invariants are covered by unit tests.
-    plan = _topk_park_plan(
-        max_chunks_per_sequence,
-        block_chunk,
-        block_topk,
-        block_tok,
-        num_heads,
-        batch_size,
-    )
     cand_tiles = plan["cand_tiles"]
     block_chunk = plan["block_chunk"]
-    budget = plan["budget"]
     batches_per_launch = plan["batches_per_launch"]
     blocks_per_launch = plan["blocks_per_launch"]
     group_tok = plan["group_tok"]
@@ -1663,6 +1663,27 @@ class _GatherMobaKVNpu(torch.autograd.Function):
 
 def _gather_moba_kv_triton(k, v, cu_chunk, filtered_chunk_indices, chunk_size):
     return _GatherMobaKVNpu.apply(k, v, cu_chunk, filtered_chunk_indices, chunk_size)
+
+
+def _select_topk_head_slices(
+    q, chunk_means, chunk_end, cu_seqlens, max_seqlen, max_chunks, topk,
+    chunk_size, selected_chunks, head_limit,
+):
+    """Fit head slices into both launch budgets while preserving GQA mapping."""
+    kv_heads = chunk_means.shape[1]
+    group_size = q.shape[1] // kv_heads
+    kv_per_slice = max(1, head_limit // group_size)
+    for kv_start in range(0, kv_heads, kv_per_slice):
+        kv_end = min(kv_start + kv_per_slice, kv_heads)
+        group_end = kv_end * group_size
+        # A slice can contain several full KV groups or part of one KV group.
+        for start in range(kv_start * group_size, group_end, head_limit):
+            end = min(start + head_limit, group_end)
+            _compute_selected_chunks_batched_streaming_triton(
+                q[:, start:end], chunk_means[:, kv_start:kv_end], chunk_end,
+                cu_seqlens, max_seqlen, max_chunks, topk, chunk_size,
+                _out=selected_chunks[:, start:end],
+            )
 
 
 __all__ = [

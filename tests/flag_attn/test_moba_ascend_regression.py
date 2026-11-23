@@ -77,6 +77,25 @@ def test_topk_plan_regression_shapes():
     assert plan["tokens_per_park"] == 1
 
 
+def test_topk_plan_bounds_minimum_launch():
+    max_chunks, block_chunk, block_topk, block_tok = 16385, 32, 64, 16
+    plan = routing._topk_park_plan(max_chunks, block_chunk, block_topk, block_tok, 64, 1)
+    assert plan["head_limit"] == 63
+    program_bytes = plan["park_program_bytes"]
+    assert 63 * program_bytes <= routing._TOPK_PARK_BUDGET_BYTES < 64 * program_bytes
+
+    with pytest.raises(ValueError, match="one MoBA top-k park program"):
+        routing._topk_park_plan(2**22, block_chunk, block_topk, block_tok, 1, 1)
+
+    # With many batches, one park block can expand beyond the gather cap.
+    plan = routing._topk_park_plan(8, 32, 2, 128, 16, 1024)
+    batch_extent = plan["batches_per_launch"]
+    gather_blocks = routing._gather_blocks_per_launch(plan, batch_extent)
+    assert (
+        gather_blocks * 16 * batch_extent * plan["tokens_per_park"] <= plan["gather_budget"]
+    )
+
+
 @pytest.fixture
 def npu_device():
     from flag_attn.testing import backend
@@ -189,6 +208,31 @@ def test_selector_large_topk_does_not_divide_by_zero(npu_device):
     case = _selector_case(npu_device, 33000, topk=64)
     seq = 33000
     _check_against_cpu_topk(case, [seq - 1, seq + seq - 1, 0, seq + 5])
+
+
+@pytest.mark.parametrize("head_limit", [1, 4])
+def test_selector_head_slices_preserve_gqa(npu_device, monkeypatch, head_limit):
+    chunk_size, seq_len, max_chunks, topk = 4, 25, 7, 2
+    cu = torch.tensor([0, 9, 9 + seq_len], dtype=torch.int32, device=npu_device)
+    _, chunk_end, _, _, _ = routing._build_dense_chunk_metadata_triton(cu, seq_len, chunk_size)
+    q = torch.zeros((34, 6, 32), dtype=torch.bfloat16, device=npu_device)
+    q[:, :, 0] = 1
+    means = torch.zeros((2 * max_chunks, 3, 32), dtype=q.dtype, device=npu_device)
+    scores = torch.arange(max_chunks, dtype=torch.float32, device=npu_device)
+    means[:, 0, 0] = scores.repeat(2)
+    means[:, 1, 0] = -scores.repeat(2)
+
+    # A one-head limit splits KV groups. Four heads fit two whole groups.
+    args = q, means, chunk_end, cu, seq_len, max_chunks, topk, chunk_size
+    expected = routing._compute_selected_chunks_batched_streaming_triton(*args)
+    assert expected[:, :, -1].cpu().tolist() == [
+        [12, 12, 7, 7, 7, 7],
+        [11, 11, 8, 8, 8, 8],
+    ]
+    plan = routing._topk_park_plan(max_chunks, 32, 2, 128, 6, 2)
+    monkeypatch.setattr(routing, "_TOPK_PARK_BUDGET_BYTES", head_limit * plan["park_program_bytes"])
+    actual = routing._compute_selected_chunks_batched_streaming_triton(*args)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("topk, tail_start", [(1, 2048), (2, 2048), (7, 512)])
