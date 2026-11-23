@@ -734,6 +734,12 @@ def _compute_dense_chunk_means_triton(
     valid_historical: torch.Tensor,
     chunk_size: int,
 ) -> torch.Tensor:
+    if k.device.type == "npu":
+        from flag_attn.runtime.backend._ascend.FLA.moba.routing import (
+            _compute_dense_chunk_means_triton as _npu_impl,
+        )
+
+        return _npu_impl(k, cu_chunk, valid_historical, chunk_size)
     num_chunk_slots = valid_historical.numel()
     _, num_kv_heads, head_dim = k.shape
     chunk_means = torch.empty(
@@ -915,6 +921,12 @@ def _compute_chunk_means_triton(
     chunk_size: int,
 ) -> torch.Tensor:
     """Compute target chunk means directly from the original K tensor."""
+    if k.device.type == "npu":
+        from flag_attn.runtime.backend._ascend.FLA.moba.routing import (
+            _compute_chunk_means_triton as _npu_impl,
+        )
+
+        return _npu_impl(k, cu_chunk, filtered_chunk_indices, chunk_size)
     num_chunks = filtered_chunk_indices.numel()
     _, num_heads, head_dim = k.shape
     if num_chunks == 0:
@@ -964,6 +976,14 @@ def _compute_selected_chunks_streaming_triton(
     batch_end: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
+    # Triton-Ascend cannot lower tl.topk(K>1)/tl.bitonic_merge, so the NPU path
+    # resolves the same selection in its vendor backend.
+    if q.device.type == "npu":
+        from flag_attn.runtime.backend._ascend.FLA.moba.routing import (
+            _compute_selected_chunks_streaming_triton as _npu_impl,
+        )
+
+        return _npu_impl(q, chunk_means, chunk_end, batch_end, topk)
     num_chunks, num_kv_heads, head_dim = chunk_means.shape
     num_heads = q.shape[1]
     if num_heads % num_kv_heads != 0:
@@ -1181,8 +1201,24 @@ def _compute_selected_chunks_batched_streaming_triton(
     max_seqlen: int,
     max_chunks_per_sequence: int,
     topk: int,
+    chunk_size: int | None = None,
 ) -> torch.Tensor:
     """Batch-aware streaming top-k for dense-slot inference metadata."""
+    if q.device.type == "npu":
+        from flag_attn.runtime.backend._ascend.FLA.moba.routing import (
+            _compute_selected_chunks_batched_streaming_triton as _npu_impl,
+        )
+
+        return _npu_impl(
+            q,
+            chunk_means,
+            chunk_end,
+            cu_seqlens,
+            max_seqlen,
+            max_chunks_per_sequence,
+            topk,
+            chunk_size,
+        )
     num_chunk_slots, num_kv_heads, head_dim = chunk_means.shape
     num_heads = q.shape[1]
     batch_size = cu_seqlens.numel() - 1
