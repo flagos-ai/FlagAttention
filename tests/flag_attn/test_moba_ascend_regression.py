@@ -231,8 +231,19 @@ def test_selector_head_slices_preserve_gqa(npu_device, monkeypatch, head_limit):
     ]
     plan = routing._topk_park_plan(max_chunks, 32, 2, 128, 6, 2)
     monkeypatch.setattr(routing, "_TOPK_PARK_BUDGET_BYTES", head_limit * plan["park_program_bytes"])
+    park_kernel = routing._chunk_topk_park_kernel
+    launch_programs = []
+
+    class ObservedParkKernel:
+        def __getitem__(self, grid):
+            blocks, heads, batches = grid
+            launch_programs.append(blocks * heads * batches)
+            return park_kernel[grid]
+
+    monkeypatch.setattr(routing, "_chunk_topk_park_kernel", ObservedParkKernel())
     actual = routing._compute_selected_chunks_batched_streaming_triton(*args)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert launch_programs and max(launch_programs) <= head_limit
 
 
 @pytest.mark.parametrize("topk, tail_start", [(1, 2048), (2, 2048), (7, 512)])
