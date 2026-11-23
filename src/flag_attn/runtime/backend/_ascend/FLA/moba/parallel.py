@@ -292,7 +292,6 @@ class MixedAttention(torch.autograd.Function):
         return dq, dk, dv, None, dmq, dmkv, None, None, None, None, None, None, None
 
 
-
 def _plan_rank_passes(
     selected_chunks,
     sequence_lengths,
@@ -371,11 +370,9 @@ def _moba_attn_varlen_inference(
 ) -> torch.Tensor:
     """Device-side forward path with native GQA and index-only sparse routes."""
     seqlen, num_q_heads, head_dim = q.shape
-    # ``max_seqlen`` sizes the local-attention grid, so an understated value
-    # would leave the tail of a longer sequence unwritten.  Validate it against
-    # the host copy of ``cu_seqlens`` (cached per tensor version), which is the
-    # same source the pass planner uses: the check stays exact and does not
-    # block on a device-to-host copy on every call.
+    # max_seqlen bounds dense chunk capacity and selector token coverage.
+    # An understated value can leave the sequence tail unwritten. Reuse the
+    # host lengths from the rank planner and cache them per tensor version.
     sequence_lengths = _host_sequence_lengths(cu_seqlens)
     actual_max_seqlen = max(sequence_lengths)
     if max_seqlen < actual_max_seqlen:
@@ -439,9 +436,8 @@ def _moba_attn_varlen_inference(
     current_out = local_out
     current_lse = local_lse
     if len(rank_passes) == 1:
-        # A single pass can merge in place: each program reads only the rows it
-        # writes, so the routed terms never alias the destination. This drops
-        # one output-sized buffer (1 GiB at the largest official shape).
+        # A single pass can reuse the local output and LSE buffers. Each
+        # program owns its rows and the routed inputs are disjoint.
         next_out = current_out
         next_lse = current_lse
     else:
@@ -483,10 +479,7 @@ def _moba_attn_varlen_inference(
             next_out.view(-1, head_dim),
             next_lse,
         )
-        # The next pass allocates its own routed output before this loop body
-        # runs again; releasing the previous pass's buffers and metadata here
-        # keeps two route outputs from being resident at once (measured 3.35 GB
-        # at 262144 and 4.49 GB at 524288 tokens).
+        # Release routed buffers before allocating the next pass's outputs.
         del route_out, route_lse, route_positions
         del query_indices, expert_offsets, descriptor_experts, descriptor_starts
         current_out, next_out = next_out, current_out
@@ -563,7 +556,7 @@ def parallel_moba(
     if num_q_heads != num_kv_heads:
         k, v = _expand_kv_heads_triton(k, v, num_q_heads)
 
-    seqlen, num_head, head_dim = q.shape
+    seqlen = q.shape[0]
 
     actual_max_seqlen, chunk_metadata = _validated_chunk_metadata(
         cu_seqlens,
@@ -635,7 +628,7 @@ def parallel_moba(
     ) = _build_sparse_routes_triton(
         selected_chunks,
         num_filtered_chunk,
-        num_head,
+        num_q_heads,
         seqlen,
     )
 
@@ -654,7 +647,7 @@ def parallel_moba(
     moba_q = gather_moba_q(q, moba_q_sh_indices)
 
     moba_cu_seqlen_q = expert_offsets
-    num_experts = num_filtered_chunk * num_head
+    num_experts = num_filtered_chunk * num_q_heads
     moba_kv = _gather_moba_kv_triton(
         k,
         v,

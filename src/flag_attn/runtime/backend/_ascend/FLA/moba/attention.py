@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ascend Triton MoBA kernels.
+"""Ascend launch and merge paths for MoBA.
 
-The generic implementation relies on CUDA device queries, autotuned merge
-kernels and Triton primitives (``tl.topk`` with K > 1, ``tl.bitonic_merge``)
-that the Ascend compiler either rejects or lowers incorrectly.  This module
-keeps the shared ``@triton.jit`` attention kernels, but replaces the launch
-policy, the merge entry point and the routed top-k selection.
+The varlen and routed attention math uses the shared Triton kernels.
+Ascend supplies grid partitioning, workspace limits and an FP32 merge.
+The merge avoids CUDA-specific autotuning and uses int64 routed
+addresses for large training buffers. Routing selection is in
+``routing.py``.
 """
 
 import torch
@@ -66,14 +66,14 @@ def _attention_launch_config(head_dim: int, device: torch.device):
     return _BLOCK_M_SMALL_D, _BLOCK_N_SMALL_D, block_d, _NUM_WARPS, _NUM_STAGES
 
 
-# Routed-attention tiling.  One program owns ``_ROUTED_BLOCK_M`` route rows of one
-# expert, so the row tile also sets the descriptor granularity: 128 halves the
-# descriptor count against the shared varlen tile of 64.  Measured on the 910B
-# (8192 tokens, D=128, C=128, K=8, production inputs) that is 10.37 -> 7.83 ms
-# of routed attention with bit-identical output, because the per-program start
-# (~0.4 us) and the expert's K/V reload are paid once per 128 rows instead of
-# once per 64.  The 5.97 ms quoted by an earlier draft of this comment did not
-# reproduce.  Larger head dims keep the shared small tile.
+# One routed program owns a row tile for one (chunk, query head) expert.
+# The launcher and descriptor builder must use the same row tile.
+# At D <= 128, increasing the tile from 64 to 128 roughly halves the
+# descriptor count and amortizes program startup and expert K/V loads.
+# The measured routed stage at 8192 tokens on 910B fell from 10.37 to
+# 7.83 ms with identical output. The larger tile raises per-program
+# workspace, which is bounded by the descriptor slice below.
+# Larger head dimensions use the smaller shared tile.
 _ROUTED_BLOCK_M = 128
 
 
@@ -413,17 +413,17 @@ def _routed_sparse_attention_triton(
     route_out = torch.empty((query_indices.numel(), head_dim), device=q.device, dtype=q.dtype)
     route_lse = torch.empty((query_indices.numel(),), device=q.device, dtype=torch.float32)
     num_descriptors = descriptor_experts.numel()
-    # Each program owns exactly one descriptor and writes disjoint route rows,
-    # so contiguous descriptor slices are independent launches.  The slice
-    # bounds the reserved workspace (~490 KiB/program after the 128-row retile)
-    # and the launch count: the 8192-program slice used before K10-4 would have
-    # reserved 3.9 GB at 8192 tokens and owned the peak there.  The shipped rule
-    # is `min(_ROUTED_DESC_SLICE, _MAX_LAUNCH_GRID, max(1, cdiv(descriptors,
-    # 8)))`, which is 1024 programs (8 launches) at 8192 tokens and reserves
-    # ~0.5 GB instead (measured peak 1.39 -> 0.89 GB, no latency change); at
-    # 524288 tokens the 2048-program cap applies, so a full pass of 196608
-    # descriptors is 96 launches.  Both clamps are inert for every official
-    # shape because ``_ROUTED_DESC_SLICE`` (2048) is the smallest bound.
+    # Descriptors own disjoint output and LSE rows, so contiguous slices can
+    # be launched independently into the same output buffers.
+    #
+    # Workspace scales with the number of launched programs. The 128-row
+    # tile uses about 490 KiB per program on the measured 910B4 shape.
+    # The one-eighth slice limits the peak on short passes, while the fixed
+    # descriptor cap bounds workspace for longer passes. The grid limit
+    # applies independently to each slice.
+    #
+    # The input descriptor capacity can include padding. The kernel masks
+    # inactive descriptors, and they still count toward the launch grid.
     descriptor_slice = min(
         _ROUTED_DESC_SLICE,
         _MAX_LAUNCH_GRID,
@@ -561,12 +561,12 @@ def _fused_merge_softmax_triton(
     which case a program loops over several row tiles (Triton-Ascend rejects
     larger launches).
 
-    At the worst official shape (``num_rows = 4194304``, ``head_dim = 128``,
-    ``topk = 7``, ``rows = 32``) there are 131072 row tiles, launched as 65535
-    programs that each process two or three tiles: a single launch, no slicing.
-    The kernel has no ``tl.dot`` and allocates no per-program workspace
-    (measured 0 B at every size up to 4.2M rows), so peak device memory is
-    exactly the input and output buffers.
+    The largest official case has 8,388,608 rows and 262,144 row tiles.
+    Grid striding keeps each merge pass to one launch. The kernel uses
+    vector arithmetic and requires no per-program dot workspace.
+    Route positions index compacted rows, whose element offset can exceed
+    int32 even when the row index fits. Routed value loads widen the row
+    position to int64 before multiplying by its stride.
 
     The shared kernel cannot be used: Triton-Ascend fails to legalize its
     ``tl.where(mask, positions, 0)`` scalar materialization, and its autotune
@@ -651,9 +651,9 @@ def _fused_merge_softmax_triton_inplace(
     ``self_lse`` may alias ``final_lse`` as well.  No kernel code differs from
     the out-of-place path, so results are bit-identical to it.
 
-    Memory: the kernel itself allocates no workspace, so the only change is that
-    the caller no longer needs a second output (``num_rows x head_dim``) and LSE
-    buffer - about 1.07 GB + 16 MB at 4.2M rows, D=128 in bf16.
+    For a single pass, exact aliasing saves an output payload of
+    ``num_rows * head_dim * element_size`` bytes and an FP32 LSE vector.
+    Multi-pass callers can still use two disjoint buffer pairs.
     """
     _fused_merge_softmax_triton(
         self_out,
