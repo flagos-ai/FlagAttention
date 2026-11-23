@@ -95,10 +95,10 @@ def _varlen_sequence_plan(cu_seqlens_q, cu_seqlens_k, num_blocks, num_heads):
     original single launch already fits and must be kept untouched (it is the
     bit-identity baseline).
 
-    Ascend rejects a launch whose grid product exceeds 65535
-    (``Invalid_Argument EE1003: ... coreDim ...``) and reserves a per-program
-    workspace (measured: 56-192 KiB for these kernels), so the slice size is
-    the tighter of the legality limit and ``_VARLEN_PROGRAMS_PER_SLICE``.
+    Aim for ``_VARLEN_PROGRAMS_PER_SLICE`` to bound workspace. A single
+    packed sequence may exceed that target because the sequence is indivisible
+    here. Ascend enforces the 65535-program grid limit for every launch, so
+    reject a sequence that cannot fit on its own.
     """
     num_sequences = cu_seqlens_q.numel() - 1
     if cu_seqlens_k.numel() - 1 != num_sequences:

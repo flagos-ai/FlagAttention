@@ -1102,12 +1102,7 @@ def _scatter_route_metadata_kernel(
 
 
 def _compact_routes_int64(selected_chunks: torch.Tensor, num_chunks: int, num_heads: int, seqlen: int):
-    """Fallback for expert spaces that float32 cannot represent exactly.
-
-    ``num_chunks * num_heads`` reaching 2**24 needs more than ``2**24 /
-    num_heads`` chunks (1M chunks at 16 heads), which no supported sequence
-    length produces; keep the exact int64 path anyway.
-    """
+    """Sort exact int64 expert keys when the FP32 key space reaches its guard."""
     topk = selected_chunks.shape[0]
     device = selected_chunks.device
     num_slots = selected_chunks.numel()
@@ -1145,13 +1140,9 @@ def _compact_routes_int64(selected_chunks: torch.Tensor, num_chunks: int, num_he
 def _compact_routes(selected_chunks: torch.Tensor, num_chunks: int, num_heads: int, seqlen: int):
     """Exact, atomic-free compaction of (rank, head, token) routes.
 
-    ``tl.atomic_add`` cannot allocate unique slots on Ascend, so routes are
-    ordered by a sort on the expert id.  The sort key is FP32 because
-    ``torch.sort`` runs int64 on AiCPU (6.5 s of a 7.6 s stage at 29.4M slots)
-    while FP32 sort runs on AiCore (52 ms); every expert id is below 2**24, so
-    the key is exact.  The resulting expert slices and per-route positions are
-    equivalent to the CUDA counter-based compaction (any within-expert order is
-    valid).
+    Sorting by the expert ID gives each route a unique slot without atomics.
+    FP32 sort runs on AiCore and preserves the exact expert IDs and invalid
+    sentinel below 2**24. Within an expert, any route order is valid.
 
     Invalid routes (chunk id out of range) sort last under the sentinel
     ``num_experts``; they are not counted and their route position stays -1.
@@ -1160,8 +1151,8 @@ def _compact_routes(selected_chunks: torch.Tensor, num_chunks: int, num_heads: i
     ``order`` is a permutation of ``0 .. num_slots - 1``, ``torch.sort`` returns
     the identity as values and the inverse permutation as indices, and that is
     exactly ``positions_of_slot``.  An FP32 key represents every slot id exactly
-    while ``num_slots < 2**24``; above that (and for the expert-space fallback
-    below) the shipped scatter kernel is kept.
+    while ``num_slots < 2**24``. Larger slot spaces use the Triton scatter
+    kernel to invert that sort. Larger expert spaces use int64 keys instead.
     """
     topk = selected_chunks.shape[0]
     device = selected_chunks.device
