@@ -304,10 +304,9 @@ def _plan_rank_passes(
 
     The previous policy sized every pass by the *worst case* row count
     ``tokens * heads``, which forced one pass per rank on long sequences. The
-    actual routed row count of a rank is much smaller (a rank only has routes
-    for tokens past its chunk), so grouping by the measured row count removes
-    redundant merge/reload work while keeping the routed-attention output under
-    the same byte budget.
+    actual routed row count of a rank is smaller (a rank only has routes for
+    tokens past its chunk). Grouping by that count reduces merge/reload work
+    while targeting the same byte budget for live output and FP32 LSE rows.
 
     The row count is derived analytically from the host copy of ``cu_seqlens``
     (``sequence_lengths``) instead of reading ``(selected_chunks >= 0).sum()``
@@ -320,13 +319,14 @@ def _plan_rank_passes(
     This is exact, needs no device readback, and preserves the previous pass
     grouping (including the one-pass-per-rank case at 262144 tokens).
 
-    A second, independent bound is the int32 element index that the kernels use
-    for routed rows.  Triton-Ascend computes ``row * head_dim`` in int32 inside
-    the merge gather, so a pass with ``rows * head_dim >= 2**31`` wraps and traps
-    on the vector core (observed as an aivec error at 262144 tokens, where 29.4M
-    route rows x 128 columns is 3.76e9 elements).  The cap is in *elements*, not
-    bytes: 65536 tokens (940M elements, 1.88 GB) already exceeds the byte bound
-    and still runs correctly.
+    The routed forward store still multiplies an int32 route position by the
+    output row stride. Keep the conservative element cap for that store. The
+    merge widens routed positions to int64 before multiplying by the stride,
+    which fixes the historical overflow in its gather.
+
+    Route slots and flattened query indices have separate int32 checks in
+    compaction. The routed launcher slices descriptors to bound per-launch
+    workspace independently of this pass budget.
     """
     num_ranks, num_heads, _ = selected_chunks.shape
     if num_ranks <= 0:
