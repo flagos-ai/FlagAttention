@@ -2832,7 +2832,6 @@ def _kv_block_attn_tle_kernel(
     # Causal + sequence mask per (key, query). key_abs = kv_block*128 + off_n,
     # broadcast across the QH queries (each query carries its own kv_block/q_abs,
     # expanded to the group heads). qk_t is [K, QH].
-    key_abs = kv_block[None, :] * BLOCK_SIZE_K + off_n[:, None]  # [K, Q_TILE]
     q_abs_qh = tl.reshape(
         tl.broadcast_to(q_abs[:, None], (Q_TILE, BLOCK_SIZE_H)), QH
     )  # [QH]
@@ -3623,7 +3622,6 @@ def _minimax_m3_sparse_attn_kv_outer(
     total_q, num_heads, head_dim = q.shape
     topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
-    max_blocks = block_table.shape[1]
 
     num_pages = kv_cache.shape[0]
     if csr is None:
@@ -3870,7 +3868,10 @@ def minimax_m3_sparse_attn(
     Short prompts, fp8 KV, scaled KV, and TLE-less builds keep the q-outer body
     below. The public signature and semantics are unchanged.
     """
-    if _should_use_kv_outer_prefill(kv_cache, max_query_len, k_scale, v_scale):
+    if (
+        _should_use_kv_outer_prefill(kv_cache, max_query_len, k_scale, v_scale)
+        and _tma_supports_head_dim(q.shape[-1], kv_cache.element_size())
+    ):
         _minimax_m3_sparse_attn_kv_outer(
             q, kv_cache, topk_idx, block_table, cu_seqlens_q, seq_lens,
             prefix_lens, max_query_len, num_kv_heads, sm_scale, output,
