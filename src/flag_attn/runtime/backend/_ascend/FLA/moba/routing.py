@@ -51,61 +51,61 @@ from flag_attn.FLA.moba.routing import (
 # have at most ``_MAX_LAUNCH_GRID`` programs.
 _MAX_LAUNCH_GRID = 65535
 
-# Triton-Ascend also reserves a per-program workspace when a kernel launches,
-# so a legal grid can still exhaust device memory.  The costs below were
-# measured on this 910B by launching each kernel with grids of 1024..8192 and
-# dividing the ``torch.npu.max_memory_allocated()`` delta by the grid
-# (BLOCK_M=64, BLOCK_N=64, BLOCK_D=128, CHUNK_SIZE=128; the deltas were exactly
-# linear in the grid):
-#     _varlen_attn_fwd_kernel          56 KiB
-#     _varlen_attn_bwd_dq_kernel      192 KiB
-#     _varlen_attn_bwd_dkdv_kernel     80 KiB
-#     _routed_gqa_attn_fwd_kernel     240 KiB (64-row); ~490 KiB with the
-#                                      shipped 128-row tile
-#     _chunk_topk_*_streaming_kernel    8 KiB
-#     all load/store-only kernels       0 KiB
-# Slices are therefore capped by a workspace budget as well as by legality.
-_WORKSPACE_BUDGET_BYTES = 2 * 1024**3
-
-
-def _workspace_programs(per_program_bytes: int) -> int:
-    """Largest slice that keeps one launch's reserved workspace in budget."""
-    return max(1, _WORKSPACE_BUDGET_BYTES // max(1, per_program_bytes))
-
-
-# 2048 descriptors x ~490 KiB (the 128-row routed tile) ~= 1.0 GB of per-launch
-# workspace; at the original 240 KiB tile it was ~480 MiB.  Before slicing, a
-# 16384-token call (30720 descriptors) reserved ~8 GB for this kernel alone; the
-# 8192-program slice still reserved 2.0 GB, which made routed attention the
-# peak-memory owner at short sequences (2.40 GB of the 2.40 GB total at 8192
-# tokens).  The launcher additionally caps a launch at an eighth of the pass, so
-# short calls use 1024 programs.  The slice only bounds one launch, so it does
-# not change results.
+# Ascend reserves workspace per launched program in addition to the tensors
+# allocated by Python. Each kernel family has a separate launch bound.
+# Per-program workspace depends on the tile shape and head dimension.
+#
+# Routed attention uses about 490 KiB per program with the 128-row tile on the
+# measured 910B4 shape (D=C=128). 2048 descriptors reserve about 1 GiB.
+# The launcher further caps short passes at one eighth of their descriptors.
 _ROUTED_DESC_SLICE = 2048
-# 4096 programs: 224 MiB (fwd, 56 KiB/program), 768 MiB (dq, 192 KiB/program),
-# 320 MiB (dkdv, 80 KiB/program).
+
+# Measured workspace per varlen program is 56 KiB for forward, 192 KiB for
+# backward dQ, and 80 KiB for backward dK/dV. A 4096-program slice therefore
+# uses up to 224, 768, or 320 MiB respectively at the measured shape.
+# The shared varlen launchers partition packed sequences to apply this cap.
 _VARLEN_PROGRAMS_PER_SLICE = 4096
-# 8 KiB/program (measured at 1024 and 2048 chunk tiles, so the static chunk
-# scan does not grow the workspace), but one launch is also bounded by the
-# AICore watchdog: measured 0.92 s at 8192 programs, 1.84 s at 16384 and a
-# timeout at 65520 (D=128, 1024 chunks), so slice well below the legality cap.
+
+# The selector also needs to stay below the AICore watchdog. A 65520-program
+# scan timed out with D=128 and 1024 chunks even though its grid was legal.
 _TOPK_PROGRAMS_PER_SLICE = 8192
-# Parked candidates are 8 bytes per (tile, rank, token) plus a 4-byte tile
-# count per program.  The whole stage-1 scratch is launch-local, so the launch
-# is shrunk until this one buffer fits the budget below; the gather for that
-# token range consumes the same buffer before the next park launch reuses it.
+
+# Park scratch uses two FP32 lanes per parked (tile, rank, token) and one
+# int32 tile count per program. The gather reads the corresponding token
+# blocks before a later park launch reuses the same tensors. This budget is
+# separate from the compiler-managed workspace and the on-core tile size.
 _TOPK_PARK_BUDGET_BYTES = 256 * 1024**2
-# Stage 2 ranks the candidate axis in groups of at most this many lanes.  128
-# lanes x up to 32 tokens keeps the score/id tiles and the unrolled rank chain
-# inside the 192 KiB unified buffer; 512 lanes (the 524288-token case) needs
-# 225 KiB and fails to compile.  Shapes with fewer lanes take the single-group
-# path unchanged.
+
+# Ranking the entire candidate axis can exceed the 192 KiB unified buffer.
+# Gather ranks at most 128 lanes at a time and merges exact rank lists.
+# The planner also narrows the token tile for grouped two-rank-lane gathers.
 _GATHER_MAX_CAND_LANES = 128
-# Load/store-only kernels reserve no workspace: legality-bound.
+
+# Query-row gathers and packed KV gathers use bounded row slices. Mean and
+# GQA expansion/reduction launches use the grid limit directly.
 _GATHER_ROWS_PER_SLICE = 8192
-_CHUNK_MEAN_PROGRAMS_PER_SLICE = min(_MAX_LAUNCH_GRID, _workspace_programs(0))
 _GATHER_KV_ROWS_PER_SLICE = 8192
-_EXPAND_PROGRAMS_PER_SLICE = min(_MAX_LAUNCH_GRID, _workspace_programs(0))
+
+
+def _select_topk_head_slices(
+    q, chunk_means, chunk_end, cu_seqlens, max_seqlen, max_chunks, topk,
+    chunk_size, selected_chunks, head_limit,
+):
+    """Fit head slices into both launch budgets while preserving GQA mapping."""
+    kv_heads = chunk_means.shape[1]
+    group_size = q.shape[1] // kv_heads
+    kv_per_slice = max(1, head_limit // group_size)
+    for kv_start in range(0, kv_heads, kv_per_slice):
+        kv_end = min(kv_start + kv_per_slice, kv_heads)
+        group_end = kv_end * group_size
+        # A slice can contain several full KV groups or part of one KV group.
+        for start in range(kv_start * group_size, group_end, head_limit):
+            end = min(start + head_limit, group_end)
+            _compute_selected_chunks_batched_streaming_triton(
+                q[:, start:end], chunk_means[:, kv_start:kv_end], chunk_end,
+                cu_seqlens, max_seqlen, max_chunks, topk, chunk_size,
+                _out=selected_chunks[:, start:end],
+            )
 
 
 def _streaming_tile_shape(history_chunks: int, block_topk: int):
@@ -1205,7 +1205,6 @@ def _compact_routes(selected_chunks: torch.Tensor, num_chunks: int, num_heads: i
     expert_offsets = torch.searchsorted(sorted_experts, limits).to(torch.int32)
     expert_counts = expert_offsets[1:] - expert_offsets[:-1]
 
-    route_positions = torch.empty((num_slots,), device=device, dtype=torch.int32)
     # slots are laid out as [rank, token, head], so the compacted query index of
     # a slot is exactly slot % (seqlen * num_heads).
     order = order.to(torch.int32)
@@ -1225,6 +1224,7 @@ def _compact_routes(selected_chunks: torch.Tensor, num_chunks: int, num_heads: i
         # FP32 keys would round slot ids >= 2**24 and break the inverse.  The
         # grid is legality-bound, so walk the slots in 65535-program chunks
         # instead of emitting one oversized launch.
+        route_positions = torch.empty((num_slots,), device=device, dtype=torch.int32)
         num_blocks = cdiv(num_slots, _ROUTE_SCATTER_BLOCK)
         for block_start in range(0, num_blocks, _MAX_LAUNCH_GRID):
             block_end = min(block_start + _MAX_LAUNCH_GRID, num_blocks)
@@ -1348,7 +1348,7 @@ def _compute_chunk_means_triton(
     # The kernel indexes the source chunk and the output by its local program
     # id, so both are sliced together.
     chunks_per_launch = max(
-        1, min(_CHUNK_MEAN_PROGRAMS_PER_SLICE, _MAX_LAUNCH_GRID) // num_heads
+        1, _MAX_LAUNCH_GRID // num_heads
     )
     for chunk_start in range(0, num_chunks, chunks_per_launch):
         chunk_end = min(chunk_start + chunks_per_launch, num_chunks)
@@ -1390,7 +1390,7 @@ def _compute_dense_chunk_means_triton(
     block_tok = min(64, triton.next_power_of_2(chunk_size))
     block_d = max(16, triton.next_power_of_2(head_dim))
     slots_per_launch = max(
-        1, min(_CHUNK_MEAN_PROGRAMS_PER_SLICE, _MAX_LAUNCH_GRID) // num_kv_heads
+        1, _MAX_LAUNCH_GRID // num_kv_heads
     )
     for slot_start in range(0, num_chunk_slots, slots_per_launch):
         slot_end = min(slot_start + slots_per_launch, num_chunk_slots)
@@ -1481,7 +1481,7 @@ class _ExpandKVHeadsNpu(torch.autograd.Function):
         expanded_v = torch.empty_like(expanded_k)
         block_d = max(16, triton.next_power_of_2(head_dim))
         tokens_per_launch = max(
-            1, min(_EXPAND_PROGRAMS_PER_SLICE, _MAX_LAUNCH_GRID) // num_q_heads
+            1, _MAX_LAUNCH_GRID // num_q_heads
         )
         for token_start in range(0, total_tokens, tokens_per_launch):
             token_end = min(token_start + tokens_per_launch, total_tokens)
@@ -1522,7 +1522,7 @@ class _ExpandKVHeadsNpu(torch.autograd.Function):
         dv = torch.zeros(ctx.input_shape, device=d_expanded_v.device, dtype=d_expanded_v.dtype)
         block_d = max(16, triton.next_power_of_2(head_dim))
         tokens_per_launch = max(
-            1, min(_EXPAND_PROGRAMS_PER_SLICE, _MAX_LAUNCH_GRID) // num_kv_heads
+            1, _MAX_LAUNCH_GRID // num_kv_heads
         )
         for token_start in range(0, total_tokens, tokens_per_launch):
             token_end = min(token_start + tokens_per_launch, total_tokens)
@@ -1663,27 +1663,6 @@ class _GatherMobaKVNpu(torch.autograd.Function):
 
 def _gather_moba_kv_triton(k, v, cu_chunk, filtered_chunk_indices, chunk_size):
     return _GatherMobaKVNpu.apply(k, v, cu_chunk, filtered_chunk_indices, chunk_size)
-
-
-def _select_topk_head_slices(
-    q, chunk_means, chunk_end, cu_seqlens, max_seqlen, max_chunks, topk,
-    chunk_size, selected_chunks, head_limit,
-):
-    """Fit head slices into both launch budgets while preserving GQA mapping."""
-    kv_heads = chunk_means.shape[1]
-    group_size = q.shape[1] // kv_heads
-    kv_per_slice = max(1, head_limit // group_size)
-    for kv_start in range(0, kv_heads, kv_per_slice):
-        kv_end = min(kv_start + kv_per_slice, kv_heads)
-        group_end = kv_end * group_size
-        # A slice can contain several full KV groups or part of one KV group.
-        for start in range(kv_start * group_size, group_end, head_limit):
-            end = min(start + head_limit, group_end)
-            _compute_selected_chunks_batched_streaming_triton(
-                q[:, start:end], chunk_means[:, kv_start:kv_end], chunk_end,
-                cu_seqlens, max_seqlen, max_chunks, topk, chunk_size,
-                _out=selected_chunks[:, start:end],
-            )
 
 
 __all__ = [
