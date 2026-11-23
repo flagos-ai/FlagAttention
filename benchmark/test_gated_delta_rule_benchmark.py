@@ -221,22 +221,15 @@ def _record_result(
 
 
 @pytest.mark.chunk_gated_delta_rule
-@pytest.mark.skipif(
-    not test_backend.supports_operator("chunk_gated_delta_rule"), reason="requires an available accelerator"
-)
 def test_chunk_gated_delta_rule_benchmark(
     record_property: Callable[[str, object], None],
 ) -> None:
-    if _cuda_tle_available() and torch.cuda.get_device_capability()[0] == 9:
-        pytest.skip("Hopper coverage is parametrized in test_chunk_gdn_forward_benchmark")
     run_benchmark(record_property)
 
 
 def run_benchmark(
     record_property: Callable[[str, object], None] | None = None,
 ) -> None:
-    if not test_backend.is_available():
-        raise RuntimeError("GDN benchmark requires an available accelerator")
     compare_vllm = test_backend.is_nvidia()
 
     if record_property is not None:
@@ -397,8 +390,6 @@ def _record(record_property, op_name, shape, state_dtype, module, latency, measu
 @pytest.mark.parametrize("baseline", ["vllm"], ids=["vllm_reference"])
 @torch.inference_mode()
 def test_chunk_gdn_forward_benchmark(shape, dtype, cache, baseline, record_property):
-    if not _cuda_tle_available() or torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("Hopper and TLE required")
     from flag_attn import chunk_gated_delta_rule_fwd
 
     reference = _require_vllm_reference()
