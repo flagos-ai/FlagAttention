@@ -1,4 +1,4 @@
-"""Regression tests for the Ascend MoBA K10-R routing fixes.
+"""Regression tests for Ascend MoBA routing and rank planning.
 
 Covers the three P0 defects found by the K10 audit with *independent* oracles:
 
@@ -17,29 +17,9 @@ import os
 import pytest
 import torch
 
-# This suite is Ascend-specific. Importing torch_npu registers torch.npu; skip
-# the module on vendors where it is not installed instead of failing collection.
-if not hasattr(torch, "npu"):
-    pytest.importorskip("torch_npu")
+from flag_attn.runtime.backend._ascend.FLA.moba import routing
 
-from flag_attn import parallel_moba
-from flag_attn.FLA.moba.naive_moba import moba_attn_varlen_naive
-from flag_attn.runtime.backend._ascend.FLA.moba import parallel as ascend_parallel
-from flag_attn.runtime.backend._ascend.FLA.moba.routing import (
-    _TOPK_PARK_BUDGET_BYTES,
-    _gather_blocks_per_launch,
-    _streaming_tile_shape,
-    _topk_park_plan,
-)
-from flag_attn.testing import backend as test_backend
-
-pytestmark = [
-    pytest.mark.parallel_moba,
-    pytest.mark.skipif(
-        not test_backend.supports_operator("parallel_moba"),
-        reason=test_backend.skip_reason("parallel_moba"),
-    ),
-]
+pytestmark = pytest.mark.parallel_moba
 
 MAX_CHUNKS = [
     1, 8, 64, 96, 128, 160, 224, 256,
@@ -52,7 +32,7 @@ TOPKS = [1, 2, 3, 4, 7, 8, 9, 16, 17, 31, 32, 33, 63, 64]
 def _tile_shape(max_chunks: int, topk: int):
     """The production tile policy, as the selector applies it."""
     block_topk = max(2, 1 << (topk - 1).bit_length())
-    block_tok, block_chunk = _streaming_tile_shape(max_chunks, block_topk)
+    block_tok, block_chunk = routing._streaming_tile_shape(max_chunks, block_topk)
     return block_topk, block_tok, block_chunk
 
 
@@ -60,7 +40,7 @@ def _tile_shape(max_chunks: int, topk: int):
 @pytest.mark.parametrize("topk", TOPKS)
 def test_topk_plan_spans_every_candidate(max_chunks, topk):
     block_topk, block_tok, block_chunk = _tile_shape(max_chunks, topk)
-    plan = _topk_park_plan(max_chunks, block_chunk, block_topk, block_tok, 16, 2)
+    plan = routing._topk_park_plan(max_chunks, block_chunk, block_topk, block_tok, 16, 2)
 
     # T1: ceil groups cover all candidate lanes; a floor would miss the tail.
     assert plan["num_groups"] * plan["group_cand"] >= plan["total_cand_lanes"]
@@ -75,40 +55,43 @@ def test_topk_plan_spans_every_candidate(max_chunks, topk):
     # T4: one park launch stays inside the declared scratch budget.
     programs = plan["blocks_per_launch"] * 16 * min(2, plan["batches_per_launch"])
     assert programs <= plan["budget"]
-    assert programs * plan["park_program_bytes"] <= _TOPK_PARK_BUDGET_BYTES
+    assert programs * plan["park_program_bytes"] <= routing._TOPK_PARK_BUDGET_BYTES
 
     # Stage 2 may only consume the blocks parked by its own stage-1 launch.
     for batch_extent in (1, 2):
-        gather_blocks = _gather_blocks_per_launch(plan, batch_extent)
+        gather_blocks = routing._gather_blocks_per_launch(plan, batch_extent)
         assert 1 <= gather_blocks <= plan["blocks_per_launch"]
 
 
 def test_topk_plan_regression_shapes():
     # 516 chunks is the 66048-token T1 shape: 17 tiles x 8 ranks = 136 lanes.
     block_topk, block_tok, block_chunk = _tile_shape(516, 8)
-    plan = _topk_park_plan(516, block_chunk, block_topk, block_tok, 16, 2)
+    plan = routing._topk_park_plan(516, block_chunk, block_topk, block_tok, 16, 2)
     assert plan["cand_tiles"] == 17
     assert plan["total_cand_lanes"] == 136
     assert plan["num_groups"] == 2
 
     # 258 chunks + topk 64 is the T3 shape: previously tokens_per_park == 0.
     block_topk, block_tok, block_chunk = _tile_shape(258, 64)
-    plan = _topk_park_plan(258, block_chunk, block_topk, block_tok, 16, 2)
+    plan = routing._topk_park_plan(258, block_chunk, block_topk, block_tok, 16, 2)
     assert plan["tokens_per_park"] == 1
 
 
-def _device_index() -> int:
+@pytest.fixture
+def npu_device():
+    from flag_attn.testing import backend
+
+    if backend.device != "npu" or not backend.is_available():
+        pytest.skip("An active Ascend NPU backend is required")
     spec = os.environ.get("FLAG_ATTN_TEST_DEVICE", "npu:0")
-    return int(spec.split(":")[-1]) if ":" in spec else 0
+    index = int(spec.split(":")[-1]) if ":" in spec else 0
+    torch.npu.set_device(index)
+    assert torch.npu.current_device() == index
+    return f"npu:{index}"
 
 
-def _selector_case(max_seqlen: int, topk: int):
+def _selector_case(device: str, max_seqlen: int, topk: int):
     """Run the inference selector on a deterministic 2-sequence batch."""
-    dev_index = _device_index()
-    torch.npu.set_device(dev_index)
-    assert torch.npu.current_device() == dev_index
-    device = f"npu:{dev_index}"
-
     batch, heads, dim, chunk = 2, 16, 128, 128
     tokens = batch * max_seqlen
     torch.manual_seed(20261121)
@@ -119,13 +102,13 @@ def _selector_case(max_seqlen: int, topk: int):
     )
     with torch.no_grad():
         cu_chunk, chunk_end, _, valid, maxc = (
-            ascend_parallel._build_dense_chunk_metadata_triton(cu, max_seqlen, chunk)
+            routing._build_dense_chunk_metadata_triton(cu, max_seqlen, chunk)
         )
-        means = ascend_parallel._compute_dense_chunk_means_triton(
+        means = routing._compute_dense_chunk_means_triton(
             k, cu_chunk, valid, chunk
         )
         hist = min(topk - 1, int(maxc) - 1)
-        selected = ascend_parallel._compute_selected_chunks_batched_streaming_triton(
+        selected = routing._compute_selected_chunks_batched_streaming_triton(
             q, means, chunk_end, cu, max_seqlen, int(maxc), hist, chunk
         )
         torch.npu.synchronize()
@@ -137,16 +120,18 @@ def _selector_case(max_seqlen: int, topk: int):
         int(maxc),
         hist,
         selected.cpu(),
-        chunk,
     )
 
 
 def _check_against_cpu_topk(case, token_indices):
-    q, means, chunk_end, cu, maxc, topk, selected, chunk = case
+    q, means, chunk_end, cu, maxc, topk, selected = case
     heads = q.shape[1]
     kv_heads = means.shape[1]
     group = heads // kv_heads
     tol = 5e-2  # only near-ties may reorder; scores are O(10)
+    changed_ranks = replaced_ids = near_ties = 0
+    max_gap = 0.0
+    errors = []
 
     for t in token_indices:
         batch = max(i for i in range(len(cu) - 1) if cu[i] <= t)
@@ -161,36 +146,140 @@ def _check_against_cpu_topk(case, token_indices):
             scores = (means[valid, kv, :] * q[t, head, :]).sum(dim=1)
             order = torch.argsort(scores, descending=True, stable=True)
             ref = valid[order[:want]]
-            got = selected[:, head, t]
-            got = got[got >= 0]
-            assert got.numel() == want, (t, head, got.numel(), want)
-            got_scores = (means[got, kv, :] * q[t, head, :]).sum(dim=1)
-            if not torch.equal(got.sort().values, ref.sort().values):
-                # Only a near-tie may reorder: the worst selected score must be
-                # within ``tol`` of the best excluded candidate.
-                assert want < valid.numel(), (t, head)
-                first_out = scores[order[want]]
-                assert float(got_scores.min()) >= float(first_out) - tol, (t, head)
+            ranks = selected[:, head, t]
+            got = ranks[:want]
+            assert torch.all(ranks[want:] == -1), (t, head, ranks)
+            assert torch.isin(got, valid).all(), (t, head, got, valid)
+            assert got.unique().numel() == want, (t, head, got)
+            changed_ranks += (got != ref).sum().item()
+
+            missing = ref[~torch.isin(ref, got)]
+            if missing.numel():
+                extra = got[~torch.isin(got, ref)]
+                replaced_ids += missing.numel()
+                # Compare the best missed candidate with the worst replacement.
+                best_missed = scores[torch.searchsorted(valid, missing)].max()
+                worst_extra = scores[torch.searchsorted(valid, extra)].min()
+                gap = (best_missed - worst_extra).item()
+                max_gap = max(max_gap, gap)
+                if gap <= tol:
+                    near_ties += 1
+                else:
+                    errors.append((t, head, gap, missing.tolist(), extra.tolist()))
+
+    diagnostics = (
+        f"checks={len(token_indices) * heads}, changed_ranks={changed_ranks}, "
+        f"replaced_ids={replaced_ids}, max_boundary_gap={max_gap:.6g}, "
+        f"near_tie_rows={near_ties}, wrong_rows={len(errors)}"
+    )
+    print(diagnostics)
+    assert not errors, (diagnostics, errors[:3])
 
 
-@pytest.mark.skipif(not torch.npu.is_available(), reason="NPU is required")
-def test_selector_tail_group_matches_cpu_topk():
+def test_selector_tail_group_matches_cpu_topk(npu_device):
     """66048 tokens: the last candidate tile (chunk 512+) must still be ranked."""
-    case = _selector_case(66048, topk=8)
+    case = _selector_case(npu_device, 66048, topk=8)
     seq = 66048
     tokens = [seq + seq - 1, seq + seq - 2, seq - 1, 0, seq + 32, seq + seq - 130]
     _check_against_cpu_topk(case, tokens)
 
 
-@pytest.mark.skipif(not torch.npu.is_available(), reason="NPU is required")
-def test_selector_large_topk_does_not_divide_by_zero():
+def test_selector_large_topk_does_not_divide_by_zero(npu_device):
     """33000 tokens + topk 64: ``tokens_per_park`` was zero before the fix."""
-    case = _selector_case(33000, topk=64)
+    case = _selector_case(npu_device, 33000, topk=64)
     seq = 33000
     _check_against_cpu_topk(case, [seq - 1, seq + seq - 1, 0, seq + 5])
 
 
+@pytest.mark.parametrize("topk, tail_start", [(1, 2048), (2, 2048), (7, 512)])
+def test_selectors_exact_ids(npu_device, topk, tail_start):
+    """Exercise a partially filled gather group and compare both selectors."""
+    chunk_size, heads, dim = 4, 5, 32
+    history = (2, tail_start + 2)
+    short_len, long_len = (count * chunk_size + 1 for count in history)
+    offsets = [0, short_len, short_len + long_len]
+    max_chunks = history[1] + 1
+    block_topk, block_tok, block_chunk = _tile_shape(max_chunks, topk)
+    plan = routing._topk_park_plan(max_chunks, block_chunk, block_topk, block_tok, heads, 2)
+    assert plan["num_groups"] == 2
+    assert plan["total_cand_lanes"] % plan["group_cand"] > 0
+
+    # One-hot queries produce exact BF16 scores. The last head uses two base-64
+    # digits to rank the newest historical chunk first at each causal boundary.
+    query = torch.zeros((heads, dim), dtype=torch.bfloat16)
+    query[:4, :4] = torch.eye(4, dtype=query.dtype)
+    query[4, 4:6] = torch.tensor([64, 1])
+    q = query.expand(offsets[-1], -1, -1).contiguous().to(npu_device)
+    means = torch.zeros((2 * max_chunks, 1, dim), dtype=torch.bfloat16)
+    means[:, :, :6] = 64  # high scores in padding and the final local chunk
+    dense_ids, ends, batch_ends = [], [], []
+    for batch, count in enumerate(history):
+        base = batch * max_chunks
+        means[base:base + count] = 0
+        ids = torch.arange(count)
+        means[base:base + count, 0, 4] = ids // 64
+        means[base:base + count, 0, 5] = ids % 64
+        dense_ids.extend(range(base, base + count))
+        ends.extend(offsets[batch] + (i + 1) * chunk_size for i in range(count))
+        batch_ends.extend([offsets[batch + 1]] * count)
+
+    tail = max_chunks + tail_start
+    # Head 0 has all ties. Head 1 has a unique maximum in the second group.
+    # Head 2 ties for first within that group. Head 3 ties across groups at
+    # the last retained rank for topk=7.
+    means[tail:tail + 2, 0, 1] = torch.tensor([3, 4])
+    means[tail:tail + 2, 0, 2] = 4
+    means[max_chunks:max_chunks + 6, 0, 3] = 3
+    means[max_chunks + 6:max_chunks + 8, 0, 3] = 2
+    means[tail:tail + 2, 0, 3] = 2
+
+    cu = torch.tensor(offsets, device=npu_device, dtype=torch.int32)
+    _, dense_ends, _, _, _ = routing._build_dense_chunk_metadata_triton(
+        cu, long_len, chunk_size
+    )
+    inference = routing._compute_selected_chunks_batched_streaming_triton(
+        q, means.to(npu_device), dense_ends, cu, long_len, max_chunks, topk, chunk_size
+    ).cpu()
+    training = routing._compute_selected_chunks_streaming_triton(
+        q,
+        means[dense_ids].to(npu_device),
+        torch.tensor(ends, device=npu_device, dtype=torch.int32),
+        torch.tensor(batch_ends, device=npu_device, dtype=torch.int32),
+        topk,
+    ).cpu()
+
+    compact_base = 0
+    for batch, count in enumerate(history):
+        start = offsets[batch]
+        dense_base = batch * max_chunks
+        scores = (
+            query.float() @ means[dense_base:dense_base + count, 0].float().T
+        ).tolist()
+        causal_tokens = ends[compact_base:compact_base + count]
+        for selected, base in ((inference, dense_base), (training, compact_base)):
+            # Give every historical candidate an opportunity to win Top-1 on
+            # head 4 at the first token where that candidate is causal.
+            got = selected[0, 4, causal_tokens].tolist()
+            assert got == list(range(base, base + count))
+
+            # Derive legal candidates from the sequence geometry, independent
+            # of device metadata, then compare the full ordered list and padding.
+            sample = {0, chunk_size - 1, chunk_size, count * chunk_size - 1, count * chunk_size}
+            if batch == 1:
+                sample.update({tail_start * chunk_size, (tail_start + 1) * chunk_size})
+            for local_token in sorted(sample):
+                eligible = range(local_token // chunk_size)
+                for head, score in enumerate(scores):
+                    ranked = sorted(eligible, key=lambda i: (-score[i], base + i))[:topk]
+                    expected = [base + i for i in ranked] + [-1] * (topk - len(ranked))
+                    actual = selected[:, head, start + local_token].tolist()
+                    assert actual == expected, (batch, local_token, head, base, actual, expected)
+        compact_base += count
+
+
 def _naive_forward(q, k, v, cu, max_seqlen, chunk, topk):
+    from flag_attn.FLA.moba.naive_moba import moba_attn_varlen_naive
+
     repeats = q.shape[1] // k.shape[1]
     if repeats > 1:
         k = k.repeat_interleave(repeats, dim=1)
@@ -208,24 +297,25 @@ FORWARD_CASES = [
 ]
 
 
-@pytest.mark.skipif(not torch.npu.is_available(), reason="NPU is required")
 @pytest.mark.parametrize(
     ("seq_lens", "heads", "kv_heads", "dim", "chunk", "topk", "dtype"),
     FORWARD_CASES,
 )
-def test_forward_irregular_matches_naive(seq_lens, heads, kv_heads, dim, chunk, topk, dtype):
-    dev_index = _device_index()
-    torch.npu.set_device(dev_index)
-    assert torch.npu.current_device() == dev_index
-    device = f"npu:{dev_index}"
+def test_forward_irregular_matches_naive(
+    npu_device, seq_lens, heads, kv_heads, dim, chunk, topk, dtype
+):
+    from flag_attn import parallel_moba
+    from flag_attn.runtime.backend._ascend.FLA.moba import parallel as ascend_parallel
+
+    assert parallel_moba is ascend_parallel.parallel_moba
 
     torch.manual_seed(7)
     total = sum(seq_lens)
-    q = torch.randn(total, heads, dim, device=device, dtype=dtype)
-    k = torch.randn(total, kv_heads, dim, device=device, dtype=dtype)
-    v = torch.randn(total, kv_heads, dim, device=device, dtype=dtype)
+    q = torch.randn(total, heads, dim, device=npu_device, dtype=dtype)
+    k = torch.randn(total, kv_heads, dim, device=npu_device, dtype=dtype)
+    v = torch.randn(total, kv_heads, dim, device=npu_device, dtype=dtype)
     cu = torch.tensor(
-        [0, *torch.tensor(seq_lens).cumsum(0).tolist()], device=device, dtype=torch.int32
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()], device=npu_device, dtype=torch.int32
     )
     max_seqlen = max(seq_lens)
 
