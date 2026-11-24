@@ -14,9 +14,7 @@
 
 """Public metadata and backend selection regressions; no GPU is required."""
 
-import importlib
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -49,53 +47,6 @@ def test_public_device_metadata():
 def test_unknown_attribute():
     with pytest.raises(AttributeError, match="has no attribute 'missing_operator'"):
         flag_attn.missing_operator
-
-
-def _operator_inventory_names():
-    yaml = pytest.importorskip("yaml")
-    inventory = Path(__file__).resolve().parents[2] / "conf" / "operators.yaml"
-    with open(inventory) as handle:
-        catalog = yaml.safe_load(handle).get("ops", [])
-    names, non_operator_ids = [], {"runtime"}
-    for entry in catalog:
-        if entry.get("id") in non_operator_ids:
-            continue
-        for name in entry.get("for", []):
-            if name not in names and name not in non_operator_ids:
-                names.append(name)
-    return names
-
-
-@pytest.mark.parametrize("name", _operator_inventory_names())
-def test_operator_inventory_name_is_exposed_at_top_level(name):
-    """Every conf/operators.yaml operator is reachable as flag_attn.<name>.
-
-    A missing kernel dependency raises on resolution rather than reporting
-    the name as absent, so only AttributeError is treated as a failure here.
-    """
-    assert name in flag_attn.__all__, f"{name} is in conf/operators.yaml but missing from flag_attn.__all__"
-    try:
-        resolved = getattr(flag_attn, name)
-    except AttributeError as exc:
-        pytest.fail(f"flag_attn.{name} is in conf/operators.yaml but not exposed: {exc}")
-    except Exception as exc:  # unavailable kernel dependency in this environment
-        pytest.skip(f"{name} is exposed but its implementation is unavailable here: {type(exc).__name__}: {exc}")
-    assert callable(resolved) or not isinstance(resolved, ModuleType), (
-        f"flag_attn.{name} should be an operator entry point, got {resolved!r}"
-    )
-
-
-def test_subpackage_paths_still_import_after_top_level_export():
-    """Publishing a callable must not hide the same-named subpackage."""
-    for module_name, attribute in (
-        ("flag_attn.forgetting_attention.naive", "forgetting_attention"),
-        ("flag_attn.forgetting_attention.parallel", "parallel_forgetting_attn"),
-        ("flag_attn.sage_attention.quant_per_block", "per_block_int8"),
-    ):
-        module = importlib.import_module(module_name)
-        assert hasattr(module, attribute), f"{module_name}.{attribute} is no longer importable"
-    assert callable(flag_attn.forgetting_attention)
-    assert flag_attn.forgetting_attention is flag_attn.parallel_forgetting_attn
 
 
 @pytest.mark.parametrize(

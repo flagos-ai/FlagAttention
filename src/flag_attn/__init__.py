@@ -89,37 +89,36 @@ _OPERATOR_EXPORTS = {
         "flag_attn.infllmv2",
         "infllmv2_decode",
     ),
-    # Remaining conf/operators.yaml names. Every operator listed there is
-    # reachable as flag_attn.<name>; these are the ones whose entry point is
-    # not already published above under its own name. The Hy3 names resolve
-    # through the hpc_ops_attention facade so they keep the stage/variant
-    # vendor-override behavior of hy3_attention.
+    # Remaining conf/operators.yaml names, pointing at the implementation
+    # that defines each one.
     "attention_with_kvcache_blocksparse_prefill_fp8": (
-        "flag_attn.hpc_ops_attention",
+        "flag_attn.hpc_ops_attention.prefill.attention_blocksparse_prefill_fp8",
         "attention_with_kvcache_blocksparse_prefill_fp8",
     ),
     "attention_decode_bf16_static": (
-        "flag_attn.hpc_ops_attention",
+        "flag_attn.hpc_ops_attention.decode.static.bf16_static",
         "attention_decode_bf16_static",
     ),
     "attention_decode_bf16_dynamic": (
-        "flag_attn.hpc_ops_attention",
+        "flag_attn.hpc_ops_attention.decode.dynamic.bf16_dynamic",
         "attention_decode_bf16_dynamic",
     ),
-    # Four implementation modules define attention_decode_fp8; the facade
-    # requires an explicit variant to pick one.
-    "attention_decode_fp8": ("flag_attn.hpc_ops_attention", "attention_decode_fp8"),
+    # Four modules define attention_decode_fp8; this publishes the per-token
+    # Q/K, per-head V static variant. Use hy3_attention(stage="decode",
+    # variant=...) to select another.
+    "attention_decode_fp8": (
+        "flag_attn.hpc_ops_attention.decode.static.fp8_qkpertoken_perhead_vperhead_static",
+        "attention_decode_fp8",
+    ),
     "chunk_kda_fwd_infer": ("flag_attn.FLA.chunk_kda", "chunk_kda_fwd_infer"),
     "parallax_decode": ("flag_attn.FLA.parallax.decode", "parallax_decode"),
     "parallax_attn_with_kvcache": (
         "flag_attn.FLA.parallax.decode",
         "parallax_attn_with_kvcache",
     ),
-    # forgetting_attention is also the name of a subpackage. Publishing the
-    # callable keeps flag_attn.forgetting_attention(...) working, while
-    # import flag_attn.forgetting_attention.naive and
-    # from flag_attn.forgetting_attention import ... resolve through
-    # sys.modules and are unaffected.
+    # forgetting_attention is also a subpackage name. Publishing the callable
+    # keeps flag_attn.forgetting_attention(...) working; the submodule paths
+    # resolve through sys.modules and are unaffected.
     "forgetting_attention": (
         "flag_attn.forgetting_attention.parallel",
         "forgetting_attention",
@@ -152,20 +151,7 @@ for _package_name in ("sage_attention", "parallel_nsa", "diffkv_attention", "for
     globals().pop(_package_name, None)
 
 
-_STAGE_FACADES = {
-    "minimax_m3_sparse_attn",
-    "infllmv2_attention",
-    "parallel_parallax",
-    "hy3_attention",
-    "parallel_nsa",
-    # Hy3 stage/variant shorthands. Each one calls hy3_attention, which
-    # resolves the vendor override for the stage it selects, so resolving
-    # these names through the registry again would be redundant.
-    "attention_with_kvcache_blocksparse_prefill_fp8",
-    "attention_decode_bf16_static",
-    "attention_decode_bf16_dynamic",
-    "attention_decode_fp8",
-}
+_STAGE_FACADES = {"minimax_m3_sparse_attn", "infllmv2_attention", "parallel_parallax", "hy3_attention", "parallel_nsa"}
 
 # Published names whose vendor override is registered under a different
 # operator name.
