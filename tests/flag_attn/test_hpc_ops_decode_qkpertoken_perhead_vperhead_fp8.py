@@ -33,6 +33,11 @@ SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from flag_attn.testing import backend as test_backend
+from flag_attn import runtime
+
+if runtime.device.vendor_name == "ascend":
+    pytest.skip("HY3 FP8 attention is not supported on Ascend", allow_module_level=True)
+
 from flag_attn.hpc_ops_attention.decode import HAS_TLE  # noqa: E402
 from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_dynamic as fp8_dynamic,
@@ -40,7 +45,7 @@ from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
 from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_static as fp8_static,
 )
-from flag_attn import hy3_attention
+from flag_attn import hy3_attention, hy3_attention_prepare
 
 
 BLOCK_SIZE = fp8_static.BLOCK_SIZE
@@ -437,7 +442,7 @@ def test_attn_fp8_sm90(
     schedule = "dynamic" if use_dynamic_sched else "static"
     implementation = _implementation(schedule)
     inputs = _inputs(panel, implementation)
-    workspace = implementation.prepare_decode_workspace(inputs)
+    workspace = hy3_attention_prepare(inputs, variant=f"fp8_qk_{schedule}")
     actual = hy3_attention(inputs, workspace, stage="decode", variant=f"fp8_qk_{schedule}").detach().clone()
     expected = _pytorch_reference(panel, num_seq_q, QUANT_TYPE)
     test_backend.device_fn.synchronize()
