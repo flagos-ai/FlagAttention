@@ -69,12 +69,12 @@ FlagAttention 是一个使用 [Triton](https://github.com/triton-lang/triton) �
 
 | 算子族 | 公开导入入口 | 主要布局/用途 | 梯度支持 | 阶段 |
 | --- | --- | --- | --- | --- |
-| SageAttention | `flag_attn.sage_attention`、`from flag_attn.sage_attention import per_block_int8` | Q/K 分块 INT8 量化及 attention；支持 HND/NHD | 前向 | Alpha |
+| SageAttention | `flag_attn.sage_attention`、`from flag_attn.sageattention import per_block_int8` | Q/K 分块 INT8 量化及 attention；支持 HND/NHD | 前向 | Alpha |
 | DiffKV Attention | `flag_attn.diffkv_attention` | K/V head dimension 不对称的 paged decode；Triton 与 TLE 路径 | 推理 | Alpha |
 | Forgetting Attention | `flag_attn.parallel_forgetting_attn` | 带逐 token 对数遗忘门的注意力；SM90 走 TLE，其余回落 Triton | 前向 + 反向 | Alpha |
 | Fused AttnRes | `flag_attn.fused_attnres` | 对 RMS 归一化后的残差源做 softmax 混合，可选融合输出 RMSNorm | 推理 | Alpha |
 
-上述算子均由顶层包导出：[`conf/operators.yaml`](./conf/operators.yaml) 中列出的每个算子名都可以通过 `flag_attn.<name>` 访问。SageAttention 和 Parallel NSA 除子模块入口外，也可直接作为 `flag_attn.sage_attention`、`flag_attn.parallel_nsa` 调用。次要入口仍保留在各自子模块上，例如 `flag_attn.sage_attention.per_block_int8` 需通过 `from flag_attn.sage_attention import per_block_int8` 导入。`flag_attn.runtime.backend._<vendor>` 下还存在厂商开发接口，但这些路径不视为稳定公开 API。
+[`conf/operators.yaml`](./conf/operators.yaml) 中列出的算子均可通过 `flag_attn.<name>` 访问。SageAttention、Native Sparse Attention、DiffKV 和 Forgetting Attention 的实现分别位于 `flag_attn.sageattention`、`flag_attn.nsa`、`flag_attn.diffkv` 和 `flag_attn.forgetting`。`flag_attn.runtime.backend._<vendor>` 下还存在厂商开发接口，但这些路径不视为稳定公开 API。
 
 ## 依赖与后端
 
@@ -274,8 +274,8 @@ Decode: minimax_m3_index_decode（score + top-k）
 
 ```python
 import torch
-from flag_attn.sage_attention import forward as sage_attention
-from flag_attn.sage_attention import per_block_int8
+from flag_attn import sage_attention
+from flag_attn.sageattention import per_block_int8
 
 B, H, N, D = 1, 2, 128, 64
 q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
@@ -292,7 +292,7 @@ out, lse = sage_attention(
 
 支持 `HND`（`[B,H,N,D]`）和 `NHD`（`[B,N,H,D]`）布局。默认 Q 以 128 token 为一块量化，K 以 64 token 为一块量化；前向 kernel 支持 bool mask 和 additive mask。
 
-`forward` 始终返回 `(out, lse)`；当 `return_lse=False` 时，`lse` 是一个空的 CPU tensor。公开的 `flag_attn.sage_attention` 子模块会在可用 NPU 上自动选择 Ascend 实现；其他厂商的 SageAttention 特化实现需要使用其后端开发模块。
+`sage_attention` 始终返回 `(out, lse)`。当 `return_lse=False` 时，`lse` 是一个空的 CPU tensor。`flag_attn.sage_attention` 根据检测到的后端选择已注册的实现，例如在可用 NPU 上选择 Ascend 实现。
 
 ## 递归、线性与其余算子 API
 
@@ -300,7 +300,7 @@ out, lse = sage_attention(
 
 GLA、GDN2 和 KDA 使用 sequence-first `[B,T,H,D]`。Gated Delta Rule 默认 `head_first=True`，布局为 `[B,H,T,D]`，同时也接受 sequence-first 输入。大多数递归接口返回 `(output, final_state)`，并通过 `cu_seqlens` 支持 packed varlen。
 
-- [`chunk_gla`](./src/flag_attn/FLA/gated_linear_attention/chunk_gla.py) 实现带 autograd 的分块 gated linear attention，支持初始/最终递归状态。
+- [`chunk_gla`](./src/flag_attn/FLA/gated_linear_attention/chunk.py) 实现带 autograd 的分块 gated linear attention，支持初始/最终递归状态。
 - [`chunk_gated_delta_rule`](./src/flag_attn/FLA/gated_delta_rule/api.py) 是纯前向 delta-rule 实现；`head_first=True` 时布局为 `[B,H,T,D]`，当前 `BT` 固定为 64。
 - [`chunk_gdn2`](./src/flag_attn/gdn2/chunk.py) 在原生 Triton、TLE 和厂商特化的 GDN2 前向路径之间派发。
 - [`chunk_kda`](./src/flag_attn/FLA/chunk_kda.py) 是推理 API。通用 CUDA 路径需要提供 TLE 的 Triton build，并且会拒绝开启梯度的调用、非 BF16 或非连续输入、`K != 128`、`V != 128` 以及 GVA。chunk size 默认为 16；厂商实现的约束可能不同。
@@ -310,7 +310,7 @@ GLA、GDN2 和 KDA 使用 sequence-first `[B,T,H,D]`。Gated Delta Rule 默认 `
 
 ### Native Sparse Attention
 
-[`parallel_nsa`](./src/flag_attn/parallel_nsa) 包含 Native Sparse Attention 选择及压缩算子，支持定长和 packed varlen，通过 `mode=` 选择。`parallel_nsa` 必须提供预计算的 `block_indices` 或 `g_cmp`，且 `Hq/Hkv` 必须是至少 16 的 2 的幂；组合 sliding-window 时还需要 `g_swa` 和外部 `flash-attn` 包。对于定长输入，Compression API 接收全长 Q，以及时间维为 `ceil(T / block_size)` 的 K/V，返回 `(output, lse)`；packed 输入会依次存放各序列的压缩块。
+[`parallel_nsa`](./src/flag_attn/nsa) 包含 Native Sparse Attention 选择及压缩算子，支持定长和 packed varlen，通过 `mode=` 选择。`parallel_nsa` 必须提供预计算的 `block_indices` 或 `g_cmp`，且 `Hq/Hkv` 必须是至少 16 的 2 的幂；组合 sliding-window 时还需要 `g_swa` 和外部 `flash-attn` 包。对于定长输入，Compression API 接收全长 Q，以及时间维为 `ceil(T / block_size)` 的 K/V，返回 `(output, lse)`；packed 输入会依次存放各序列的压缩块。
 
 ### 其他稀疏与融合算子
 
@@ -318,8 +318,8 @@ GLA、GDN2 和 KDA 使用 sequence-first `[B,T,H,D]`。Gated Delta Rule 默认 `
 - [`parallel_moba`](./src/flag_attn/FLA/moba/parallel.py) 是面向 packed `[seqlen, heads, head_dim]` 张量的因果变长 MoBA，接收 `cu_seqlens`、`max_seqlen`、`moba_chunk_size` 和 `moba_topk`。`moba_topk` 包含当前因果 chunk，与 FlashMoBA 一致。支持 MHA/GQA/MQA、最大 256 的 head dimension 以及最大 64 的 top-k。推理路径有意跳过对依赖具体数值的元数据的 host 侧校验，autograd 路径仍保留该校验。
 - [`hy3_attention`](./src/flag_attn/hpc_ops_attention) 提供 FP8 paged 块稀疏 prefill（`stage="prefill"`）以及由 `variant=` 选择的六种 decode 实现：`bf16_static`、`bf16_dynamic`、`fp8_qk_static`、`fp8_qk_dynamic`、`fp8_kv_static`、`fp8_kv_dynamic`。其中 `qk` 表示逐 token 量化 Q/K 并逐 head 量化 V，`kv` 表示逐 token 量化 Q 并逐 tensor 量化 K/V；`static` 与 `dynamic` 选择调度策略。Decode 会原样转发 `(inputs, workspace)`，因此需要先用对应实现模块准备 workspace。该算子族要求 PyTorch 2.7.0。
 - [`inkling_fa4_rel_attention`](./src/flag_attn/inkling_fa4) 是仅用于推理的 paged varlen 注意力，并叠加相对位置 logits，参数与同名 vLLM 算子一致。Cache 使用 `[num_blocks, block_size, num_kv_heads, head_dim]` 布局。`backend=` 接受 `"auto"`（默认）、`"triton"` 或 `"tle"`，环境变量 `INKLING_FA4_BACKEND` 可做同样选择；auto 优先使用 TLE，当 TLE 不可用或布局不支持时回落到 Triton。
-- [`diffkv_attention`](./src/flag_attn/diffkv_attention/api.py) 是 K/V head dimension 不对称的 paged decode：`query: [B,Hq,Dqk]`、`key_cache: [NB,BS,Hkv,Dqk]`、`value_cache: [NB,BS,Hkv,Dv]`，返回 `[B,Hq,Dv]`。`window_size=-1` 表示完整上下文；`path` 选择 `"2d"` 或 `"3d"` launch，`num_segments` 控制 3D 路径的 split-KV；`backend` 接受 `"auto"`、`"tle"` 或 `"triton"`。
-- [`parallel_forgetting_attn`](./src/flag_attn/forgetting_attention/parallel.py) 通过 `log_fgate` 引入逐 token 的对数遗忘门，另有 `head_first=`、`seq_start=`、`sm_scale=` 和 `adaptive_threshold=`。在 SM90 且 TLE 兼容时使用 TLE kernel，否则由普通 Triton kernel 处理 16、32、60、64、100、128 这些 head dimension，通过零填充实现且不改变 attention 缩放与剪枝行为。
+- [`diffkv_attention`](./src/flag_attn/diffkv/api.py) 是 K/V head dimension 不对称的 paged decode：`query: [B,Hq,Dqk]`、`key_cache: [NB,BS,Hkv,Dqk]`、`value_cache: [NB,BS,Hkv,Dv]`，返回 `[B,Hq,Dv]`。`window_size=-1` 表示完整上下文；`path` 选择 `"2d"` 或 `"3d"` launch，`num_segments` 控制 3D 路径的 split-KV；`backend` 接受 `"auto"`、`"tle"` 或 `"triton"`。
+- [`parallel_forgetting_attn`](./src/flag_attn/forgetting/parallel.py) 通过 `log_fgate` 引入逐 token 的对数遗忘门，另有 `head_first=`、`seq_start=`、`sm_scale=` 和 `adaptive_threshold=`。在 SM90 且 TLE 兼容时使用 TLE kernel，否则由普通 Triton kernel 处理 16、32、60、64、100、128 这些 head dimension，通过零填充实现且不改变 attention 缩放与剪枝行为。
 - [`fused_attnres`](./src/flag_attn/FLA/attnres/fused.py) 聚合多个残差源：每个源先做 RMS 归一化用于与 `query` 打分，再由源维度上的 softmax 混合原始残差，`output_rms_weight` 可选地融合下一子层所需的 RMSNorm。该算子仅用于推理、不提供 autograd 公式，针对 Kimi K3 形状优化，支持最多 16 个源和最大 8192 的 hidden size。
 
 这些 alpha API 针对特定模型布局进行了优化。集成前请阅读对应 docstring 和测试，其参数与后端约束仍可能变化。

@@ -41,9 +41,9 @@ if str(ROOT / "src") not in sys.path:
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import diffkv_attention
-from flag_attn.diffkv_attention.api import OP_NAME, unified_attention_diffkv
+from flag_attn.diffkv.api import OP_NAME, unified_attention_diffkv
 
-diffkv_impl = importlib.import_module("flag_attn.diffkv_attention.diffkv")
+diffkv_impl = importlib.import_module("flag_attn.diffkv.diffkv")
 
 
 CUDA_REQUIRED = pytest.mark.skipif(
@@ -399,7 +399,7 @@ def test_public_api_rejects_invalid_paged_cache_inputs():
 
 
 def test_unified_diffkv_is_exported_from_operator_package():
-    package = importlib.import_module("flag_attn.diffkv_attention")
+    package = importlib.import_module("flag_attn.diffkv")
 
     assert "unified_attention_diffkv" in package.__all__
     assert callable(package.unified_attention_diffkv)

@@ -13,8 +13,6 @@
 # limitations under the License.
 
 from importlib import import_module
-from sys import modules as _modules
-from types import ModuleType as _ModuleType
 
 from flag_attn import runtime
 from flag_attn import testing  # noqa: F401
@@ -37,13 +35,13 @@ _OPERATOR_EXPORTS = {
     "chunk_gated_delta_rule_fwd": ("FLA.gated_delta_rule.chunk",),
     "fused_recurrent_gated_delta_rule_packed_decode": ("FLA.gated_delta_rule.packed_decode",),
     "fused_recurrent_gated_delta_rule_fwd": ("FLA.gated_delta_rule.fused_recurrent",),
-    "sage_attention": ("sage_attention.attn_qk_int8_per_block", "forward"),
-    "parallel_nsa": ("parallel_nsa", "parallel_nsa", None),
-    "parallel_nsa_compression": ("parallel_nsa.parallel_nsa_compression",),
+    "sage_attention": ("sageattention.attn_qk_int8_per_block", "forward"),
+    "parallel_nsa": ("nsa", "parallel_nsa", None),
+    "parallel_nsa_compression": ("nsa.compression",),
     "parallel_moba": ("FLA.moba.parallel",),
-    "parallel_forgetting_attn": ("forgetting_attention.parallel",),
+    "parallel_forgetting_attn": ("forgetting.parallel",),
     "log_linear_attn": ("FLA.log_linear_attn.chunk_tle",),
-    "diffkv_attention": ("diffkv_attention.api",),
+    "diffkv_attention": ("diffkv.api",),
     "hy3_attention": ("hpc_ops_attention", "hy3_attention", None),
     "hy3_attention_prepare": ("hpc_ops_attention", "hy3_attention_prepare", None),
     "parallel_parallax": ("FLA.parallax", "parallel_parallax", None),
@@ -55,7 +53,7 @@ _OPERATOR_EXPORTS = {
     "paged_attention": ("paged", "attention"),
     "chunk_log_linear_attn": ("FLA.log_linear_attn",),
     "chunk_gated_delta_rule": ("FLA.gated_delta_rule",),
-    "chunk_gla": ("FLA.gated_linear_attention.chunk_gla",),
+    "chunk_gla": ("FLA.gated_linear_attention.chunk",),
     "chunk_gdn2": ("gdn2.chunk",),
     "chunk_kda": ("FLA.chunk_kda", "chunk_kda_fwd_infer", "chunk_kda_fwd_infer"),
     "InfLLMV2Config": ("infllmv2",),
@@ -89,7 +87,7 @@ _OPERATOR_EXPORTS = {
         "hy3_attention_decode_fp8_qk_static",
     ),
     "chunk_kda_fwd_infer": ("FLA.chunk_kda",),
-    "forgetting_attention": ("forgetting_attention.parallel", "forgetting_attention", "parallel_forgetting_attn"),
+    "forgetting_attention": ("forgetting.parallel", "forgetting_attention", "parallel_forgetting_attn"),
     "parallax_decode": ("FLA.parallax.decode",),
     "parallax_attn_with_kvcache": ("FLA.parallax.decode",),
 }
@@ -111,24 +109,6 @@ def __getattr__(name: str):
         value = runtime.backend.resolve_operator(operator, module, attribute)
     globals()[name] = value
     return value
-
-
-class _FlagAttentionModule(_ModuleType):
-    def __setattr__(self, name, value):
-        # A same-named submodule stays importable by its fully qualified name.
-        if (
-            name in _OPERATOR_EXPORTS
-            and isinstance(value, _ModuleType)
-            and value.__name__ == f"{self.__name__}.{name}"
-        ):
-            return
-        super().__setattr__(name, value)
-
-
-_modules[__name__].__class__ = _FlagAttentionModule
-
-# Cache the lightweight NSA wrapper before its nested implementation can shadow it.
-__getattr__("parallel_nsa")
 
 
 __all__ = [*_OPERATOR_EXPORTS, "device", "vendor", "vendor_name", "backend_info"]

@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .chunk_gdn2 import chunk_gdn2
+from .chunk import chunk_gdn2
 
 __all__ = ["chunk_gdn2"]

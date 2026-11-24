@@ -53,12 +53,12 @@ Twenty-six inventory entries are registered in [`conf/operators.yaml`](./conf/op
 
 | Operator family | Public import | Main layout/use | Gradient support | Stage |
 | --- | --- | --- | --- | --- |
-| SageAttention | `flag_attn.sage_attention`, `from flag_attn.sage_attention import per_block_int8` | Per-block INT8 Q/K quantization and attention; HND or NHD layout | Forward | Alpha |
+| SageAttention | `flag_attn.sage_attention`, `from flag_attn.sageattention import per_block_int8` | Per-block INT8 Q/K quantization and attention; HND or NHD layout | Forward | Alpha |
 | DiffKV attention | `flag_attn.diffkv_attention` | Paged decode with asymmetric K/V head dimensions; Triton and TLE paths | Inference | Alpha |
 | Forgetting Attention | `flag_attn.parallel_forgetting_attn` | Attention with per-token log forget gates; SM90 TLE path with Triton fallback | Forward + backward | Alpha |
 | Fused AttnRes | `flag_attn.fused_attnres` | Softmax mixing of RMS-normalized residual sources, with optional fused output RMSNorm | Inference | Alpha |
 
-The top-level package exports every operator above: each operator name listed in [`conf/operators.yaml`](./conf/operators.yaml) is reachable as `flag_attn.<name>`. SageAttention and Parallel NSA are also callable directly as `flag_attn.sage_attention` and `flag_attn.parallel_nsa`, in addition to their submodule APIs. Secondary entry points stay on their submodules, for example `flag_attn.sage_attention.per_block_int8` is imported as `from flag_attn.sage_attention import per_block_int8`. Vendor-specific development interfaces are available under `flag_attn.runtime.backend._<vendor>` but are not treated as stable public APIs.
+Every operator named in [`conf/operators.yaml`](./conf/operators.yaml) is available as `flag_attn.<name>`. The implementation packages for SageAttention, Native Sparse Attention, DiffKV, and Forgetting Attention are `flag_attn.sageattention`, `flag_attn.nsa`, `flag_attn.diffkv`, and `flag_attn.forgetting`. Vendor-specific development interfaces are available under `flag_attn.runtime.backend._<vendor>` but are not treated as stable public APIs.
 
 ## Requirements and backends
 
@@ -258,8 +258,8 @@ The sparse attention kernels support GQA and BF16 KV caches, with FP8 cache scal
 
 ```python
 import torch
-from flag_attn.sage_attention import forward as sage_attention
-from flag_attn.sage_attention import per_block_int8
+from flag_attn import sage_attention
+from flag_attn.sageattention import per_block_int8
 
 B, H, N, D = 1, 2, 128, 64
 q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
@@ -276,7 +276,7 @@ out, lse = sage_attention(
 
 Both `HND` (`[B,H,N,D]`) and `NHD` (`[B,N,H,D]`) layouts are supported. Q is quantized in 128-token blocks and K in 64-token blocks by default. The forward kernel accepts boolean or additive attention masks.
 
-`forward` always returns `(out, lse)`; when `return_lse=False`, `lse` is an empty CPU tensor. The public `flag_attn.sage_attention` submodule automatically selects the Ascend implementation on an available NPU; other vendor-specific SageAttention implementations use their backend development modules.
+`sage_attention` always returns `(out, lse)`. When `return_lse=False`, `lse` is an empty CPU tensor. `flag_attn.sage_attention` selects the implementation registered for the detected backend, including the Ascend implementation on an available NPU.
 
 ## Recurrent, linear, and remaining operator APIs
 
@@ -284,7 +284,7 @@ Both `HND` (`[B,H,N,D]`) and `NHD` (`[B,N,H,D]`) layouts are supported. Q is qua
 
 GLA, GDN2, and KDA use sequence-first `[B,T,H,D]`. Gated Delta Rule defaults to head-first `[B,H,T,D]` with `head_first=True`, and also accepts sequence-first input. Most recurrent APIs return `(output, final_state)` and support packed variable-length sequences through `cu_seqlens`.
 
-- [`chunk_gla`](./src/flag_attn/FLA/gated_linear_attention/chunk_gla.py) implements chunked gated linear attention with autograd and optional initial/final recurrent states.
+- [`chunk_gla`](./src/flag_attn/FLA/gated_linear_attention/chunk.py) implements chunked gated linear attention with autograd and optional initial/final recurrent states.
 - [`chunk_gated_delta_rule`](./src/flag_attn/FLA/gated_delta_rule/api.py) provides a forward-only delta-rule implementation. `head_first=True` uses `[B,H,T,D]`; `BT` is currently fixed at 64.
 - [`chunk_gdn2`](./src/flag_attn/gdn2/chunk.py) dispatches between native Triton, TLE, and vendor-specific GDN2 forward paths.
 - [`chunk_kda`](./src/flag_attn/FLA/chunk_kda.py) is an inference API. The generic CUDA path needs a Triton build providing TLE, and rejects grad-enabled calls, non-BF16 or non-contiguous inputs, `K != 128`, `V != 128`, and GVA. Chunk size defaults to 16; vendor implementations may differ.
@@ -294,7 +294,7 @@ GLA, GDN2, and KDA use sequence-first `[B,T,H,D]`. Gated Delta Rule defaults to 
 
 ### Native Sparse Attention
 
-[`parallel_nsa`](./src/flag_attn/parallel_nsa) contains Native Sparse Attention selection and compression operators with fixed-length and packed-variable-length support, selected through `mode=`. `parallel_nsa` needs either precomputed `block_indices` or `g_cmp`, and `Hq/Hkv` must be a power of two and at least 16. Sliding-window composition additionally needs `g_swa` and the external `flash-attn` package. For fixed-length input, the compression API consumes full-length Q and K/V with time dimension `ceil(T / block_size)`, then returns `(output, lse)`; packed input stores the per-sequence compressed blocks consecutively.
+[`parallel_nsa`](./src/flag_attn/nsa) contains Native Sparse Attention selection and compression operators with fixed-length and packed-variable-length support, selected through `mode=`. `parallel_nsa` needs either precomputed `block_indices` or `g_cmp`, and `Hq/Hkv` must be a power of two and at least 16. Sliding-window composition additionally needs `g_swa` and the external `flash-attn` package. For fixed-length input, the compression API consumes full-length Q and K/V with time dimension `ceil(T / block_size)`, then returns `(output, lse)`; packed input stores the per-sequence compressed blocks consecutively.
 
 ### Other sparse and fused operators
 
@@ -302,8 +302,8 @@ GLA, GDN2, and KDA use sequence-first `[B,T,H,D]`. Gated Delta Rule defaults to 
 - [`parallel_moba`](./src/flag_attn/FLA/moba/parallel.py) is causal variable-length MoBA over packed `[seqlen, heads, head_dim]` tensors, taking `cu_seqlens`, `max_seqlen`, `moba_chunk_size`, and `moba_topk`. `moba_topk` counts the current causal chunk, matching FlashMoBA. It supports MHA/GQA/MQA, head dimensions up to 256, and top-k up to 64. The inference path deliberately skips host-side validation of value-dependent metadata; the autograd path retains it.
 - [`hy3_attention`](./src/flag_attn/hpc_ops_attention) exposes FP8 paged block-sparse prefill (`stage="prefill"`) and six decode implementations selected by `variant=`: `bf16_static`, `bf16_dynamic`, `fp8_qk_static`, `fp8_qk_dynamic`, `fp8_kv_static`, `fp8_kv_dynamic`. Here `qk` means per-token Q/K with per-head V quantization, and `kv` means per-token Q with per-tensor K/V quantization; `static` and `dynamic` select the scheduling policy. Decode forwards `(inputs, workspace)` unchanged, so prepare the workspace with the matching implementation module first. This family requires PyTorch 2.7.0.
 - [`inkling_fa4_rel_attention`](./src/flag_attn/inkling_fa4) is inference-only paged varlen attention that adds relative-position logits, with arguments mirroring the vLLM operator of the same name. Caches use `[num_blocks, block_size, num_kv_heads, head_dim]`. `backend=` accepts `"auto"` (default), `"triton"`, or `"tle"`, and `INKLING_FA4_BACKEND` sets the same choice; auto prefers TLE and falls back to Triton when TLE is unavailable or the layout is unsupported.
-- [`diffkv_attention`](./src/flag_attn/diffkv_attention/api.py) is paged decode with asymmetric K/V head dimensions: `query: [B,Hq,Dqk]`, `key_cache: [NB,BS,Hkv,Dqk]`, `value_cache: [NB,BS,Hkv,Dv]`, returning `[B,Hq,Dv]`. `window_size=-1` means full context; `path` selects the `"2d"` or `"3d"` launch, with `num_segments` controlling split-KV on the 3D path; `backend` accepts `"auto"`, `"tle"`, or `"triton"`.
-- [`parallel_forgetting_attn`](./src/flag_attn/forgetting_attention/parallel.py) adds per-token log forget gates through `log_fgate`, with `head_first=`, `seq_start=`, `sm_scale=`, and `adaptive_threshold=`. On SM90 with compatible TLE it uses the TLE kernel; otherwise the ordinary Triton kernel handles head dimensions 16, 32, 60, 64, 100, and 128 by zero-padding without changing attention scaling or pruning.
+- [`diffkv_attention`](./src/flag_attn/diffkv/api.py) is paged decode with asymmetric K/V head dimensions: `query: [B,Hq,Dqk]`, `key_cache: [NB,BS,Hkv,Dqk]`, `value_cache: [NB,BS,Hkv,Dv]`, returning `[B,Hq,Dv]`. `window_size=-1` means full context; `path` selects the `"2d"` or `"3d"` launch, with `num_segments` controlling split-KV on the 3D path; `backend` accepts `"auto"`, `"tle"`, or `"triton"`.
+- [`parallel_forgetting_attn`](./src/flag_attn/forgetting/parallel.py) adds per-token log forget gates through `log_fgate`, with `head_first=`, `seq_start=`, `sm_scale=`, and `adaptive_threshold=`. On SM90 with compatible TLE it uses the TLE kernel; otherwise the ordinary Triton kernel handles head dimensions 16, 32, 60, 64, 100, and 128 by zero-padding without changing attention scaling or pruning.
 - [`fused_attnres`](./src/flag_attn/FLA/attnres/fused.py) aggregates residual sources: each source is RMS-normalized for scoring against `query`, then a softmax over the source axis mixes the original residuals, with `output_rms_weight` optionally fusing the next sublayer's RMSNorm. It is inference-only with no autograd formula, tuned for Kimi K3 shapes, and supports up to 16 sources and hidden sizes up to 8192.
 
 These alpha APIs are optimized for specific model layouts. Read their docstrings and tests before integrating them; arguments and backend constraints may change.

@@ -25,7 +25,7 @@ from triton.runtime.jit import JITFunction
 from ...compat import autotune_cache_kwargs
 from flag_attn.runtime import get_tuned_config
 
-_shared = importlib.import_module("flag_attn.runtime.backend._metax.FLA.gla.chunk_gla")
+_shared = importlib.import_module("flag_attn.runtime.backend._metax.FLA.gla.chunk")
 HAS_TLE = _shared.HAS_TLE
 prepare_chunk_indices = _shared.prepare_chunk_indices
 chunk_gla_fwd_kernel_o = _shared.chunk_gla_fwd_kernel_o

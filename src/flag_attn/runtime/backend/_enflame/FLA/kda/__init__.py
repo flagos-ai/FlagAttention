@@ -14,6 +14,6 @@
 
 """Enflame S60 Kimi Delta Attention implemented with Triton/TLE."""
 
-from .chunk_kda import chunk_kda
+from .chunk import chunk_kda
 
 __all__ = ["chunk_kda"]
