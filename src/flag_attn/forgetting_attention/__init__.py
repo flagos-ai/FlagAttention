@@ -1,14 +1,13 @@
 """Public Forgetting Attention exports."""
-from importlib import import_module
+import importlib
+
+from .parallel import forgetting_attention, parallel_forgetting_attn
 
 
-def __getattr__(name: str):
-    if name not in __all__:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    if name == "naive_forgetting_attention":
-        value = import_module(".naive", __name__).forgetting_attention
-    else:
-        value = getattr(import_module(".parallel", __name__), name)
+def __getattr__(name):
+    if name != "naive_forgetting_attention":
+        raise AttributeError(name)
+    value = importlib.import_module(".naive", __name__).forgetting_attention
     globals()[name] = value
     return value
 

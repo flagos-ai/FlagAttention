@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from importlib import import_module
+from sys import modules as _modules
+from types import ModuleType as _ModuleType
 
 from flag_attn import runtime
 from flag_attn import testing  # noqa: F401
@@ -111,14 +113,22 @@ def __getattr__(name: str):
     return value
 
 
-# Reserve public names before Python binds their same-named subpackages.
-for _name, (_module, *_) in _OPERATOR_EXPORTS.items():
-    if _module.partition(".")[0] == _name:
-        import_module(f".{_name}", __name__)
-        globals().pop(_name, None)
-        # Cache the package-level wrapper before a nested import can shadow it.
-        if _module == _name:
-            __getattr__(_name)
+class _FlagAttentionModule(_ModuleType):
+    def __setattr__(self, name, value):
+        # A same-named submodule stays importable by its fully qualified name.
+        if (
+            name in _OPERATOR_EXPORTS
+            and isinstance(value, _ModuleType)
+            and value.__name__ == f"{self.__name__}.{name}"
+        ):
+            return
+        super().__setattr__(name, value)
+
+
+_modules[__name__].__class__ = _FlagAttentionModule
+
+# Cache the lightweight NSA wrapper before its nested implementation can shadow it.
+__getattr__("parallel_nsa")
 
 
 __all__ = [*_OPERATOR_EXPORTS, "device", "vendor", "vendor_name", "backend_info"]
