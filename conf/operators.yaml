@@ -85,6 +85,7 @@ ops:
       - benchmark/test_hpc_ops_prefill_fp8_perf.py
       - benchmark/test_hpc_ops_decode_bf16_perf.py
       - benchmark/test_hpc_ops_decode_fp8_perf.py
+      - benchmark/test_hpc_ops_decode_hygon_perf.py
   - id: chunk_gated_delta_rule
     description: Run the forward path for chunked gated delta rule attention.
     for:
