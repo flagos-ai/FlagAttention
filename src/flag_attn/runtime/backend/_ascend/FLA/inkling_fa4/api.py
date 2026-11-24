@@ -11,7 +11,7 @@ use the same shifted positions.
 import torch
 import triton
 
-from .kernels import _combine_splits_kernel, _rel_attn_paged_kernel
+from .paged_relative_attention import _combine_splits_kernel, _rel_attn_paged_kernel
 
 # Short queries use fewer rows and wider KV tiles; longer queries use 64x64
 # tiles to keep the fp32 scores and working state within the Ascend UB.
