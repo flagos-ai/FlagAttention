@@ -4,6 +4,6 @@
 
 """MThreads Kimi Delta Attention implementation."""
 
-from .chunk_kda import chunk_kda
+from .chunk import chunk_kda
 
 __all__ = ["chunk_kda"]

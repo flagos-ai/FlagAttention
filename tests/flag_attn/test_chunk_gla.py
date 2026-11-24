@@ -905,7 +905,7 @@ def _compat_prepare_chunk_indices_kwarg():
         return
     import sys
 
-    mod = sys.modules["flag_attn.FLA.gated_linear_attention.chunk_gla"]
+    mod = sys.modules["flag_attn.FLA.gated_linear_attention.chunk"]
     old = mod.prepare_chunk_indices
 
     def _wrapped(cu_seqlens, chunk_size, cu_seqlens_cpu=None):

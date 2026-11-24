@@ -5,14 +5,14 @@
 import torch
 import triton
 
-from flag_attn.parallel_nsa.index import (
+from flag_attn.nsa.index import (
     prepare_chunk_indices as _generic_prepare_chunk_indices,
 )
-from flag_attn.parallel_nsa.index import (
+from flag_attn.nsa.index import (
     prepare_chunk_offsets as _generic_prepare_chunk_offsets,
 )
-from flag_attn.parallel_nsa.index import prepare_lens as _generic_prepare_lens
-from flag_attn.parallel_nsa.index import (
+from flag_attn.nsa.index import prepare_lens as _generic_prepare_lens
+from flag_attn.nsa.index import (
     prepare_token_indices as _generic_prepare_token_indices,
 )
 

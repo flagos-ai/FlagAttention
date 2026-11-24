@@ -42,7 +42,7 @@ else:
 
 __all__ = ["chunk_gdn2"]
 
-K1_TLE_MAXNREG_CANDIDATES = (64, 72, 96)
+K1_TLE_MAXNREG_CANDIDATES = (64,)
 K1_TLE_SMEM_REUSE_MIN_K = 256
 
 

@@ -39,7 +39,7 @@ import triton.language as tl
 
 from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.index import prepare_chunk_indices
-from flag_attn.parallel_nsa.bwd_preprocess import parallel_attn_bwd_preprocess
+from flag_attn.nsa.bwd_preprocess import parallel_attn_bwd_preprocess
 from flag_attn.utils import input_guard
 
 RCP_LN2 = 1.4426950216

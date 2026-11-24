@@ -96,7 +96,7 @@ def chunk_gla(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Ascend GLA, chunked when possible and recurrent otherwise.
 
-    The signature follows flag_attn.FLA.gated_linear_attention.chunk_gla.
+    The signature follows flag_attn.FLA.gated_linear_attention.chunk.chunk_gla.
     ``g`` is a per-key gate of shape ``[B, T, H, K]``; ``initial_state`` is
     float32, in the ``[B, H, V, K]`` ``state_v_first`` layout when requested.
     Variable-length inputs with ``state_v_first`` are served by the recurrent

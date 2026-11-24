@@ -15,6 +15,6 @@
 
 """Enflame S60 GDN2 implemented with fused Triton kernels."""
 
-from .chunk_gdn2 import chunk_gdn2
+from .chunk import chunk_gdn2
 
 __all__ = ["chunk_gdn2"]
