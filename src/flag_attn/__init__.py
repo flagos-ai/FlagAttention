@@ -50,7 +50,7 @@ _OPERATOR_EXPORTS = {
     "parallel_nsa": ("flag_attn.parallel_nsa", "parallel_nsa"),
     "parallel_nsa_compression": ("flag_attn.parallel_nsa.parallel_nsa_compression", "parallel_nsa_compression"),
     "parallel_moba": ("flag_attn.FLA.moba.parallel", "parallel_moba"),
-    "parallel_forgetting_attn": ("flag_attn.forgetting_attention", "parallel_forgetting_attn"),
+    "parallel_forgetting_attn": ("flag_attn.forgetting_attention.parallel", "parallel_forgetting_attn"),
     "log_linear_attn": ("flag_attn.FLA.log_linear_attn.chunk_tle", "log_linear_attn"),
     "diffkv_attention": ("flag_attn.diffkv_attention.api", "diffkv_attention"),
     "hy3_attention": ("flag_attn.hpc_ops_attention", "hy3_attention"),
@@ -138,10 +138,6 @@ for _name in (
     _OPERATOR_EXPORTS[_name] = (_module, _name)
 
 
-# Operators exposed exactly as their module defines them, without going through
-# the backend registry. Each is a stage/variant facade that already resolves its
-# own primitives per stage, so resolving the facade's own name here would swap
-# the whole facade for a single implementation and break stage=/variant=.
 _DIRECT_EXPORTS = {
     "hy3_attention",
     "hy3_attention_prepare",
