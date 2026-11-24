@@ -51,6 +51,9 @@ _OPERATOR_EXPORTS = {
     # reaches the prefill path on its own.
     "_minimax_m3_sparse_attn_prefill": (".msa", "minimax_m3_sparse_attn"),
     "minimax_m3_sparse_attn_decode": (".msa", "minimax_m3_sparse_attn_decode"),
+    "hy3_attention_decode_bf16_dynamic": (".hpc_ops_attention", "attention_decode_bf16_dynamic"),
+    "hy3_attention_decode_fp8_qk_dynamic": (".hpc_ops_attention", "attention_decode_fp8_qk_dynamic"),
+    "hy3_attention_decode_fp8_kv_dynamic": (".hpc_ops_attention", "attention_decode_fp8_kv_dynamic"),
 }
 
 

@@ -16,6 +16,12 @@ import triton
 
 import triton.language as tl
 
+from ..hygon import (
+    HygonDecodeWorkspace,
+    attention_decode_hygon,
+    is_hygon_decode_device,
+    prepare_hygon_decode,
+)
 from .. import (
     PureTritonMTPWorkspace,
     PureTritonMTP1Workspace,
@@ -12270,6 +12276,8 @@ def select_decode_policy(inputs):
 
 
 def prepare_decode_workspace(inputs):
+    if is_hygon_decode_device(inputs.q.device):
+        return prepare_hygon_decode(inputs, 1)
     if not USE_TLE:
         if inputs.mtp == 1:
             return prepare_pure_triton_mtp1_workspace(inputs, QUANT_TYPE)
@@ -12278,6 +12286,8 @@ def prepare_decode_workspace(inputs):
 
 
 def attention_decode_fp8(inputs, workspace):
+    if isinstance(workspace, HygonDecodeWorkspace):
+        return attention_decode_hygon(inputs, workspace)
     if isinstance(workspace, PureTritonMTP1Workspace):
         return attention_decode_pure_triton_mtp1(inputs, workspace)
     if isinstance(workspace, PureTritonMTPWorkspace):
@@ -12286,6 +12296,8 @@ def attention_decode_fp8(inputs, workspace):
 
 
 def workspace_is_reset(workspace):
+    if isinstance(workspace, HygonDecodeWorkspace):
+        return True
     if isinstance(workspace, PureTritonMTP1Workspace):
         return True
     return _fp8_entry__fp8_workspace_is_reset(workspace)
