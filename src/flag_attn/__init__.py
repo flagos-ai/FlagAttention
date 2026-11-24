@@ -29,8 +29,6 @@ except ImportError:
     __version__ = "0.0.0"
     version_tuple = (0, 0, 0)
 
-FACADE = ...
-
 _OPERATOR_EXPORTS = {
     "chunk_gated_delta_rule_fwd": (
         "flag_attn.FLA.gated_delta_rule.chunk",
@@ -49,15 +47,15 @@ _OPERATOR_EXPORTS = {
     "flash_attention_split_kv": ("flag_attn.split_kv", "attention"),
     "paged_attention": ("flag_attn.paged", "attention"),
     "sage_attention": ("flag_attn.sage_attention.attn_qk_int8_per_block", "forward"),
-    "parallel_nsa": ("flag_attn.parallel_nsa", "parallel_nsa", FACADE),
+    "parallel_nsa": ("flag_attn.parallel_nsa", "parallel_nsa"),
     "parallel_nsa_compression": ("flag_attn.parallel_nsa.parallel_nsa_compression", "parallel_nsa_compression"),
     "parallel_moba": ("flag_attn.FLA.moba.parallel", "parallel_moba"),
     "parallel_forgetting_attn": ("flag_attn.forgetting_attention", "parallel_forgetting_attn"),
     "log_linear_attn": ("flag_attn.FLA.log_linear_attn.chunk_tle", "log_linear_attn"),
     "diffkv_attention": ("flag_attn.diffkv_attention.api", "diffkv_attention"),
-    "hy3_attention": ("flag_attn.hpc_ops_attention", "hy3_attention", FACADE),
-    "hy3_attention_prepare": ("flag_attn.hpc_ops_attention", "hy3_attention_prepare", FACADE),
-    "parallel_parallax": ("flag_attn.FLA.parallax", "parallel_parallax", FACADE),
+    "hy3_attention": ("flag_attn.hpc_ops_attention", "hy3_attention"),
+    "hy3_attention_prepare": ("flag_attn.hpc_ops_attention", "hy3_attention_prepare"),
+    "parallel_parallax": ("flag_attn.FLA.parallax", "parallel_parallax"),
     "fused_attnres": ("flag_attn.FLA.attnres", "fused_attnres"),
     "inkling_fa4_rel_attention": (
         "flag_attn.inkling_fa4",
@@ -85,7 +83,6 @@ _OPERATOR_EXPORTS = {
     "infllmv2_attention": (
         "flag_attn.infllmv2",
         "infllmv2_attention",
-        FACADE,
     ),
     "infllmv2_decode": (
         "flag_attn.infllmv2",
@@ -138,9 +135,21 @@ for _name in (
         _module = "flag_attn.minimax_sparse_attention"
     else:
         _module = "flag_attn.minimax_sparse_attention.sparse_attn"
-    # minimax_m3_sparse_attn is the stage facade; the rest are concrete kernels.
-    _facade = (FACADE,) if _name == "minimax_m3_sparse_attn" else ()
-    _OPERATOR_EXPORTS[_name] = (_module, _name, *_facade)
+    _OPERATOR_EXPORTS[_name] = (_module, _name)
+
+
+# Operators exposed exactly as their module defines them, without going through
+# the backend registry. Each is a stage/variant facade that already resolves its
+# own primitives per stage, so resolving the facade's own name here would swap
+# the whole facade for a single implementation and break stage=/variant=.
+_DIRECT_EXPORTS = {
+    "hy3_attention",
+    "hy3_attention_prepare",
+    "infllmv2_attention",
+    "minimax_m3_sparse_attn",
+    "parallel_nsa",
+    "parallel_parallax",
+}
 
 
 for _package_name in ("sage_attention", "parallel_nsa", "diffkv_attention"):
@@ -154,7 +163,7 @@ def __getattr__(name: str):
         module_name, attribute_name, *override = _OPERATOR_EXPORTS[name]
     except KeyError as exc:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
-    if override and override[0] is FACADE:
+    if name in _DIRECT_EXPORTS:
         value = getattr(importlib.import_module(module_name), attribute_name)
     else:
         operator = override[0] if override else name
