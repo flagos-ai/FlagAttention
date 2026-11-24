@@ -17,8 +17,6 @@ import importlib
 from flag_attn import runtime
 from flag_attn import testing  # noqa: F401
 
-# Match FlagGems and FlagGems-vllm: the package exposes strings, while
-# runtime.device retains the structured vendor/device metadata.
 device = runtime.device.name
 vendor_name = runtime.device.vendor_name
 vendor = vendor_name
@@ -90,8 +88,6 @@ _OPERATOR_EXPORTS = {
         "flag_attn.infllmv2",
         "infllmv2_decode",
     ),
-    # Remaining conf/operators.yaml names, pointing at the implementation
-    # that defines each one.
     "attention_with_kvcache_blocksparse_prefill_fp8": (
         "flag_attn.hpc_ops_attention.prefill.attention_blocksparse_prefill_fp8",
         "attention_with_kvcache_blocksparse_prefill_fp8",
@@ -104,9 +100,6 @@ _OPERATOR_EXPORTS = {
         "flag_attn.hpc_ops_attention.decode.dynamic.bf16_dynamic",
         "attention_decode_bf16_dynamic",
     ),
-    # Four modules define attention_decode_fp8; this publishes the per-token
-    # Q/K, per-head V static variant. Use hy3_attention(stage="decode",
-    # variant=...) to select another.
     "attention_decode_fp8": (
         "flag_attn.hpc_ops_attention.decode.static.fp8_qkpertoken_perhead_vperhead_static",
         "attention_decode_fp8",
@@ -117,9 +110,6 @@ _OPERATOR_EXPORTS = {
         "flag_attn.FLA.parallax.decode",
         "parallax_attn_with_kvcache",
     ),
-    # forgetting_attention is also a subpackage name. Publishing the callable
-    # keeps flag_attn.forgetting_attention(...) working; the submodule paths
-    # resolve through sys.modules and are unaffected.
     "forgetting_attention": (
         "flag_attn.forgetting_attention.parallel",
         "forgetting_attention",
@@ -144,9 +134,6 @@ for _name in (
     )
 
 
-# Initialize only lightweight namespaces before publishing same-named APIs.
-# Later submodule imports then cannot replace these callable exports with
-# package objects. Implementations remain lazy inside each namespace.
 for _package_name in ("sage_attention", "parallel_nsa", "diffkv_attention", "forgetting_attention"):
     importlib.import_module(f"{__name__}.{_package_name}")
     globals().pop(_package_name, None)
@@ -154,7 +141,6 @@ for _package_name in ("sage_attention", "parallel_nsa", "diffkv_attention", "for
 
 _STAGE_FACADES = {"minimax_m3_sparse_attn", "infllmv2_attention", "parallel_parallax", "hy3_attention", "hy3_attention_prepare", "parallel_nsa"}
 
-# Published names whose vendor override is registered under a different
 # operator name.
 _OPERATOR_NAME_ALIASES = {
     "chunk_kda": "chunk_kda_fwd_infer",
