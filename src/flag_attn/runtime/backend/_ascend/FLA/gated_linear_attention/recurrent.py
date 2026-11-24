@@ -717,7 +717,7 @@ def chunk_gla(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Ascend GLA entry point, backed by the plain recurrent formulation.
 
-    The signature follows flag_attn.FLA.gated_linear_attention.chunk_gla.
+    The signature follows flag_attn.FLA.gated_linear_attention.chunk.chunk_gla.
     `g` is a per-key gate of shape [B, T, H, K]. `cu_seqlens_cpu` is accepted
     for API compatibility; the recurrent kernel reads `cu_seqlens` directly.
     """

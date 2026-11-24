@@ -30,8 +30,8 @@ except ModuleNotFoundError:  # Execution from the benchmark directory.
     from recording import BenchmarkRecorder
 
 from flag_attn.testing import backend as test_backend
-from flag_attn.diffkv_attention import api as diffkv_impl
-from flag_attn.diffkv_attention.api import DEFAULT_LAYOUT, LAUNCH, OP_NAME, SUPPORTED_PATHS
+from flag_attn.diffkv import api as diffkv_impl
+from flag_attn.diffkv.api import DEFAULT_LAYOUT, LAUNCH, OP_NAME, SUPPORTED_PATHS
 
 
 DEFAULT_WARMUP = 100

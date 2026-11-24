@@ -4,7 +4,7 @@
 
 """MThreads implementation of Native Sparse Attention."""
 
-from .parallel_nsa import parallel_nsa
-from .parallel_nsa_compression import parallel_nsa_compression
+from .parallel import parallel_nsa
+from .compression import parallel_nsa_compression
 
 __all__ = ["parallel_nsa", "parallel_nsa_compression"]

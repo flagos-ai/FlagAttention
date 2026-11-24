@@ -14,7 +14,7 @@
 
 """PPU Log-Linear Attention operator."""
 
-from .log_linear_attn import chunk_log_linear_attn
+from .chunk import chunk_log_linear_attn
 
 log_linear_attn = chunk_log_linear_attn
 

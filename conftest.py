@@ -289,6 +289,15 @@ class _JsonResultRecorder:
                             result["details"].append(detail)
                         else:
                             existing["result"].extend(detail["result"])
+                            skip_reason = detail.get("native_baseline_skip_reason")
+                            if skip_reason:
+                                reasons = (
+                                    existing.get("native_baseline_skip_reason"),
+                                    skip_reason,
+                                )
+                                existing["native_baseline_skip_reason"] = "; ".join(
+                                    dict.fromkeys(reason for reason in reasons if reason)
+                                )
         else:
             result = self.results.setdefault(
                 key,

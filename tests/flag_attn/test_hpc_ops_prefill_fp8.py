@@ -19,6 +19,11 @@ import pytest
 import torch
 
 from flag_attn.testing import backend as test_backend
+from flag_attn import runtime
+
+if runtime.device.vendor_name == "ascend":
+    pytest.skip("HY3 FP8 attention is not supported on Ascend", allow_module_level=True)
+
 from flag_attn import hy3_attention
 
 BLOCK = 128
