@@ -31,7 +31,7 @@ Twenty-six inventory entries are registered in [`conf/operators.yaml`](./conf/op
 | Operator family | Public import | Main layout/use | Gradient support | Stage |
 | --- | --- | --- | --- | --- |
 | MiniMax M3 sparse attention | Six `flag_attn.minimax_m3_*` functions | 128-token page scoring, top-k selection, sparse prefill and decode | Inference | Alpha |
-| Parallel NSA | `flag_attn.parallel_nsa.parallel_nsa`, `parallel_nsa_compression` | Native sparse attention and compression; fixed or packed variable lengths | Forward + backward | Alpha |
+| Parallel NSA | `flag_attn.parallel_nsa`, `flag_attn.parallel_nsa_compression` | Native sparse attention and compression; fixed or packed variable lengths | Forward + backward | Alpha |
 | InfLLM-V2 | `flag_attn.infllmv2_attention`, `infllmv2_decode` | Continuous-packed causal prefill with block selection, plus variable-length decode | Forward + backward (prefill) | Alpha |
 | Parallel MoBA | `flag_attn.parallel_moba` | Variable-length Mixture-of-Block-Attention with causal chunk routing | Forward + backward | Alpha |
 | Hy3 attention | `flag_attn.hy3_attention` | FP8 paged block-sparse prefill and six BF16/FP8 decode variants | Inference | Alpha |
@@ -53,12 +53,12 @@ Twenty-six inventory entries are registered in [`conf/operators.yaml`](./conf/op
 
 | Operator family | Public import | Main layout/use | Gradient support | Stage |
 | --- | --- | --- | --- | --- |
-| SageAttention | `flag_attn.sage_attention.forward`, `per_block_int8` | Per-block INT8 Q/K quantization and attention; HND or NHD layout | Forward | Alpha |
+| SageAttention | `flag_attn.sage_attention`, `from flag_attn.sage_attention import per_block_int8` | Per-block INT8 Q/K quantization and attention; HND or NHD layout | Forward | Alpha |
 | DiffKV attention | `flag_attn.diffkv_attention` | Paged decode with asymmetric K/V head dimensions; Triton and TLE paths | Inference | Alpha |
 | Forgetting Attention | `flag_attn.parallel_forgetting_attn` | Attention with per-token log forget gates; SM90 TLE path with Triton fallback | Forward + backward | Alpha |
 | Fused AttnRes | `flag_attn.fused_attnres` | Softmax mixing of RMS-normalized residual sources, with optional fused output RMSNorm | Inference | Alpha |
 
-The top-level package exports every operator above except SageAttention and Parallel NSA, which are submodule APIs. Vendor-specific development interfaces are available under `flag_attn.runtime.backend._<vendor>` but are not treated as stable public APIs.
+The top-level package exports every operator above: each operator name listed in [`conf/operators.yaml`](./conf/operators.yaml) is reachable as `flag_attn.<name>`. SageAttention and Parallel NSA are also callable directly as `flag_attn.sage_attention` and `flag_attn.parallel_nsa`, in addition to their submodule APIs. Secondary entry points stay on their submodules, for example `flag_attn.sage_attention.per_block_int8` is imported as `from flag_attn.sage_attention import per_block_int8`. Vendor-specific development interfaces are available under `flag_attn.runtime.backend._<vendor>` but are not treated as stable public APIs.
 
 ## Requirements and backends
 

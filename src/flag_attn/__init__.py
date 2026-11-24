@@ -89,6 +89,41 @@ _OPERATOR_EXPORTS = {
         "flag_attn.infllmv2",
         "infllmv2_decode",
     ),
+    # Remaining conf/operators.yaml names. Every operator listed there is
+    # reachable as flag_attn.<name>; these are the ones whose entry point is
+    # not already published above under its own name. The Hy3 names resolve
+    # through the hpc_ops_attention facade so they keep the stage/variant
+    # vendor-override behavior of hy3_attention.
+    "attention_with_kvcache_blocksparse_prefill_fp8": (
+        "flag_attn.hpc_ops_attention",
+        "attention_with_kvcache_blocksparse_prefill_fp8",
+    ),
+    "attention_decode_bf16_static": (
+        "flag_attn.hpc_ops_attention",
+        "attention_decode_bf16_static",
+    ),
+    "attention_decode_bf16_dynamic": (
+        "flag_attn.hpc_ops_attention",
+        "attention_decode_bf16_dynamic",
+    ),
+    # Four implementation modules define attention_decode_fp8; the facade
+    # requires an explicit variant to pick one.
+    "attention_decode_fp8": ("flag_attn.hpc_ops_attention", "attention_decode_fp8"),
+    "chunk_kda_fwd_infer": ("flag_attn.FLA.chunk_kda", "chunk_kda_fwd_infer"),
+    "parallax_decode": ("flag_attn.FLA.parallax.decode", "parallax_decode"),
+    "parallax_attn_with_kvcache": (
+        "flag_attn.FLA.parallax.decode",
+        "parallax_attn_with_kvcache",
+    ),
+    # forgetting_attention is also the name of a subpackage. Publishing the
+    # callable keeps flag_attn.forgetting_attention(...) working, while
+    # import flag_attn.forgetting_attention.naive and
+    # from flag_attn.forgetting_attention import ... resolve through
+    # sys.modules and are unaffected.
+    "forgetting_attention": (
+        "flag_attn.forgetting_attention.parallel",
+        "forgetting_attention",
+    ),
 }
 
 for _name in (
@@ -112,12 +147,32 @@ for _name in (
 # Initialize only lightweight namespaces before publishing same-named APIs.
 # Later submodule imports then cannot replace these callable exports with
 # package objects. Implementations remain lazy inside each namespace.
-for _package_name in ("sage_attention", "parallel_nsa", "diffkv_attention"):
+for _package_name in ("sage_attention", "parallel_nsa", "diffkv_attention", "forgetting_attention"):
     importlib.import_module(f"{__name__}.{_package_name}")
     globals().pop(_package_name, None)
 
 
-_STAGE_FACADES = {"minimax_m3_sparse_attn", "infllmv2_attention", "parallel_parallax", "hy3_attention", "parallel_nsa"}
+_STAGE_FACADES = {
+    "minimax_m3_sparse_attn",
+    "infllmv2_attention",
+    "parallel_parallax",
+    "hy3_attention",
+    "parallel_nsa",
+    # Hy3 stage/variant shorthands. Each one calls hy3_attention, which
+    # resolves the vendor override for the stage it selects, so resolving
+    # these names through the registry again would be redundant.
+    "attention_with_kvcache_blocksparse_prefill_fp8",
+    "attention_decode_bf16_static",
+    "attention_decode_bf16_dynamic",
+    "attention_decode_fp8",
+}
+
+# Published names whose vendor override is registered under a different
+# operator name.
+_OPERATOR_NAME_ALIASES = {
+    "chunk_kda": "chunk_kda_fwd_infer",
+    "forgetting_attention": "parallel_forgetting_attn",
+}
 
 
 def __getattr__(name: str):
@@ -129,7 +184,7 @@ def __getattr__(name: str):
     if name in _STAGE_FACADES:
         value = getattr(importlib.import_module(module_name), attribute_name)
     else:
-        operator = "chunk_kda_fwd_infer" if name == "chunk_kda" else name
+        operator = _OPERATOR_NAME_ALIASES.get(name, name)
         value = runtime.backend.resolve_operator(operator, module_name, attribute_name)
     globals()[name] = value
     return value
@@ -173,4 +228,12 @@ __all__ = [
     "minimax_m3_sparse_attn",
     "minimax_m3_sparse_attn_decode",
     "parallel_wall_attn",
+    "attention_with_kvcache_blocksparse_prefill_fp8",
+    "attention_decode_bf16_static",
+    "attention_decode_bf16_dynamic",
+    "attention_decode_fp8",
+    "chunk_kda_fwd_infer",
+    "forgetting_attention",
+    "parallax_decode",
+    "parallax_attn_with_kvcache",
 ]

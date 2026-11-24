@@ -47,7 +47,7 @@ FlagAttention 是一个使用 [Triton](https://github.com/triton-lang/triton) �
 | 算子族 | 公开导入入口 | 主要布局/用途 | 梯度支持 | 阶段 |
 | --- | --- | --- | --- | --- |
 | MiniMax M3 稀疏注意力 | 六个 `flag_attn.minimax_m3_*` 函数 | 以 128 token page 为单位打分、Top-K、稀疏 prefill/decode | 推理 | Alpha |
-| Parallel NSA | `flag_attn.parallel_nsa.parallel_nsa`、`parallel_nsa_compression` | Native Sparse Attention 及压缩；支持定长和 packed varlen | 前向 + 反向 | Alpha |
+| Parallel NSA | `flag_attn.parallel_nsa`、`flag_attn.parallel_nsa_compression` | Native Sparse Attention 及压缩；支持定长和 packed varlen | 前向 + 反向 | Alpha |
 | InfLLM-V2 | `flag_attn.infllmv2_attention`、`infllmv2_decode` | 连续 packed 因果 prefill 配合块选择，以及变长 decode | 前向 + 反向（prefill） | Alpha |
 | Parallel MoBA | `flag_attn.parallel_moba` | 变长 Mixture-of-Block-Attention，按因果 chunk 路由 | 前向 + 反向 | Alpha |
 | Hy3 Attention | `flag_attn.hy3_attention` | FP8 paged 块稀疏 prefill 及六种 BF16/FP8 decode 变体 | 推理 | Alpha |
@@ -69,12 +69,12 @@ FlagAttention 是一个使用 [Triton](https://github.com/triton-lang/triton) �
 
 | 算子族 | 公开导入入口 | 主要布局/用途 | 梯度支持 | 阶段 |
 | --- | --- | --- | --- | --- |
-| SageAttention | `flag_attn.sage_attention.forward`、`per_block_int8` | Q/K 分块 INT8 量化及 attention；支持 HND/NHD | 前向 | Alpha |
+| SageAttention | `flag_attn.sage_attention`、`from flag_attn.sage_attention import per_block_int8` | Q/K 分块 INT8 量化及 attention；支持 HND/NHD | 前向 | Alpha |
 | DiffKV Attention | `flag_attn.diffkv_attention` | K/V head dimension 不对称的 paged decode；Triton 与 TLE 路径 | 推理 | Alpha |
 | Forgetting Attention | `flag_attn.parallel_forgetting_attn` | 带逐 token 对数遗忘门的注意力；SM90 走 TLE，其余回落 Triton | 前向 + 反向 | Alpha |
 | Fused AttnRes | `flag_attn.fused_attnres` | 对 RMS 归一化后的残差源做 softmax 混合，可选融合输出 RMSNorm | 推理 | Alpha |
 
-除 SageAttention 和 Parallel NSA 使用子模块入口外，上述算子均由顶层包导出。`flag_attn.runtime.backend._<vendor>` 下还存在厂商开发接口，但这些路径不视为稳定公开 API。
+上述算子均由顶层包导出：[`conf/operators.yaml`](./conf/operators.yaml) 中列出的每个算子名都可以通过 `flag_attn.<name>` 访问。SageAttention 和 Parallel NSA 除子模块入口外，也可直接作为 `flag_attn.sage_attention`、`flag_attn.parallel_nsa` 调用。次要入口仍保留在各自子模块上，例如 `flag_attn.sage_attention.per_block_int8` 需通过 `from flag_attn.sage_attention import per_block_int8` 导入。`flag_attn.runtime.backend._<vendor>` 下还存在厂商开发接口，但这些路径不视为稳定公开 API。
 
 ## 依赖与后端
 

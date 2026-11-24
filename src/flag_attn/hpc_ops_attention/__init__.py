@@ -70,4 +70,70 @@ def hy3_attention(
     return implementation(*args, **kwargs)
 
 
-__all__ = ["hy3_attention", "decode", "prefill"]
+_HY3_FP8_DECODE_VARIANTS = tuple(name for name in _HY3_DECODE_IMPLEMENTATIONS if name.startswith("fp8_"))
+
+
+def attention_decode_bf16_static(*args, **kwargs):
+    """Run the BF16 static-scheduling Hy3 decode implementation.
+
+    Forwards (inputs, workspace) unchanged. Equivalent to
+    hy3_attention(..., stage="decode", variant="bf16_static"), and resolves
+    the same vendor override.
+    """
+    return hy3_attention(*args, stage="decode", variant="bf16_static", **kwargs)
+
+
+def attention_decode_bf16_dynamic(*args, **kwargs):
+    """Run the BF16 dynamic-scheduling Hy3 decode implementation.
+
+    Forwards (inputs, workspace) unchanged. Equivalent to
+    hy3_attention(..., stage="decode", variant="bf16_dynamic"), and resolves
+    the same vendor override.
+    """
+    return hy3_attention(*args, stage="decode", variant="bf16_dynamic", **kwargs)
+
+
+def attention_decode_fp8(
+    *args,
+    variant: Literal["fp8_qk_static", "fp8_qk_dynamic", "fp8_kv_static", "fp8_kv_dynamic"],
+    **kwargs,
+):
+    """Run one FP8 Hy3 decode implementation, selected by variant.
+
+    Four implementation modules each define a function named
+    attention_decode_fp8, so variant is required rather than defaulted:
+    qk denotes per-token Q/K with per-head V quantization, kv denotes
+    per-token Q with per-tensor K/V quantization. Arguments are forwarded
+    as (inputs, workspace) unchanged; prepare the workspace using the
+    matching implementation module before calling. Equivalent to
+    hy3_attention(..., stage="decode", variant=variant).
+    """
+    if variant not in _HY3_DECODE_IMPLEMENTATIONS:
+        raise ValueError(f"attention_decode_fp8 requires variant in {_HY3_FP8_DECODE_VARIANTS}; got {variant!r}")
+    if not variant.startswith("fp8_"):
+        raise ValueError(
+            f"{variant!r} is not an FP8 decode variant; expected one of {_HY3_FP8_DECODE_VARIANTS}. "
+            f"Use hy3_attention(..., stage='decode', variant={variant!r}) instead."
+        )
+    return hy3_attention(*args, stage="decode", variant=variant, **kwargs)
+
+
+def attention_with_kvcache_blocksparse_prefill_fp8(*args, **kwargs):
+    """Run the FP8 block-sparse paged prefill Hy3 implementation.
+
+    Forwards the tensor/cache/scale arguments unchanged. Equivalent to
+    hy3_attention(...), the default prefill stage, and resolves the same
+    vendor override.
+    """
+    return hy3_attention(*args, **kwargs)
+
+
+__all__ = [
+    "attention_decode_bf16_dynamic",
+    "attention_decode_bf16_static",
+    "attention_decode_fp8",
+    "attention_with_kvcache_blocksparse_prefill_fp8",
+    "hy3_attention",
+    "decode",
+    "prefill",
+]
