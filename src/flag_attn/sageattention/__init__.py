@@ -1,5 +1,4 @@
 # Copyright 2026 FlagOS Contributors
-# Copyright contributors to the vLLM project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,30 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DiffKV attention with standard Triton and optional TLE backends."""
-
-from importlib import import_module
-
 from flag_attn.runtime.backend import resolve_operator
+
+_OPERATOR_EXPORTS = {
+    "sage_attention": ("sage_attention", "flag_attn.sageattention.attn_qk_int8_per_block", "forward"),
+    "forward": ("sage_attention", "flag_attn.sageattention.attn_qk_int8_per_block", "forward"),
+    "per_block_int8": ("sage_attention_per_block_int8", "flag_attn.sageattention.quant_per_block", "per_block_int8"),
+}
 
 
 def __getattr__(name: str):
-    if name not in __all__:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    if name == "diffkv_attention":
-        value = resolve_operator(name, "flag_attn.diffkv_attention.api")
-    else:
-        value = getattr(import_module("flag_attn.diffkv_attention.api"), name)
+    try:
+        operator, module, symbol = _OPERATOR_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = resolve_operator(operator, module, symbol)
     globals()[name] = value
     return value
 
 
-__all__ = [
-    "OP_NAME",
-    "diffkv_attention",
-    "unified_attention_diffkv",
-    "unified_attention_diffkv_tle",
-    "unified_attention_diffkv_fallback",
-    "DiffKVLayout",
-    "DEFAULT_LAYOUT",
-]
+__all__ = ["sage_attention", "forward", "per_block_int8"]

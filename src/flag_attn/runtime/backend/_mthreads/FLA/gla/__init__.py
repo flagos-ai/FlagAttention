@@ -4,6 +4,6 @@
 
 """MThreads gated linear attention implemented with Triton/TLE."""
 
-from .chunk_gla import chunk_gla
+from .chunk import chunk_gla
 
 __all__ = ["chunk_gla"]

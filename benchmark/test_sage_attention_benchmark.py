@@ -32,7 +32,7 @@ except ModuleNotFoundError:  # Direct script execution.
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import sage_attention
-from flag_attn.sage_attention import per_block_int8
+from flag_attn.sageattention import per_block_int8
 
 
 SDPA_BASELINE_NAME = "torch_sdpa"
