@@ -261,17 +261,17 @@ def _fwd_pipelined_kernel(
         start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n = start_n + offs_n_base
         if DIVISIBLE_M:
-            q = tl.load(q_ptrs, mask=offs_k[None, :] < ACTUAL_D, other=0, cache_modifier=".ca")
+            q = tl.load(q_ptrs, mask=(offs_k[None, :] < ACTUAL_D) & ((ACTUAL_D != BLOCK_DMODEL) | (P_SEQ + offs_m[:, None] >= start_n)), other=0, cache_modifier=".ca")
         else:
-            q = tl.load(q_ptrs, mask=mask_m[:, None] & (offs_k[None, :] < ACTUAL_D), other=0, cache_modifier=".ca")
+            q = tl.load(q_ptrs, mask=mask_m[:, None] & (offs_k[None, :] < ACTUAL_D) & ((ACTUAL_D != BLOCK_DMODEL) | (P_SEQ + offs_m[:, None] >= start_n)), other=0, cache_modifier=".ca")
         if DIVISIBLE_N:
             k = tl.load(k_ptrs, mask=offs_k[:, None] < ACTUAL_D, other=0, cache_modifier=".ca")
-            log_lambda_in = _gate_load(log_lambda_in_ptrs, tl.full((BLOCK_N,), True, tl.int1))
+            log_lambda_in = _load_gate_bits(log_lambda_in_ptrs, tl.full((BLOCK_N,), True, tl.int1))
         else:
             mask_n = offs_n < N
             k = tl.load(k_ptrs, mask=mask_n[None, :] & (offs_k[:, None] < ACTUAL_D), other=0, cache_modifier=".ca")
-            log_lambda_in = _gate_load(log_lambda_in_ptrs, mask_n)
-        s = _mul_rn(tl.dot(q, k, input_precision="ieee"), qk_scale)
+            log_lambda_in = _load_gate_bits(log_lambda_in_ptrs, mask_n)
+        s = tl.dot(q, k, input_precision="ieee") * qk_scale
         decay_bias = log_lambda_out[:, None] - log_lambda_in[None, :]
         s = tl.fma(decay_bias, log2e, s)
         if not DIVISIBLE_N:
@@ -307,24 +307,12 @@ def _fwd_pipelined_kernel(
 
 
 @triton.jit
-def _mul_rn(a, b):
-    # Preserve baseline score rounding before the decay-bias FMA.
-    return tl.inline_asm_elementwise(
-        "ppu.mul.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32, is_pure=True, pack=1
-    )
-
-
-@triton.jit
-def _gate_load(ptr, valid):
-    # This reads memory: keep is_pure=False. Its effects also affect Q hoisting.
-    return tl.inline_asm_elementwise(
-        "{ .reg .pred p; ppu.mov.f32 $0, 0f00000000; ppu.setp.ne.u32 p, $2, 0; @p ppu.ld.global.f32 $0, [$1]; }",
-        "=f,l,r",
-        [ptr.to(tl.uint64), valid.to(tl.int32)],
-        dtype=tl.float32,
-        is_pure=False,
-        pack=1,
-    )
+def _load_gate_bits(ptr, valid):
+    bits_ptr = ptr.to(tl.pointer_type(tl.uint16))
+    low = tl.load(bits_ptr, mask=valid, other=0, cache_modifier=".ca").to(tl.uint32)
+    high = tl.load(bits_ptr + 1, mask=valid, other=0, cache_modifier=".ca").to(tl.uint32)
+    bits = low | (high << 16)
+    return bits.to(tl.float32, bitcast=True)
 
 
 # Keep the original load order for decode and short prefill.
