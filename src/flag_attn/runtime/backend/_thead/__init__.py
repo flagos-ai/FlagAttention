@@ -19,7 +19,7 @@ from __future__ import annotations
 import importlib
 
 _OPERATOR_EXPORTS = {
-    "parallel_forgetting_attn": (".forgetting_attention.parallel", "parallel_forgetting_attn"),
+    "parallel_forgetting_attn": (".forgetting.parallel", "parallel_forgetting_attn"),
     "inkling_fa4_rel_attention": (".inkling_fa4.relative_attention", "inkling_fa4_rel_attention"),
     "SPARSE_BLOCK_SIZE": (".minimax_sparse_attention.index_topk", "SPARSE_BLOCK_SIZE"),
     "minimax_m3_index_decode": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode"),
