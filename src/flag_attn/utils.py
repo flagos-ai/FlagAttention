@@ -70,6 +70,17 @@ def is_sm90_device(device: torch.device | None = None) -> bool:
     return capability == (9, 0)
 
 
+def is_sm100_device(device: torch.device | None = None) -> bool:
+    """Return whether a CUDA device has compute capability 10.0."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        capability = torch.cuda.get_device_capability(device)
+    except (RuntimeError, TypeError, ValueError):
+        return False
+    return capability == (10, 0)
+
+
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """Cache the eight most recent calls using tensor identity as the key."""
     cache_entries: list[tuple[tuple[Any, ...], dict[str, Any], Any]] = []

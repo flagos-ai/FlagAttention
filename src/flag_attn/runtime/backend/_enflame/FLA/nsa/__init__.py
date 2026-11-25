@@ -6,8 +6,8 @@
 
 from typing import Literal
 
-from .parallel_nsa import parallel_nsa as _parallel_nsa_full
-from .parallel_nsa_compression import (
+from .parallel import parallel_nsa as _parallel_nsa_full
+from .compression import (
     parallel_nsa_compression,
 )
 

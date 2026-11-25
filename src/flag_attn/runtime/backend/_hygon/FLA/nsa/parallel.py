@@ -22,7 +22,7 @@ from ..index import (
     prepare_token_indices,
 )
 from .mean_pooling import mean_pooling
-from .parallel_nsa_compression import parallel_nsa_compression
+from .compression import parallel_nsa_compression
 from ..triton_ops_helper import autotune_cache_kwargs, exp, log
 from ..utils import _bitonic_merge, check_shared_mem, input_guard
 

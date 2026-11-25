@@ -15,10 +15,21 @@ _OPERATOR_EXPORTS = {
         "fused_recurrent_gated_delta_rule_packed_decode",
     ),
     "chunk_gdn2": (".gdn2", "chunk_gdn2"),
+    "chunk_gla": (".FLA.gated_linear_attention.api", "chunk_gla"),
     "parallel_parallax": (".parallax", "parallel_parallax"),
     "parallax_decode": (".parallax", "parallax_decode"),
     "parallax_attn_with_kvcache": (".parallax", "parallax_attn_with_kvcache"),
     "forward": (".attn_qk_int8_per_block", "forward"),
+    "hy3_attention": (
+        ".hpc_ops_attention.prefill.attention_blocksparse_prefill_bf16",
+        "attention_with_kvcache_blocksparse_prefill_bf16",
+    ),
+    "hy3_attention_decode_bf16_static": (
+        ".hpc_ops_attention.decode.static.bf16_static", "attention_decode_bf16_tle"),
+    "hy3_attention_decode_bf16_dynamic": (
+        ".hpc_ops_attention.decode.dynamic.bf16_dynamic", "attention_decode_bf16_dynamic"),
+    "hy3_attention_prepare": (".hpc_ops_attention.api", "hy3_attention_prepare"),
+    "fused_attnres": (".FLA.attnres", "fused_attnres"),
     "per_block_int8": (".ops", "quant_per_block_int8"),
     "quant_per_block_int8": (".ops", "quant_per_block_int8"),
     "sage_attention": (".attn_qk_int8_per_block", "forward"),

@@ -33,7 +33,7 @@ except (ImportError, AttributeError):
     gpu_types = None
     HAS_TLE = False
 
-USE_TLE = HAS_TLE
+USE_TLE = HAS_TLE and hasattr(tle, "device_mesh")
 
 
 @dataclass

@@ -37,6 +37,14 @@ _OPERATOR_EXPORTS = {
         ".FLA.wall_attn.parallel",
         "parallel_wall_attn",
     ),
+    "log_linear_attn": (
+        ".FLA.log_linear_attn.chunk",
+        "log_linear_attn",
+    ),
+    "chunk_log_linear_attn": (
+        ".FLA.log_linear_attn.chunk",
+        "chunk_log_linear_attn",
+    ),
 }
 
 
