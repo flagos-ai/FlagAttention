@@ -12,13 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cross-backend correctness tests for the MiniMax M3 paged MSA kernels."""
+"""Cross-backend correctness tests for the MiniMax M3 paged MSA kernels.
+
+Manual B200 matrix (120 cases, no MiniMax dependency; NVFP4 inputs need TE)::
+
+    pytest -q tests/flag_attn/test_minimax_sparse_attention.py::test_nvidia_msa_full_chain
+
+Use --stage/--dtype/-k to filter the manual matrix. Disable forced TF32 for
+the independent FP32 reference (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0 and
+NVIDIA_TF32_OVERRIDE=0). B200 tests skip on other architectures; no B200 CI.
+"""
 
 from __future__ import annotations
 
 
 import importlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Sequence
 
 import pytest
@@ -883,3 +892,628 @@ def test_prefill_bf16_non_pow2_head_dim(head_dim: int, group_size: int) -> None:
     )
     expected = _ref_sparse_attn(data, topk_idx)
     _assert_attention_match(actual, expected, data)
+
+
+# Manual SM100 workload preparation, reused by the MiniMax benchmark.
+DTYPES = {
+    "bf16": "BF16 / BF16 / BF16",
+    "mixed": "BF16 / FP8 / FP8",
+    "fp8": "FP8 / FP8 / FP8",
+    "nvfp4-bf16": "BF16 / NVFP4 / NVFP4",
+    "nvfp4-fp8": "FP8 / NVFP4 / NVFP4",
+}
+WORKLOADS = {
+    "prefill": (("P1", 1, 2048, 2048), ("P2", 1, 8192, 8192),
+                ("P3", 1, 512, 65536), ("P4", 1, 8192, 65536)),
+    "decode": (("D1", 1, 1, 8192), ("D2", 64, 1, 8192),
+               ("D3", 1, 1, 65536), ("D4", 64, 1, 65536)),
+}
+
+
+@dataclass(frozen=True)
+class MSACase:
+    stage: str
+    dtype: str
+    batch: int
+    q: int
+    kv: int
+    heads: int
+    gqa: int
+    label: str
+    tp: int = 0
+    seed: int = 42
+    topk: int = 16
+
+    @property
+    def id(self):
+        return (f"{self.stage}-{self.dtype}-tp{self.tp}-{self.label}-"
+                f"b{self.batch}-q{self.q}-s{self.kv}-h{self.heads}-g{self.gqa}")
+
+    @property
+    def packed(self):
+        return self.dtype.startswith("nvfp4")
+
+    @property
+    def tolerance(self):
+        return (0.02, 0.02) if self.dtype in ("bf16", "nvfp4-bf16") else (0.06, 0.08)
+
+
+def msa_cases(*, stage="all", dtype="all"):
+    """120 SM100 workloads: five input types, three TP layouts, two stages."""
+    if dtype not in (*DTYPES, "all", "both"):
+        raise ValueError(f"Unknown MSA dtype {dtype!r}; choose {tuple(DTYPES)} or all")
+    cases = []
+    for phase in ("prefill", "decode"):
+        if stage not in ("all", phase):
+            continue
+        for mode in DTYPES:
+            if dtype not in ("all", "both", mode):
+                continue
+            for tp, heads, gqa in ((1, 4, 16), (4, 1, 16), (8, 1, 8)):
+                for label, batch, q, kv in WORKLOADS[phase]:
+                    cases.append(MSACase(phase, mode, batch, q, kv, heads, gqa, label, tp))
+    return cases
+
+
+def swizzle_nvfp4_scales(scales):
+    logical = scales.reshape(-1, 8).view(torch.uint8)
+    row = torch.arange(logical.shape[0], device=scales.device)[:, None]
+    col = torch.arange(8, device=scales.device)[None, :]
+    offsets = ((row // 128) * 2 + col // 4) * 512 + (row % 32) * 16 + ((row % 128) // 32) * 4 + col % 4
+    storage = torch.empty_like(logical).flatten()
+    storage[offsets.flatten()] = logical.flatten()
+    return storage.reshape(-1, 8)
+
+
+def quantize_nvfp4(x, max_elements=1 << 27):
+    """TE rowwise quantization, bounded preparation memory, one global scale.
+
+    A calibration page carries the full tensor amax into each chunk. It is
+    discarded before use; page boundaries align with 128-row scale tiles.
+    No kernel or third-party function is monkey-patched.
+    """
+    from transformer_engine.pytorch.tensor import NVFP4Quantizer
+
+    quantizer = NVFP4Quantizer(rowwise=True, columnwise=False)
+    chunk_pages = max(1, max_elements // x[0].numel())
+    chunked = x.numel() > max_elements
+    calibration = torch.zeros_like(x[:1]) if chunked else None
+    if chunked:
+        calibration.flatten()[0] = torch.maximum(x.amax().abs(), x.amin().abs())
+    data, scales, global_scale, first_rng = [], [], None, None
+    for start in range(0, len(x), chunk_pages):
+        part = x[start:start + chunk_pages]
+        source = torch.cat((part, calibration)) if chunked else part
+        meta = quantizer.quantize(source.contiguous()).get_metadata()
+        current = meta["amax_rowwise"].float() / (448 * 6)
+        if global_scale is not None:
+            torch.testing.assert_close(current, global_scale, atol=0, rtol=0)
+        global_scale = current
+        data.append(meta["rowwise_data"].view(torch.uint8)[:len(part)].clone())
+        rows = part.numel() // 128
+        scales.append(meta["rowwise_scale_inv"][:rows, :8].clone().view(torch.float8_e4m3fn)
+                      .reshape(*part.shape[:-1], 8))
+        if first_rng is None:
+            first_rng = torch.cuda.get_rng_state()
+    if chunked:
+        torch.cuda.set_rng_state(first_rng)
+    return torch.cat(data), torch.cat(scales), global_scale.contiguous()
+
+
+@dataclass
+class MSAInputs:
+    case: MSACase
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    kv: torch.Tensor
+    iq: torch.Tensor
+    ik: torch.Tensor
+    pages: torch.Tensor
+    cuq: torch.Tensor
+    seq: torch.Tensor
+    prefix: torch.Tensor
+    output: torch.Tensor
+    ks: torch.Tensor | None = None
+    vs: torch.Tensor | None = None
+    kg: torch.Tensor | None = None
+    vg: torch.Tensor | None = None
+    iqs: torch.Tensor | None = None
+    iks: torch.Tensor | None = None
+    ks_storage: torch.Tensor | None = None
+    vs_storage: torch.Tensor | None = None
+
+    def index_kwargs(self):
+        return dict(fp4_format="nvfp4", q_scale=self.iqs, k_scale=self.iks) if self.case.packed else {}
+
+    def scores(self):
+        c = self.case
+        return minimax_m3_index_score(self.iq, self.ik, self.pages, self.cuq, self.seq, self.prefix,
+                                     c.q, c.kv, c.heads, **self.index_kwargs())
+
+    def select(self):
+        c = self.case
+        if c.stage == "decode":
+            return minimax_m3_index_decode(self.iq, self.ik, self.pages, self.seq, c.kv, c.topk,
+                                           0, 0, c.heads, c.q, c.q, **self.index_kwargs())
+        return minimax_m3_index_topk(self.scores(), self.cuq, self.prefix, c.q, c.topk, 0, 0)
+
+    def attention(self, selected):
+        c = self.case
+        extras = dict(k_scale=self.kg, v_scale=self.vg)
+        if c.packed:
+            extras = dict(kv_format="nvfp4", k_scale=self.ks_storage, v_scale=self.vs_storage,
+                          k_global_scale=self.kg, v_global_scale=self.vg)
+        if c.stage == "decode":
+            minimax_m3_sparse_attn(self.q, self.kv, selected, self.pages, self.seq, c.heads,
+                                  128**-0.5, self.output, c.q, stage="decode", **extras)
+        else:
+            minimax_m3_sparse_attn(self.q, self.kv, selected, self.pages, self.cuq, self.seq,
+                                  self.prefix, c.q, c.heads, 128**-0.5, self.output, **extras)
+        return self.output
+
+
+def make_msa_inputs(case):
+    c = case
+    torch.manual_seed(c.seed)
+
+    def rand(shape):
+        return torch.randn(shape, device="cuda", dtype=torch.bfloat16) * .5
+
+    nb = (c.kv + 127) // 128
+    npages = c.batch * nb
+    q = rand((c.batch * c.q, c.heads * c.gqa, 128))
+    if c.dtype in ("fp8", "nvfp4-fp8"):
+        q = q.to(torch.float8_e4m3fn)
+    pages = torch.randperm(npages, device="cuda").int().reshape(c.batch, nb)
+    cuq = torch.arange(c.batch + 1, device="cuda", dtype=torch.int32) * c.q
+    seq = torch.full((c.batch,), c.kv, device="cuda", dtype=torch.int32)
+    kw = {}
+    shape = (npages, c.heads, 128, 128)
+    if c.packed:
+        k, ks, kg = quantize_nvfp4(rand(shape))
+        v, vs, vg = quantize_nvfp4(rand(shape))
+        iq = torch.randint(256, (c.batch * c.q, c.heads, 64), device="cuda", dtype=torch.uint8)
+        ik = torch.randint(256, (npages, c.heads, 128, 64), device="cuda", dtype=torch.uint8)
+        iqs = torch.exp2(torch.randint(-3, 2, (*iq.shape[:-1], 8), device="cuda").float()).to(torch.float8_e4m3fn)
+        iks = torch.exp2(torch.randint(-3, 2, (*ik.shape[:-1], 8), device="cuda").float()).to(torch.float8_e4m3fn)
+        kw = dict(ks=ks, vs=vs, kg=kg, vg=vg, iqs=iqs, iks=iks,
+                  ks_storage=swizzle_nvfp4_scales(ks), vs_storage=swizzle_nvfp4_scales(vs))
+    else:
+        dtype = torch.bfloat16 if c.dtype == "bf16" else torch.float8_e4m3fn
+        k, v = rand(shape).to(dtype), rand(shape).to(dtype)
+        iq = rand((c.batch * c.q, c.heads, 128)).to(dtype)
+        ik = rand((npages, 128, 128)).to(dtype)
+    return MSAInputs(c, q, k, v, torch.cat((k, v), -1), iq, ik, pages, cuq, seq, seq - c.q,
+                     torch.empty(q.shape, device="cuda", dtype=torch.bfloat16), **kw)
+
+
+# SM100-only additions; existing SM90 test coverage is unchanged.
+def pytest_generate_tests(metafunc):
+    if "msa_case" in metafunc.fixturenames:
+        cases = msa_cases(stage=metafunc.config.getoption("--stage"),
+                          dtype=metafunc.config.getoption("--dtype"))
+        metafunc.parametrize("msa_case", cases, ids=lambda case: case.id)
+
+
+_requires_blackwell = pytest.mark.skipif(
+    not test_backend.is_nvidia() or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (10, 0),
+    reason="requires NVIDIA SM100",
+)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+@_requires_blackwell
+def test_nvidia_msa_full_chain(msa_case, record_property):
+    """Manual SM100 matrix: 5 dtypes x 12 workloads x prefill/decode."""
+    from flag_attn.testing.minimax_sparse_attention import (
+        reference_selection, reference_attention, selection_difference,
+    )
+    from flag_attn.runtime.backend._nvidia.minimax_sparse_attention import sparse_attn, index_topk
+
+    data = make_msa_inputs(msa_case)
+    selected_ref = reference_selection(data)
+    expected = reference_attention(data, selected_ref)
+    # Only clear recipe caches; compilation caches are not claimed to be cold.
+    for cache in (sparse_attn._PERSISTENT_LAUNCH_CACHE, sparse_attn._FP8_LAUNCH_CACHE,
+                  sparse_attn._NVFP4_LAUNCH_CACHE, sparse_attn._DECODE_LAUNCH_CACHE,
+                  index_topk._DECODE_INDEX_LAUNCH_CACHE):
+        cache.clear()
+    diagnostics = []
+    atol, rtol = msa_case.tolerance
+    for call in range(2):
+        selected = data.select()
+        actual = data.attention(selected)
+        difference = (actual.float() - expected.float()).abs()
+        bad = (~torch.isfinite(actual)) | (difference > atol + rtol * expected.float().abs())
+        different, total = selection_difference(data, selected, selected_ref)
+        diagnostics.append(dict(call=call, topk_different_rows=different, topk_total_rows=total,
+                                max_abs=float(difference.max()), failures=int(bad.sum()), elements=actual.numel()))
+        record_property("msa_correctness", diagnostics.copy())
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+@_requires_blackwell
+@pytest.mark.parametrize("seed", [42, 43, 44])
+def test_fp8_query_early_causal_no_requantization(seed):
+    """Keep the original large-input RNG sequence, reduce to its first page."""
+
+    data = make_data((8192,), 4, 16, decode=False, prefix_lens=(0,), mode="fp8_full", seed=seed)
+    q = data.q[:3].to(torch.float8_e4m3fn).contiguous()
+    page = int(data.block_table[0, 0])
+    kv = data.kv_cache[page : page + 1].contiguous()
+    pages = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    selected = torch.full((4, 3, 16), -1, device="cuda", dtype=torch.int32)
+    selected[:, :, 0] = 0
+    cu = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
+    seq = torch.tensor([3], device="cuda", dtype=torch.int32)
+    prefix = torch.zeros(1, device="cuda", dtype=torch.int32)
+    output = torch.empty(q.shape, device="cuda", dtype=torch.bfloat16)
+    minimax_m3_sparse_attn(
+        q,
+        kv,
+        selected,
+        pages,
+        cu,
+        seq,
+        prefix,
+        3,
+        4,
+        data.sm_scale,
+        output,
+        k_scale=torch.ones_like(data.k_scale),
+        v_scale=torch.ones_like(data.v_scale),
+    )
+    # Elementwise reduction avoids any TF32-dependent reference GEMM.
+    for token in range(3):
+        for head in range(64):
+            keys = kv[0, head // 16, : token + 1, :128].float()
+            values = kv[0, head // 16, : token + 1, 128:].float()
+            logits = (q[token, head].float()[None, :] * keys).sum(-1) * data.sm_scale
+            expected = (logits.softmax(-1)[:, None] * values).sum(0)
+            torch.testing.assert_close(output[token, head].float(), expected, atol=0.06, rtol=0.08)
+
+
+def unpack_fp4(data, scale, fmt):
+    lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], device=data.device
+    )
+    nibbles = torch.stack((data & 15, data >> 4), -1).flatten(-2)
+    values = lut[nibbles.long()]
+    if fmt == "mxfp4":
+        scales = torch.exp2(scale.view(torch.uint8).float() - 127)
+        vec = 32
+    else:
+        scales = scale.view(torch.float8_e4m3fn).float()
+        vec = 16
+    return values * scales.repeat_interleave(vec, dim=-1)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+@_requires_blackwell
+@pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
+@pytest.mark.parametrize("key_heads", [1, 2])
+@pytest.mark.parametrize("query_lengths", [(17, 65), (128, 129)])
+def test_fp4_index_scores(fmt, key_heads, query_lengths):
+    torch.manual_seed(19)
+    device = "cuda"
+    heads = 4
+    lengths = (257, 513)
+    prefixes = tuple(k - q for k, q in zip(lengths, query_lengths))
+    page_counts = tuple((n + 127) // 128 for n in lengths)
+    total_pages = sum(page_counts)
+    q = torch.randint(0, 256, (sum(query_lengths), heads, 64), device=device, dtype=torch.uint8)
+    k = torch.randint(0, 256, (total_pages, key_heads, 128, 64), device=device, dtype=torch.uint8)
+    vec = 32 if fmt == "mxfp4" else 16
+
+    def scales(shape):
+        if fmt == "mxfp4":
+            return torch.randint(124, 129, shape, device=device, dtype=torch.uint8)
+        return (torch.rand(shape, device=device) + 0.25).to(torch.float8_e4m3fn).view(torch.uint8)
+
+    qs, ks = scales((*q.shape[:2], 128 // vec)), scales((*k.shape[:3], 128 // vec))
+    if query_lengths[0] == 128:
+        dtype = getattr(torch, "float8_e8m0fnu", torch.uint8) if vec == 32 else torch.float8_e4m3fn
+        qs, ks = qs.view(dtype), ks.view(dtype)
+    permutation = torch.randperm(total_pages, device=device).to(torch.int32)
+    pages = torch.full((2, max(page_counts)), -1, device=device, dtype=torch.int32)
+    pages[0, : page_counts[0]] = permutation[: page_counts[0]]
+    pages[1, : page_counts[1]] = permutation[page_counts[0] :]
+    cu = torch.tensor([0, query_lengths[0], sum(query_lengths)], device=device, dtype=torch.int32)
+    seq = torch.tensor(lengths, device=device, dtype=torch.int32)
+    prefix = torch.tensor(prefixes, device=device, dtype=torch.int32)
+    # Exercise both the existing single-index-head cache rank and the grouped
+    # upstream-style index-key layout.
+    key_arg, ks_arg = (k[:, 0], ks[:, 0]) if key_heads == 1 else (k, ks)
+    q_arg = q
+    if key_heads == 2:
+        q_arg, key_arg = q.view(torch.int8), key_arg.view(torch.int8)
+    scores = minimax_m3_index_score(
+        q_arg,
+        key_arg,
+        pages,
+        cu,
+        seq,
+        prefix,
+        max(query_lengths),
+        max(lengths),
+        heads,
+        fp4_format=fmt,
+        q_scale=qs,
+        k_scale=ks_arg,
+    )
+    dq, dk = unpack_fp4(q, qs, fmt), unpack_fp4(k, ks, fmt)
+    ref = torch.full_like(scores, float("-inf"))
+    offset = 0
+    for batch, (nq, nk, pref) in enumerate(zip(query_lengths, lengths, prefixes)):
+        for h in range(heads):
+            keys = dk[pages[batch, : page_counts[batch]].long(), h // (heads // key_heads)]
+            keys = keys.reshape(-1, 128)
+            logits = dq[offset : offset + nq, h] @ keys.T
+            positions = torch.arange(keys.shape[0], device=device)
+            visible = positions[None, :] <= (pref + torch.arange(nq, device=device)[:, None])
+            visible &= positions[None, :] < nk
+            logits.masked_fill_(~visible, float("-inf"))
+            ref[h, offset : offset + nq, : page_counts[batch]] = logits.reshape(nq, page_counts[batch], 128).amax(-1)
+        offset += nq
+    # Existing BF16 index-score tolerance, comparing exactly the quantized
+    # stored values; quantization distortion is not counted as kernel error.
+    torch.testing.assert_close(scores, ref, atol=2e-2, rtol=2e-2)
+
+
+def swizzle_scales(scales):
+    rows = scales.numel() // 8
+    row = torch.arange(rows, device=scales.device)[:, None]
+    col = torch.arange(8, device=scales.device)[None, :]
+    offsets = ((row // 128) * 2 + col // 4) * 512 + (row % 32) * 16 + ((row % 128) // 32) * 4 + col % 4
+    result = torch.empty(rows * 8, dtype=torch.uint8, device=scales.device)
+    result[offsets.flatten()] = scales.view(torch.uint8).flatten()
+    return result
+
+
+@pytest.mark.minimax_m3_sparse_attn
+@_requires_blackwell
+@pytest.mark.parametrize("gqa", [1, 4, 16])
+@pytest.mark.parametrize("q_fp8", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_nvfp4_sparse_attention(gqa, q_fp8, empty, index_fmt=None):
+    torch.manual_seed(27)
+    nq, nk, heads_k = 17, 1025 if index_fmt else 257, 2
+    page_count = (nk + 127) // 128
+    device = "cuda"
+    q = torch.randn((nq, heads_k * gqa, 128), device=device, dtype=torch.bfloat16) * 0.5
+    if q_fp8:
+        q = q.to(torch.float8_e4m3fn)
+    kp = torch.randint(0, 256, (page_count, heads_k, 128, 64), device=device, dtype=torch.uint8)
+    vp = torch.randint(0, 256, kp.shape, device=device, dtype=torch.uint8)
+    ks = (torch.rand((page_count, heads_k, 128, 8), device=device) * 0.5 + 0.125).to(torch.float8_e4m3fn)
+    vs = (torch.rand(ks.shape, device=device) * 0.5 + 0.125).to(torch.float8_e4m3fn)
+    kg, vg = torch.tensor(0.25, device=device), torch.tensor(0.5, device=device)
+    packed = torch.cat((kp, vp), -1)
+    pages = torch.randperm(page_count, device=device).to(torch.int32)[None]
+    selected = torch.full((heads_k, nq, 4), -1, device=device, dtype=torch.int32)
+    if not empty:
+        selected[..., :3] = torch.arange(3, device=device, dtype=torch.int32)
+    cu = torch.tensor([0, nq], device=device, dtype=torch.int32)
+    seq = torch.tensor([nk], device=device, dtype=torch.int32)
+    prefix = torch.tensor([nk - nq], device=device, dtype=torch.int32)
+    if index_fmt:
+        iq = torch.randint(0, 256, (nq, heads_k, 64), device=device, dtype=torch.uint8)
+        ik = torch.randint(0, 256, (page_count, heads_k, 128, 64), device=device, dtype=torch.uint8)
+        groups, scale = (4, 127) if index_fmt == "mxfp4" else (8, 56)
+        iqs = torch.full((*iq.shape[:2], groups), scale, device=device, dtype=torch.uint8)
+        iks = torch.full((*ik.shape[:3], groups), scale, device=device, dtype=torch.uint8)
+        scores = minimax_m3_index_score(
+            iq, ik, pages, cu, seq, prefix, nq, nk, heads_k, fp4_format=index_fmt, q_scale=iqs, k_scale=iks
+        )
+        selected = minimax_m3_index_topk(scores, cu, prefix, nq, 4, 1, 1)
+    output = torch.empty(q.shape, device=device, dtype=torch.bfloat16)
+    ks_storage, vs_storage = swizzle_scales(ks), swizzle_scales(vs)
+    minimax_m3_sparse_attn(
+        q,
+        packed,
+        selected,
+        pages,
+        cu,
+        seq,
+        prefix,
+        nq,
+        heads_k,
+        128**-0.5,
+        output,
+        kv_format="nvfp4",
+        k_scale=ks_storage,
+        v_scale=vs_storage,
+        k_global_scale=kg,
+        v_global_scale=vg,
+    )
+    expected = torch.zeros_like(output)
+    if not empty:
+        dk = unpack_fp4(kp, ks, "nvfp4")
+        dv = unpack_fp4(vp, vs, "nvfp4")
+        # Reference the stored NVFP4 values, not an additional FP8 rounding
+        # selected by the implementation's query dtype.
+        dk, dv = dk.float(), dv.float()
+        for h in range(heads_k):
+            keys = dk[pages[0].long(), h].reshape(-1, 128)
+            values = dv[pages[0].long(), h].reshape(-1, 128)
+            for t in range(nq):
+                count = nk - nq + t + 1
+                query = q[t, h * gqa : (h + 1) * gqa].float()
+                positions = torch.arange(page_count * 128, device=device)
+                visible = positions < count
+                visible &= (positions[:, None] // 128 == selected[h, t][None, :]).any(-1)
+                logits = query @ keys[visible].T * (128**-0.5) * kg
+                expected[t, h * gqa : (h + 1) * gqa] = (logits.softmax(-1) @ values[visible] * vg).to(torch.bfloat16)
+    assert torch.isfinite(output).all()
+    atol, rtol = (6e-2, 8e-2) if q_fp8 else (2e-2, 2e-2)
+    torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+@_requires_blackwell
+@pytest.mark.parametrize("index_fmt", ["mxfp4", "nvfp4"])
+@pytest.mark.parametrize("q_fp8", [False, True])
+def test_quantized_full_chain(index_fmt, q_fp8):
+    """Real Top-K selection feeds packed attention, including forced pages."""
+    test_nvfp4_sparse_attention(4, q_fp8, False, index_fmt=index_fmt)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+@_requires_blackwell
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8])
+def test_packed_index_requires_format(dtype):
+    q = torch.zeros((1, 1, 64), device="cuda", dtype=dtype)
+    k = torch.zeros((1, 128, 64), device="cuda", dtype=dtype)
+    pages = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    cu = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    seq = torch.tensor([128], device="cuda", dtype=torch.int32)
+    prefix = seq - 1
+    with pytest.raises(ValueError, match="explicit fp4_format"):
+        minimax_m3_index_score(q, k, pages, cu, seq, prefix, 1, 128, 1)
+    with pytest.raises(ValueError, match="explicit fp4_format"):
+        minimax_m3_index_decode(q, k, pages, seq, 128, 4, 0, 0, 1, 1, 1)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+@_requires_blackwell
+@pytest.mark.parametrize("gqa", [1, 4, 16])
+@pytest.mark.parametrize("q_fp8", [False, True])
+def test_sm100_scalar_scale_loop(gqa, q_fp8):
+    """Exercise scalar KV scales through the public prefill entry."""
+    data = make_data((257, 513), 2, gqa, decode=False, prefix_lens=(240, 496), mode="fp8_kv")
+    q = data.q.to(torch.float8_e4m3fn) if q_fp8 else data.q
+    ks, vs = torch.tensor(0.37, device="cuda"), torch.tensor(0.73, device="cuda")
+    data = replace(data, q=q.to(torch.bfloat16), k_scale=ks, v_scale=vs)
+    selected = torch.arange(4, device="cuda", dtype=torch.int32).expand(2, q.shape[0], 4).clone()
+    selected[:, :17, 3] = -1
+    output = torch.empty(q.shape, device="cuda", dtype=torch.bfloat16)
+    minimax_m3_sparse_attn(
+        q,
+        data.kv_cache,
+        selected,
+        data.block_table,
+        data.cu_q,
+        data.seq_lens,
+        data.prefix_lens,
+        17,
+        2,
+        data.sm_scale,
+        output,
+        k_scale=ks,
+        v_scale=vs,
+    )
+    torch.testing.assert_close(output, _ref_sparse_attn(data, selected), atol=0.06, rtol=0.08)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+@_requires_blackwell
+@pytest.mark.parametrize("q_fp8", [False, True])
+def test_nvfp4_graph_replay_refreshes_cache(q_fp8):
+    """Graph replay reads current packed values, not values from capture."""
+    nq, nk, npage = 2048, 2305, 19
+    q = torch.randn((nq, 4, 128), device="cuda", dtype=torch.bfloat16)
+    if q_fp8:
+        q = q.to(torch.float8_e4m3fn)
+    kv = torch.randint(0, 256, (npage, 1, 128, 128), device="cuda", dtype=torch.uint8)
+    scales = swizzle_scales(torch.ones((npage, 1, 128, 8), device="cuda").to(torch.float8_e4m3fn))
+    global_scale = torch.ones((), device="cuda")
+    selected = torch.tensor([0, 1, 2, -1], device="cuda", dtype=torch.int32).expand(1, nq, 4).contiguous()
+    pages = torch.randperm(npage, device="cuda").int()[None]
+    cu = torch.tensor([0, nq], device="cuda", dtype=torch.int32)
+    seq = torch.tensor([nk], device="cuda", dtype=torch.int32)
+    prefix = seq - nq
+    output = torch.empty(q.shape, device="cuda", dtype=torch.bfloat16)
+
+    def run():
+        minimax_m3_sparse_attn(
+            q,
+            kv,
+            selected,
+            pages,
+            cu,
+            seq,
+            prefix,
+            nq,
+            1,
+            128**-0.5,
+            output,
+            kv_format="nvfp4",
+            k_scale=scales,
+            v_scale=scales,
+            k_global_scale=global_scale,
+            v_global_scale=global_scale,
+        )
+
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    assert output.float().abs().max() > 0
+    kv.zero_()
+    graph.replay()
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+@_requires_blackwell
+@pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
+@pytest.mark.parametrize("qlen,topk", [(1, 4), (4, 4), (4, 16)])
+def test_fp4_decode_score_out_and_topk(fmt, qlen, topk):
+    torch.manual_seed(31)
+    device = "cuda"
+    heads, total_pages, max_blocks = 4, 14, 9
+    q = torch.randint(0, 256, (2 * qlen, heads, 64), device=device, dtype=torch.uint8)
+    k = torch.randint(0, 256, (total_pages, 128, 64), device=device, dtype=torch.uint8)
+    vec = 32 if fmt == "mxfp4" else 16
+    qs = torch.full((*q.shape[:2], 128 // vec), 127 if vec == 32 else 56, device=device, dtype=torch.uint8)
+    ks = torch.full((*k.shape[:2], 128 // vec), 127 if vec == 32 else 56, device=device, dtype=torch.uint8)
+    permutation = torch.randperm(total_pages, device=device).to(torch.int32)
+    pages = torch.full((2, 9), -1, device=device, dtype=torch.int32)
+    pages[0, :5], pages[1] = permutation[:5], permutation[5:]
+    seq = torch.tensor([513, 1025], device=device, dtype=torch.int32)
+    cu = torch.arange(3, device=device, dtype=torch.int32) * qlen
+    prefix = seq - qlen
+    raw = minimax_m3_index_score(
+        q, k, pages, cu, seq, prefix, qlen, 1025, heads, fp4_format=fmt, q_scale=qs, k_scale=ks
+    )[..., :max_blocks]
+    expected = raw.clone()
+    for batch in range(2):
+        for token in range(qlen):
+            qid = batch * qlen + token
+            visible = (int(seq[batch]) - qlen + token + 128) // 128
+            expected[:, qid, : min(1, visible)] = 1.0e30
+            expected[:, qid, max(0, visible - 2) : visible] = 1.0e29
+    score_out = torch.full((heads, max_blocks, 2 * qlen), float("nan"), device=device).transpose(1, 2)
+    out = torch.full((heads, 2 * qlen + 3, topk), -99, device=device, dtype=torch.int32)
+    selected = minimax_m3_index_decode(
+        q,
+        k,
+        pages,
+        seq,
+        1025,
+        topk,
+        1,
+        2,
+        heads,
+        qlen,
+        qlen,
+        out=out,
+        score_out=score_out,
+        fp4_format=fmt,
+        q_scale=qs,
+        k_scale=ks,
+    )
+    assert selected.data_ptr() == out.data_ptr()
+    assert torch.all(out[:, 2 * qlen :] == -99)
+    torch.testing.assert_close(score_out, expected, atol=0.02, rtol=0.02)
+    selected_scores = score_out.gather(-1, selected.clamp(min=0).long())
+    selected_scores = selected_scores.masked_fill(selected < 0, float("-inf"))
+    padded = torch.nn.functional.pad(expected, (0, max(0, topk - max_blocks)), value=float("-inf"))
+    best_scores = padded.topk(topk, dim=-1).values
+    torch.testing.assert_close(selected_scores.sort(-1).values, best_scores.sort(-1).values, atol=0.02, rtol=0.02)

@@ -13,6 +13,27 @@
 # limitations under the License.
 
 
+"""MSA latency benchmarks; select an entry point from the repository root.
+
+Original BF16-Q benchmark, optional vLLM baseline::
+
+    pytest -q -s benchmark/test_minimax_sparse_attention_benchmark.py::test_msa_benchmark
+
+Manual SM100 matrix, MiniMax baseline (120 configs, attention + full chain)::
+
+    pytest -q -s benchmark/test_minimax_sparse_attention_benchmark.py::test_msa_minimax_benchmark
+
+Use existing --stage/--dtype/-k filters and --record json --output PATH.
+The SM100 entry requires MiniMax-AI/MSA installed from source (including
+submodules), its CUDA C++/CuTe dependencies, and TE NVFP4Quantizer. Validated:
+MSA 80434d7f67877c6570ca19cac444b84bc9855dac, CUTLASS DSL 4.5.3, Quack 0.5.0,
+CUDA 13.4, TE 2.19.0, FlagTree 0.7.0+git317a0249 (Triton 3.6.0), NGC 26.09.
+Disable forced TF32 for shared reference Top-K preparation. Dependencies
+are never installed automatically; ordinary SM90 CI does not need MiniMax.
+In non-root containers, point MINFER_FMHA_CACHE_DIR, MM_SPARSE_ATTN_AOT_CACHE,
+XDG_CACHE_HOME and PyTorch/CUDA compiler caches at writable directories.
+"""
+
 from __future__ import annotations
 
 
@@ -1079,3 +1100,114 @@ def test_msa_benchmark(request, record_property) -> None:
         rep=int(request.config.getoption("--iter", default=DEFAULT_REP)),
     )
     run_benchmark(args, record_property)
+
+
+def pytest_generate_tests(metafunc):
+    if "msa_benchmark_case" not in metafunc.fixturenames:
+        return
+    from test_minimax_sparse_attention import msa_cases
+
+    cases = msa_cases(stage=metafunc.config.getoption("--stage"),
+                      dtype=metafunc.config.getoption("--dtype"))
+    if metafunc.config.getoption("--quick"):
+        cases = [c for c in cases if c.tp == 4 and c.label in ("P1", "D1")]
+    metafunc.parametrize("msa_benchmark_case", cases, ids=lambda case: case.id)
+
+
+def _minimax_functions(data, selected):
+    """Public MiniMax APIs, automatic backend choice, native input layouts."""
+    import fmha_sm100 as mm
+    from fmha_sm100.sparse import (
+        build_k2q_csr, fp4_indexer_block_scores, sparse_atten_func, sparse_atten_nvfp4_kv_func,
+    )
+
+    c = data.case
+    nb = data.pages.shape[1]
+    cuk = torch.arange(c.batch + 1, device="cuda", dtype=torch.int32) * c.kv
+    cup = torch.arange(c.batch + 1, device="cuda", dtype=torch.int32) * nb
+    flat_pages = data.pages.flatten().contiguous()
+    qlens = torch.full((c.batch,), c.q, dtype=torch.int32)
+    klens = torch.full((c.batch,), c.kv, dtype=torch.int32)
+    if c.packed:
+        def scores():
+            return fp4_indexer_block_scores(
+                data.iq, data.ik, data.iqs, data.iks, data.cuq, cuk, cup,
+                max_seqlen_q=c.q, max_seqlen_k=c.kv, kv_indices=flat_pages,
+                fp4_format="nvfp4", causal=True, scale_layout="public")
+    else:
+        index_plan = mm.fmha_sm100_plan(qlens, klens, c.heads, causal=True, page_size=128, output_maxscore=True)
+        index_k = data.ik.unsqueeze(1).contiguous()
+
+        def scores():
+            return mm.fmha_sm100(data.iq, index_k, index_k, index_plan, sm_scale=1.,
+                                 kv_indices=flat_pages, output_o=False, output_maxscore=True)[1]
+
+    def select():
+        return mm.sparse_topk_select(scores(), c.topk, num_valid_pages=nb)
+
+    if c.dtype in ("bf16", "fp8"):
+        plan = mm.fmha_sm100_plan(qlens, klens, c.heads * c.gqa, num_kv_heads=c.heads,
+                                 qo_offset=klens-qlens, page_size=128, kv_block_num=c.topk,
+                                 causal=True, use_fp8_kvcache=c.dtype == "fp8")
+        output = torch.empty_like(data.output)
+
+        def attention(ids):
+            return mm.fmha_sm100(data.q, data.k, data.v, plan, kv_indices=flat_pages,
+                                 kv_block_indexes=ids, sm_scale=128**-.5, out=output,
+                                 output_maxscore=False, output_o=True)[0]
+
+        fixed = selected.permute(1, 0, 2).contiguous()
+        return lambda: attention(fixed), lambda: attention(select()), "fmha_sm100(auto)"
+
+    def attention(ids):
+        ptr, rows, schedule = build_k2q_csr(
+            ids, data.cuq, cuk, 128, total_k=c.batch*c.kv, max_seqlen_k=c.kv,
+            max_seqlen_q=c.q, total_rows=c.batch*nb, qhead_per_kv=c.gqa, return_schedule=True)
+        kwargs = dict(cu_seqlens_q=data.cuq, cu_seqlens_k=cuk, max_seqlen_q=c.q,
+                      max_seqlen_k=c.kv, causal=True, softmax_scale=128**-.5,
+                      page_table=data.pages, seqused_k=data.seq, schedule=schedule,
+                      return_softmax_lse=False)
+        if c.packed:
+            return sparse_atten_nvfp4_kv_func(data.q, data.k, data.v, data.ks_storage, data.vs_storage,
+                                             data.kg, data.vg, ptr, rows, c.topk, **kwargs)
+        return sparse_atten_func(data.q, data.k, data.v, ptr, rows, c.topk, **kwargs)
+
+    return (lambda: attention(selected), lambda: attention(select().permute(1, 0, 2).contiguous()),
+            "sparse_atten_nvfp4_kv_func" if c.packed else "sparse_atten_func")
+
+
+@pytest.mark.minimax_m3_sparse_attn
+def test_msa_minimax_benchmark(msa_benchmark_case, request, record_property):
+    """Manual SM100 matrix: performance only, no reference-result filtering."""
+    if not test_backend.is_nvidia() or not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("MiniMax MSA benchmark requires NVIDIA SM100")
+    # Selecting this entry point requires a working MiniMax installation.
+    import fmha_sm100
+    from test_minimax_sparse_attention import DTYPES, make_msa_inputs
+    from flag_attn.testing.minimax_sparse_attention import reference_selection
+
+    c = msa_benchmark_case
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        data = make_msa_inputs(c)
+        # Shared reference-owned Top-K is preparation, not a correctness gate.
+        # Each timed full chain recomputes its own native selection.
+        selected = reference_selection(data)
+        minimax_attention, minimax_chain, entry = _minimax_functions(data, selected)
+        functions = {
+            "flag_attention": lambda: data.attention(selected), "minimax_attention": minimax_attention,
+            "flag_chain": lambda: data.attention(data.select()), "minimax_chain": minimax_chain,
+        }
+        values = {name: bench_fn(fn, DEFAULT_WARMUP, DEFAULT_REP) for name, fn in functions.items()}
+        for phase in ("attention", "chain"):
+            recorder = BenchmarkRecorder(record_property, op_name="minimax_m3_sparse_attn",
+                                         dtype=DTYPES[c.dtype], mode=c.stage, baseline="MiniMax MSA",
+                                         baseline_entry=entry, baseline_module=fmha_sm100.__file__)
+            shape = (c.batch, c.q, c.kv, c.heads, c.heads * c.gqa)
+            recorder.add(shape_detail=[shape, {"phase": phase}], case_id=c.id,
+                         latency=values["flag_" + phase], latency_base=values["minimax_" + phase])
+            recorder.record()
+        print(c.id, {name + "_us": round(value * 1000, 3) for name, value in values.items()}, flush=True)
+    finally:
+        torch.set_float32_matmul_precision(previous)
