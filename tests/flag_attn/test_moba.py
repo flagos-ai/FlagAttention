@@ -486,6 +486,10 @@ def test_noncontiguous_inputs_match_naive():
         _assert_close(name, actual, expected)
 
 
+@pytest.mark.skipif(
+    not test_backend.is_nvidia(),
+    reason="tests the generic NVIDIA streaming top-k implementation contract",
+)
 @pytest.mark.parametrize("routed_topk", [7, 33, 63])
 @torch.no_grad()
 def test_streaming_topk_across_chunk_tiles(routed_topk):
