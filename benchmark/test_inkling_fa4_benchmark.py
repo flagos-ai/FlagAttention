@@ -34,7 +34,6 @@ from functools import cache, partial
 from pathlib import Path
 from typing import Any, Callable
 
-import pandas as pd
 import torch
 import torch.nn.functional as F
 
@@ -303,6 +302,24 @@ def resolve_backends(names: list[str], flash_root: str | None) -> dict[str, Back
 
 
 
+def _format_columns(columns: list[tuple[str, int]]) -> str:
+    return "  ".join(f"{value:>{width}s}" for value, width in columns)
+
+
+def _print_results(rows, providers) -> None:
+    columns = ["case", *(f"{name} (ms)" for name in providers)]
+    widths = [max([len("case")] + [len(row["case"]) for row in rows])]
+    widths.extend(max(len(column), 12) for column in columns[1:])
+    header = _format_columns(list(zip(columns, widths)))
+    separator = "-" * len(header)
+    print(separator)
+    print(header)
+    print(separator)
+    for row in rows:
+        values = [row["case"], *(f"{row[column]:.6f}" for column in columns[1:])]
+        print(_format_columns(list(zip(values, widths))), flush=True)
+
+
 class InklingFA4Benchmark(Benchmark):
     """Adapt the local template to multiple providers and an optional baseline."""
 
@@ -390,11 +407,8 @@ class InklingFA4Benchmark(Benchmark):
                             latency=latencies["triton"],
                             latency_base=latencies.get("official_cute"),
                         )
-                # Match perf_report's table output without its plotting imports.
                 print(f"inkling_fa4-bf16-splits-{splits}-rel-{self.args.rel}:")
-                print(pd.DataFrame(
-                    rows, columns=["case", *(f"{name} (ms)" for name in self.backends)],
-                ).to_string(), flush=True)
+                _print_results(rows, self.backends)
                 recorder.record()
 
 
