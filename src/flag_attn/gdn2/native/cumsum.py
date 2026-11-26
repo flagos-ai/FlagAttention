@@ -28,7 +28,6 @@ def chunk_local_cumsum_vector_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    scale,
     B: tl.constexpr,
     H: tl.constexpr,
     S: tl.constexpr,
@@ -88,7 +87,7 @@ def chunk_local_cumsum_vector_kernel(
             (1, 0),
         )
     values = tl.load(p_s, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
-    result = tl.cumsum(values * scale, axis=0, reverse=REVERSE)
+    result = tl.cumsum(values, axis=0, reverse=REVERSE)
     tl.store(p_o, result.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -99,9 +98,7 @@ def chunk_local_cumsum(
     cu_seqlens: torch.Tensor | None = None,
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
-    *,
-    scale: float = 1.0,
-    chunk_indices: torch.Tensor | None = None,
+    **kwargs,
 ) -> torch.Tensor:
     """Compute cumsum independently inside each chunk of a 4-D gate tensor."""
     if g.ndim != 4:
@@ -115,6 +112,7 @@ def chunk_local_cumsum(
         B, H, T, S = g.shape
     else:
         B, T, H, S = g.shape
+    chunk_indices = kwargs.get("chunk_indices")
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     num_chunks = triton.cdiv(T, chunk_size) if cu_seqlens is None else len(chunk_indices)
@@ -130,7 +128,6 @@ def chunk_local_cumsum(
         cu_seqlens,
         chunk_indices,
         T=T,
-        scale=scale,
         B=B,
         H=H,
         S=S,

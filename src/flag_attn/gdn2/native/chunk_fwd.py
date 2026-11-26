@@ -16,6 +16,7 @@ from .cumsum import chunk_local_cumsum
 from .gate import kda_gate_chunk_cumsum
 from .output import chunk_gla_fwd_o_gk
 
+LN2 = 0.6931471805599453
 RCP_LN2 = 1.4426950408889634
 
 
@@ -69,11 +70,10 @@ def chunk_gdn2_fwd(
         )
     else:
         g = chunk_local_cumsum(
-            g=g,
+            g=g.float() * RCP_LN2,
             chunk_size=chunk_size,
             cu_seqlens=cu_seqlens,
             output_dtype=torch.float32,
-            scale=RCP_LN2,
             chunk_indices=chunk_indices,
         )
     w_wy, u_wy, qg, kg, Aqk, Akk = chunk_gdn2_fwd_intra(
@@ -100,8 +100,7 @@ def chunk_gdn2_fwd(
         k=kg,
         w=w_wy,
         u=u_wy,
-        gk=g,
-        gk_base2=True,
+        gk=g * LN2,
         initial_state=recurrence_initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,

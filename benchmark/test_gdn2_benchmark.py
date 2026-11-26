@@ -19,16 +19,13 @@ import math
 import pytest
 import torch
 
+import flag_attn
+from flag_attn.testing import backend as test_backend
+
 try:
     from benchmark.recording import BenchmarkRecorder
 except ModuleNotFoundError:
     from recording import BenchmarkRecorder
-
-from flag_attn.testing import backend as test_backend
-from flag_attn import chunk_gdn2, runtime
-from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
-from flag_attn.runtime.backend._nvidia.gdn2.chunk import supports_fused_gdn2
-
 
 ALL_SHAPES = [
     (2, 512, 8, 64, 64),
@@ -75,27 +72,9 @@ def _make_inputs(shape: tuple[int, int, int, int, int], dtype: torch.dtype):
 
 
 @torch.inference_mode()
-def _native_forward(inputs):
-    q, k, v, g, b, w, initial_state = inputs
-    return chunk_gdn2_fwd(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        b=b,
-        w_gate=w,
-        scale=q.shape[-1] ** -0.5,
-        initial_state=initial_state,
-        output_final_state=True,
-        chunk_size=64,
-        disable_recompute=True,
-    )[:2]
-
-
-@torch.inference_mode()
 def _public_forward(inputs):
     q, k, v, g, b, w, initial_state = inputs
-    return chunk_gdn2(
+    return flag_attn.chunk_gdn2(
         q,
         k,
         v,
@@ -105,12 +84,6 @@ def _public_forward(inputs):
         scale=q.shape[-1] ** -0.5,
         initial_state=initial_state,
         output_final_state=True,
-        chunk_size=(
-            16
-            if runtime.device.vendor_name in {"mthreads", "metax"}
-            or (test_backend.is_nvidia() and supports_fused_gdn2(q.device))
-            else 64
-        ),
     )
 
 
@@ -128,40 +101,28 @@ def run_benchmark(
 
     if not test_backend.supports_operator("chunk_gdn2"):
         raise RuntimeError("GDN2 benchmark requires an available accelerator")
-    compare_native = test_backend.is_nvidia() and supports_fused_gdn2(torch.device(test_backend.device))
-    baseline_name = "FlagAttention native Triton" if compare_native else None
-
     dtype = getattr(torch, args.dtype)
     shapes = args.shape or (ALL_SHAPES if args.full else DEFAULT_SHAPES)
     print(f"GPU: {test_backend.get_device_name()} | dtype: {args.dtype}")
-    print(f"baseline: {baseline_name or 'unavailable'}")
-    print("B,T,H,K,V                       base_ms   public_ms   base/public")
-    print("-" * 66)
+    print("B,T,H,K,V                       public_ms")
+    print("-" * 42)
     recorder = BenchmarkRecorder(
         record_property,
         op_name="chunk_gdn2",
         dtype=str(dtype),
-        baseline=baseline_name,
         phase="forward",
     )
     for shape in shapes:
         torch.manual_seed(42)
         inputs = _make_inputs(shape, dtype)
-        if compare_native:
-            _native_forward(inputs)
         _public_forward(inputs)
         test_backend.device_fn.synchronize()
-        native_ms = test_backend.do_bench(
-            lambda: _native_forward(inputs), warmup=args.warmup, rep=args.rep
-        ) if compare_native else None
         public_ms = test_backend.do_bench(
             lambda: _public_forward(inputs), warmup=args.warmup, rep=args.rep
         )
         shape_text = ",".join(str(item) for item in shape)
-        baseline_text = "N/A" if native_ms is None else f"{native_ms:.4f}"
-        speedup_text = "N/A" if native_ms is None else f"{native_ms / public_ms:.3f}x"
-        print(f"{shape_text:<28} {baseline_text:>10} {public_ms:>11.4f} {speedup_text:>11}")
-        recorder.add(shape_detail=shape, latency_base=native_ms, latency=public_ms)
+        print(f"{shape_text:<28} {public_ms:>12.4f}")
+        recorder.add(shape_detail=shape, latency=public_ms)
         del inputs
         test_backend.device_fn.empty_cache()
     recorder.record()
