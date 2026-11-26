@@ -1,4 +1,5 @@
 # Copyright 2026 FlagOS Contributors
+# Copyright 2024 SageAttention Team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +26,14 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
                     ):
     lo, hi = 0, kv_len
+    if STAGE == 1:
+        hi = start_m * BLOCK_M
+    elif STAGE == 2:
+        lo = tl.multiple_of(start_m * BLOCK_M, BLOCK_M)
+        hi = tl.minimum((start_m + 1) * BLOCK_M, kv_len)
+        K_ptrs += lo * stride_kn
+        K_scale_ptr += lo // BLOCK_N
+        V_ptrs += lo * stride_vn
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_block = None
@@ -43,7 +52,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
 
             qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
 
-            if mask_block is not None:
+            if STAGE == 2:
+                causal_mask = k_mask & (offs_m[:, None] >= start_n + offs_n[None, :])
+                qk += tl.where(causal_mask, 0, float("-inf"))
+            elif mask_block is not None:
                 if mask_block.dtype == tl.int1:
                     qk = qk + tl.where(mask_block, 0, -1.0e6)
                 else:
@@ -118,6 +130,11 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
                                     BLOCK_M, HEAD_DIM, BLOCK_N,
                                     4 - STAGE, offs_m, offs_n
                                     )
+    if STAGE == 3:
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
+                                        start_m, mask_ptrs, stride_maskn,
+                                        BLOCK_M, HEAD_DIM, BLOCK_N,
+                                        2, offs_m, offs_n)
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
 
@@ -127,10 +144,17 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
         tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
 
 def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
-            output_dtype=torch.float16, return_lse=False, maxnreg=None):
+            output_dtype=torch.float16, return_lse=False, maxnreg=None, is_causal=True):
+    """Run block-quantized attention; causal self-attention is enabled by default.
+
+    As in upstream SageAttention, causal attention requires equal Q/K lengths
+    and cannot be combined with an explicit attention mask.
+    """
+    if is_causal and attn_mask is not None:
+        raise ValueError("is_causal cannot be combined with attn_mask")
     BLOCK_M = 128
     BLOCK_N = 64
-    stage = 1
+    stage = 3 if is_causal else 1
 
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
 
@@ -152,6 +176,9 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
         stride_bz_o, stride_h_o, stride_seq_o = o.stride(0), o.stride(2), o.stride(1)
     else:
         raise ValueError(f"tensor_layout {tensor_layout} not supported")
+
+    if is_causal and qo_len != kv_len:
+        raise ValueError("Q and K sequence lengths must be equal for causal attention")
 
     if attn_mask is not None:
         stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask = attn_mask.stride(0), attn_mask.stride(1), attn_mask.stride(2), attn_mask.stride(3)
@@ -185,7 +212,7 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,
         STAGE=stage, RETURN_LSE=return_lse,
         num_warps=4 if head_dim == 64 else 8,
-        num_stages=3 if head_dim == 64 else 4,
+        num_stages=4 if is_causal or head_dim == 128 else 3,
         **launch_options)
 
     return o, lse
