@@ -14,7 +14,6 @@
 
 
 import math
-from pathlib import Path
 
 import pytest
 import torch
@@ -23,7 +22,6 @@ from flag_attn.testing import backend as test_backend
 from flag_attn.testing.log_linear_attn import log_linear_attn_reference
 
 pytestmark = pytest.mark.log_linear_attn
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _make_inputs(batch, sequence, heads, dim):
@@ -54,13 +52,21 @@ def _assert_close(name, expected, actual, ratio=0.004):
 
 
 def test_chunk_log_linear_attn_public_export():
-    root_init = (REPO_ROOT / "src/flag_attn/__init__.py").read_text()
-    operator_init = (
-        REPO_ROOT / "src/flag_attn/FLA/log_linear_attn/__init__.py"
-    ).read_text()
-    assert '"chunk_log_linear_attn"' in root_init
-    assert "flag_attn.FLA.log_linear_attn" in root_init
-    assert "from flag_attn.FLA.log_linear_attn.chunk_tle import" in operator_init
+    import flag_attn
+    from flag_attn.runtime.backend import resolve_operator
+
+    exports = (
+        ("log_linear_attn", "flag_attn.FLA.log_linear_attn.chunk_tle"),
+        ("chunk_log_linear_attn", "flag_attn.FLA.log_linear_attn"),
+    )
+
+    for name, module in exports:
+        assert name in flag_attn.__all__
+        actual = getattr(flag_attn, name)
+        assert callable(actual), f"{name} is not callable"
+
+        expected = resolve_operator(name, module, name)
+        assert actual is expected, f"{name} resolves to an unexpected implementation"
 
 
 @pytest.mark.skipif(not test_backend.supports_operator("log_linear_attn", tle=True), reason="selected Log-Linear implementation is unavailable")
