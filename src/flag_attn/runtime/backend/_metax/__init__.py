@@ -23,7 +23,7 @@ _OPERATOR_EXPORTS = {
     "chunk_gdn2": (".FLA.gdn2", "chunk_gdn2"),
     "chunk_gla": (".FLA.gla", "chunk_gla"),
     "chunk_kda": (".FLA.kda", "chunk_kda"),
-    "chunk_kda_fwd_infer": (".FLA.kda.chunk_kda", "chunk_kda_fwd_infer"),
+    "chunk_kda_fwd_infer": (".FLA.kda.chunk", "chunk_kda_fwd_infer"),
     "fused_attnres": (".FLA.attnres.fused", "fused_attnres"),
     "minimax_m3_index_decode": (".msa", "minimax_m3_index_decode"),
     "minimax_m3_index_decode_score": (".msa", "minimax_m3_index_decode_score"),
@@ -34,11 +34,11 @@ _OPERATOR_EXPORTS = {
     "parallax_attn_with_kvcache": (".FLA.parallax", "parallax_attn_with_kvcache"),
     "parallax_decode": (".FLA.parallax", "parallax_decode"),
     "parallel_parallax": (".FLA.parallax", "parallel_parallax"),
-    "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
-    "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
-    "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),
-    "sage_attention_forward": (".sage_attention.attn_qk_int8_per_block", "forward"),
-    "sage_attention_per_block_int8": (".sage_attention.quant_per_block", "per_block_int8"),
+    "parallel_nsa": (".FLA.nsa.parallel", "parallel_nsa"),
+    "parallel_nsa_compression": (".FLA.nsa.compression", "parallel_nsa_compression"),
+    "sage_attention": (".sageattention.attn_qk_int8_per_block", "forward"),
+    "sage_attention_forward": (".sageattention.attn_qk_int8_per_block", "forward"),
+    "sage_attention_per_block_int8": (".sageattention.quant_per_block", "per_block_int8"),
 }
 
 

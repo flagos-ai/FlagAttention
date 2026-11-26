@@ -12,7 +12,7 @@ import triton
 
 from flag_attn import runtime
 
-from flag_attn.parallel_nsa.index import prepare_token_indices
+from flag_attn.nsa.index import prepare_token_indices
 from flag_attn import parallel_nsa
 
 

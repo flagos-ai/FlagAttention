@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .chunk_gla import chunk_gla
+from .chunk import chunk_gla
 
 __all__ = ["chunk_gla"]

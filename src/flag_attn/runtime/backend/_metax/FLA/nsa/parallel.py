@@ -12,18 +12,19 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.FLA.utils import autotune_cache_kwargs, exp, log
-
-from ..index import (
+from .bwd_preprocess import parallel_attn_bwd_preprocess
+from flag_attn.FLA.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_lens,
     prepare_token_indices,
 )
-from ..utils import _bitonic_merge, check_shared_mem, input_guard
-from .bwd_preprocess import parallel_attn_bwd_preprocess
 from .mean_pooling import mean_pooling
-from .parallel_nsa_compression import parallel_nsa_compression
+from .compression import parallel_nsa_compression
+from ..compat import autotune_cache_kwargs
+from ..triton_ops_helper import exp, log
+from ..utils import _bitonic_merge
+from flag_attn.utils import check_shared_mem, input_guard
 
 try:
     HAS_TLE = False
@@ -85,15 +86,21 @@ def parallel_nsa_kernel_topk(
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(
+            token_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
         T = eos - bos
         boc = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
         bos, eos = i_b * T, i_b * T + T
         boc = i_b * tl.cdiv(T, BS)
 
-    p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
+    p_q = tl.make_block_ptr(
+        q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0)
+    )
 
     # the Q block is kept in the shared memory throughout the whole kernel
     # [G, BK]
@@ -118,7 +125,9 @@ def parallel_nsa_kernel_topk(
         for i_c in range(0, NC, BC):
             o_c = i_c + tl.arange(0, BC)
 
-            p_k = tl.make_block_ptr(k + (boc * H + i_h) * K, (K, TC), (1, H * K), (0, i_c), (BK, BC), (0, 1))
+            p_k = tl.make_block_ptr(
+                k + (boc * H + i_h) * K, (K, TC), (1, H * K), (0, i_c), (BK, BC), (0, 1)
+            )
             # [BK, BC]
             b_k = tl.load(p_k, boundary_check=(0, 1))
 
@@ -152,7 +161,9 @@ def parallel_nsa_kernel_topk(
     for i_c in range(0, tl.cdiv(i_t + 1, BS), BC):
         o_c = i_c + tl.arange(0, BC)
 
-        p_k = tl.make_block_ptr(k + (boc * H + i_h) * K, (K, TC), (1, H * K), (0, i_c), (BK, BC), (0, 1))
+        p_k = tl.make_block_ptr(
+            k + (boc * H + i_h) * K, (K, TC), (1, H * K), (0, i_c), (BK, BC), (0, 1)
+        )
         # [BK, BC]
         b_k = tl.load(p_k, boundary_check=(0, 1))
         # [G, BC]
@@ -160,7 +171,9 @@ def parallel_nsa_kernel_topk(
         b_s = tl.where(o_c < IC, b_s, float("-inf"))
         # [G, BC]
         # the 1st and the last 2 blocks are always selected
-        b_p = tl.where((o_c == 0) | ((o_c == IC - 1) | (o_c == IC)), 1.0, exp(b_s - b_lse[:, None]))
+        b_p = tl.where(
+            (o_c == 0) | ((o_c == IC - 1) | (o_c == IC)), 1.0, exp(b_s - b_lse[:, None])
+        )
         # the importance scores of the current block
         # [BC]
         b_i, b_ip = tl.sum(b_p, 0), b_i
@@ -175,14 +188,18 @@ def parallel_nsa_kernel_topk(
             b_i, o_i = _bitonic_merge(b_i, o_i.to(tl.int32), n_dims, False, n_dims)
             b_i_new = b_ip * m_i + b_i * (1 - m_i)
             o_i_new = o_ip * m_i + o_i * (1 - m_i)
-            b_i, o_i = _bitonic_merge(b_i_new, o_i_new.to(tl.int32), n_dims, True, n_dims)
+            b_i, o_i = _bitonic_merge(
+                b_i_new, o_i_new.to(tl.int32), n_dims, True, n_dims
+            )
         else:
             b_i, o_i = _bitonic_merge(b_i, o_i.to(tl.int32), n_dims, True, n_dims)
 
     m_top = tl.arange(0, BC // S) == 0
     b_top = tl.sum(m_top[:, None] * tl.reshape(o_i, [BC // S, S]), 0)
 
-    p_b = tl.make_block_ptr(block_indices + (bos + i_t) * H * S, (H * S,), (1,), (i_h * S,), (S,), (0,))
+    p_b = tl.make_block_ptr(
+        block_indices + (bos + i_t) * H * S, (H * S,), (1,), (i_h * S,), (S,), (0,)
+    )
     tl.store(p_b, b_top.to(p_b.dtype.element_ty))
 
 
@@ -231,8 +248,12 @@ def parallel_nsa_fwd_kernel(
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(
+            token_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -246,13 +267,17 @@ def parallel_nsa_fwd_kernel(
     else:
         NS = S
 
-    p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
+    p_q = tl.make_block_ptr(
+        q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0)
+    )
     # the Q block is kept in the shared memory throughout the whole kernel
     # [G, BK]
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_q = (b_q * scale).to(b_q.dtype)
 
-    p_o = tl.make_block_ptr(o + (bos + i_t) * HQ * V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0))
+    p_o = tl.make_block_ptr(
+        o + (bos + i_t) * HQ * V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0)
+    )
     p_lse = lse + (bos + i_t) * HQ + i_h * G + tl.arange(0, G)
     # [G, BV]
     b_o = tl.zeros([G, BV], dtype=tl.float32)
@@ -263,13 +288,17 @@ def parallel_nsa_fwd_kernel(
         i_s = tl.load(block_indices + i).to(tl.int32) * BS
         if i_s <= i_t and i_s >= 0:
             p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (0, i_s), (BK, BS), (0, 1))
-            p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+            p_v = tl.make_block_ptr(
+                v, (T, V), (H * V, 1), (i_s, i_v * BV), (BS, BV), (1, 0)
+            )
             # [BK, BS]
             b_k = tl.load(p_k, boundary_check=(0, 1))
             # [G, BS] — compute QK^T scores
             b_s = tl.dot(b_q, b_k)
             # b_k registers are now free — will be reused for later loads
-            b_s = tl.where((i_t >= (i_s + tl.arange(0, BS)))[None, :], b_s, float("-inf"))
+            b_s = tl.where(
+                (i_t >= (i_s + tl.arange(0, BS)))[None, :], b_s, float("-inf")
+            )
 
             # [G]
             b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
@@ -301,7 +330,9 @@ if HAS_TLE:
     @triton.heuristics(
         {
             "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-            "USE_BLOCK_COUNTS": lambda args: isinstance(args["block_counts"], torch.Tensor),
+            "USE_BLOCK_COUNTS": lambda args: isinstance(
+                args["block_counts"], torch.Tensor
+            ),
         }
     )
     @triton.autotune(
@@ -338,8 +369,12 @@ if HAS_TLE:
         i_b, i_h = i_bh // H, i_bh % H
 
         if IS_VARLEN:
-            i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
-            bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+            i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(
+                token_indices + i_t * 2 + 1
+            ).to(tl.int32)
+            bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+                cu_seqlens + i_n + 1
+            ).to(tl.int32)
             T = eos - bos
         else:
             bos, eos = i_b * T, i_b * T + T
@@ -353,7 +388,9 @@ if HAS_TLE:
         else:
             NS = S
 
-        p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
+        p_q = tl.make_block_ptr(
+            q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0)
+        )
         # [G, BK]
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_q = (b_q * scale).to(b_q.dtype)
@@ -391,7 +428,9 @@ if HAS_TLE:
 
                 # Compute QK^T scores
                 b_s = tl.dot(b_q, b_k.to(b_q.dtype))
-                b_s = tl.where((i_t >= (i_s + tl.arange(0, BS)))[None, :], b_s, float("-inf"))
+                b_s = tl.where(
+                    (i_t >= (i_s + tl.arange(0, BS)))[None, :], b_s, float("-inf")
+                )
 
                 # [G]
                 b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
@@ -402,8 +441,14 @@ if HAS_TLE:
                 b_acc = b_acc * b_r + tl.sum(b_p, 1)
 
                 # Async V load AFTER score computation
-                v_ptrs = v_base + (i_s + offs_s[:, None]) * H * V + (v_start + offs_v[None, :])
-                v_mask = ((i_s + offs_s[:, None]) < T) & ((v_start + offs_v[None, :]) < V)
+                v_ptrs = (
+                    v_base
+                    + (i_s + offs_s[:, None]) * H * V
+                    + (v_start + offs_v[None, :])
+                )
+                v_mask = ((i_s + offs_s[:, None]) < T) & (
+                    (v_start + offs_v[None, :]) < V
+                )
                 b_v = tle.load(v_ptrs, mask=v_mask, other=0.0, is_async=True)
 
                 # [G, BV]
@@ -443,7 +488,9 @@ def parallel_nsa_kernel_mask(
 
     b_i = tl.load(block_indices + i_b * T * H * S + i_t * H * S + i_h * S + i_s)
     if USE_BLOCK_COUNTS:
-        b_m = b_i * BS <= i_t and i_s < tl.load(block_counts + i_b * T * H + i_t * H + i_h)
+        b_m = b_i * BS <= i_t and i_s < tl.load(
+            block_counts + i_b * T * H + i_t * H + i_h
+        )
     else:
         b_m = b_i * BS <= i_t
 
@@ -503,8 +550,12 @@ def parallel_nsa_bwd_kernel_dq(
 
     all = B * T
     if IS_VARLEN:
-        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(
+            token_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -547,7 +598,9 @@ def parallel_nsa_bwd_kernel_dq(
         i_s = tl.load(block_indices + i).to(tl.int32) * BS
         if i_s <= i_t and i_s >= 0:
             p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (0, i_s), (BK, BS), (0, 1))
-            p_v = tl.make_block_ptr(v, (V, T), (1, H * V), (i_v * BV, i_s), (BV, BS), (0, 1))
+            p_v = tl.make_block_ptr(
+                v, (V, T), (1, H * V), (i_v * BV, i_s), (BV, BS), (0, 1)
+            )
             # [BK, BS]
             b_k = tl.load(p_k, boundary_check=(0, 1))
             # [BV, BS]
@@ -615,13 +668,19 @@ def parallel_nsa_bwd_kernel_dkv(
 
     all = B * T
     if IS_VARLEN:
-        i_n, i_s = tl.load(chunk_indices + i_s * 2).to(tl.int32), tl.load(chunk_indices + i_s * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        i_n, i_s = tl.load(chunk_indices + i_s * 2).to(tl.int32), tl.load(
+            chunk_indices + i_s * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_s * BS, 0), (BS, BK), (1, 0))
+    p_k = tl.make_block_ptr(
+        k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_s * BS, 0), (BS, BK), (1, 0)
+    )
     p_v = tl.make_block_ptr(
         v + (bos * H + i_h) * V,
         (T, V),
@@ -657,7 +716,9 @@ def parallel_nsa_bwd_kernel_dkv(
     for i in range(i_s * BS, T):
         b_m = tl.load(block_mask + (bos + i) * H * M + i_h * M + i_s)
         if b_m:
-            p_q = tl.make_block_ptr(q + (bos + i) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
+            p_q = tl.make_block_ptr(
+                q + (bos + i) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0)
+            )
             # [G, BK]
             b_q = tl.load(p_q, boundary_check=(0, 1))
             b_q = (b_q * scale).to(b_q.dtype)
@@ -720,8 +781,12 @@ def parallel_nsa_topk(
     assert BC >= 2 * S, f"BC ({BC}) must be greater than or equal to 2 * S ({S})"
 
     block_indices = torch.zeros(B, T, H, S, dtype=torch.int32, device=q.device)
-    token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
-    chunk_offsets = prepare_chunk_offsets(cu_seqlens, BS) if cu_seqlens is not None else None
+    token_indices = (
+        prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
+    )
+    chunk_offsets = (
+        prepare_chunk_offsets(cu_seqlens, BS) if cu_seqlens is not None else None
+    )
     grid = (T, B * H)
     # the 1st and the last 2 blocks are always selected
     parallel_nsa_kernel_topk[grid](
@@ -767,6 +832,8 @@ def parallel_nsa_fwd(
     else:
         BK = min(128, triton.next_power_of_2(K))
         BV = min(128, triton.next_power_of_2(V))
+    # MetaX: cap the output tile to avoid severe D=128 register pressure.
+    BV = min(BV, 64)
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
     assert NK == 1, "The key dimension can not be larger than 256"
@@ -859,7 +926,9 @@ def parallel_nsa_bwd(
 
     delta = parallel_attn_bwd_preprocess(o, do)
 
-    dq = torch.empty(NV, *q.shape, dtype=q.dtype if NV == 1 else torch.float, device=q.device)
+    dq = torch.empty(
+        NV, *q.shape, dtype=q.dtype if NV == 1 else torch.float, device=q.device
+    )
     grid = (T, NV, B * H)
     parallel_nsa_bwd_kernel_dq[grid](
         q=q,
@@ -895,8 +964,12 @@ def parallel_nsa_bwd(
     else:
         NS = triton.cdiv(T, BS)
 
-    block_mask = parallel_nsa_block_mask(block_indices, block_counts, cu_seqlens, block_size)
-    dk = torch.empty(NV, *k.shape, dtype=k.dtype if NV == 1 else torch.float, device=q.device)
+    block_mask = parallel_nsa_block_mask(
+        block_indices, block_counts, cu_seqlens, block_size
+    )
+    dk = torch.empty(
+        NV, *k.shape, dtype=k.dtype if NV == 1 else torch.float, device=q.device
+    )
     dv = torch.empty(v.shape, dtype=v.dtype, device=q.device)
 
     grid = (NV, NS, B * H)
@@ -935,12 +1008,17 @@ def parallel_nsa_bwd(
 
 
 class ParallelNSAFunction(torch.autograd.Function):
+
     @staticmethod
     @input_guard
-    def forward(ctx, q, k, v, block_indices, block_counts, block_size, scale, cu_seqlens):
+    def forward(
+        ctx, q, k, v, block_indices, block_counts, block_size, scale, cu_seqlens
+    ):
         ctx.dtype = q.dtype
 
-        token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
+        token_indices = (
+            prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
+        )
 
         o, lse = parallel_nsa_fwd(
             q=q,
@@ -1042,7 +1120,9 @@ def parallel_nsa(
             f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`. "
             f"Please flatten variable-length inputs before processing.",
         )
-    assert q.shape[2] % (k.shape[2] * 16) == 0, "Group size must be a multiple of 16 in NSA"
+    assert (
+        q.shape[2] % (k.shape[2] * 16) == 0
+    ), "Group size must be a multiple of 16 in NSA"
 
     k_cmp = mean_pooling(k, block_size, cu_seqlens)
     v_cmp = mean_pooling(v, block_size, cu_seqlens)
@@ -1067,7 +1147,9 @@ def parallel_nsa(
             scale=scale,
             cu_seqlens=cu_seqlens,
         )
-    o = o_slc = ParallelNSAFunction.apply(q, k, v, block_indices, block_counts, block_size, scale, cu_seqlens)
+    o = o_slc = ParallelNSAFunction.apply(
+        q, k, v, block_indices, block_counts, block_size, scale, cu_seqlens
+    )
     if g_slc is not None:
         o = o_slc * g_slc.unsqueeze(-1)
     if o_cmp is not None:

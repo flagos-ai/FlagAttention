@@ -11,3 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Lazy NVIDIA overrides; public stage facades remain in the generic package."""
+
+import importlib
+
+_OPERATOR_EXPORTS = {
+    "minimax_m3_index_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_score"),
+    "minimax_m3_index_decode_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode_score"),
+    "minimax_m3_index_decode": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode"),
+    "minimax_m3_sparse_attn": (".minimax_sparse_attention.sparse_attn", "minimax_m3_sparse_attn"),
+    "minimax_m3_sparse_attn_decode": (".minimax_sparse_attention.sparse_attn", "minimax_m3_sparse_attn_decode"),
+}
+
+
+def __getattr__(name):
+    try:
+        module, symbol = _OPERATOR_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(importlib.import_module(module, __name__), symbol)
+    globals()[name] = value
+    return value
+
+
+__all__ = sorted(_OPERATOR_EXPORTS)

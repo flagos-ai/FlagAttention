@@ -39,6 +39,11 @@ except ModuleNotFoundError:
     from recording import benchmark_metric, record_benchmark_result
 
 from flag_attn.testing import backend as test_backend
+from flag_attn import runtime
+
+if runtime.device.vendor_name == "ascend":
+    pytest.skip("HY3 FP8 attention is not supported on Ascend", allow_module_level=True)
+
 from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_dynamic as fp8_qk_dynamic,
     fp8_qpertoken_perhead_kvpertensor_dynamic as fp8_kv_dynamic,
@@ -48,7 +53,7 @@ from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_static as fp8_qk_static,
     fp8_qpertoken_perhead_kvpertensor_static as fp8_kv_static,
 )
-from flag_attn import hy3_attention
+from flag_attn import hy3_attention, hy3_attention_prepare
 
 
 BLOCK_SIZE = 64
@@ -428,7 +433,7 @@ def test_attention_decode_fp8_perf(
     )
     inputs = _inputs(panel)
     implementation = _implementation(schedule, quant_type)
-    workspace = implementation.prepare_decode_workspace(inputs)
+    workspace = hy3_attention_prepare(inputs, variant=variant)
     cuda_output = (
         torch.empty_like(panel.q, dtype=torch.bfloat16) if hpc is not None else None
     )

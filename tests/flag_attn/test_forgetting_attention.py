@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from flag_attn.testing import backend as test_backend
-from flag_attn.forgetting_attention.parallel import TLE_AVAILABLE
+from flag_attn.forgetting.parallel import TLE_AVAILABLE
 
 # Inline pytest parameters: B, M, N, Hq, Hkv, D, dtype, scale, seed-0 SHA256.
 # Preserve all 90 historical configurations and their numerical regression oracle.
@@ -148,7 +148,7 @@ def optimized_entry():
 
 @lru_cache(maxsize=1)
 def official_entry():
-    return importlib.import_module("flag_attn.forgetting_attention.naive").forgetting_attention
+    return importlib.import_module("flag_attn.forgetting.naive").forgetting_attention
 
 
 def call_optimized(inputs, case, threshold=-10.0, scale=None):
@@ -217,7 +217,7 @@ def test_forgetting_attention_matches_official(case, seed):
 @torch.inference_mode()
 @pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="prefix preparation requires SM90/TLE")
 def test_forgetting_attention_prefix_and_boundaries(case):
-    from flag_attn.forgetting_attention.parallel import prepare, h100_config
+    from flag_attn.forgetting.parallel import prepare, h100_config
     inputs = make_inputs(case)
     b, m, n, h, hk, d = (case[k] for k in ("B", "M", "N", "HQ", "H", "D"))
     prep = h100_config(b, m, n, h, hk, d)[2]
@@ -320,7 +320,7 @@ def test_forgetting_attention_rejects_unsupported(problem):
 @torch.inference_mode()
 @pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="generic ACP implementation contract requires SM90/TLE")
 def test_forgetting_attention_explicit_async_and_hot_launch(id):
-    from flag_attn.forgetting_attention.parallel import capture
+    from flag_attn.forgetting.parallel import capture
     case = next(c for c in CASES if c["id"] == id)
     inputs = make_inputs(case)
     call_optimized(inputs, case)

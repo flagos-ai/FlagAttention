@@ -12,7 +12,7 @@ import torch
 
 from ..chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from ...cumsum import chunk_local_cumsum
-from ...gla.chunk_gla import chunk_gla_fwd_o_gk
+from ...gla.chunk import chunk_gla_fwd_o_gk
 from .chunk_intra import chunk_gdn2_fwd_intra
 from .gate import kda_gate_chunk_cumsum
 

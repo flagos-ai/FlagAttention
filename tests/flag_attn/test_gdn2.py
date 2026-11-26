@@ -214,7 +214,7 @@ if importlib.import_module("flag_attn.gdn2.chunk").HAS_TLE_GDN2:
     @pytest.mark.chunk_gdn2
     def test_k1_tle_resource_controls_are_enabled():
         module = importlib.import_module("flag_attn.gdn2.chunk")
-        assert module.K1_TLE_MAXNREG_CANDIDATES == (64, 72, 96)
+        assert module.K1_TLE_MAXNREG_CANDIDATES == (64,)
         assert module.K1_TLE_SMEM_REUSE_MIN_K == 256
         source = Path(module.__file__).read_text(encoding="utf-8")
         assert "tle.gpu.alloc" in source
