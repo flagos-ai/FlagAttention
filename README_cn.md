@@ -302,7 +302,7 @@ GLA、GDN2 和 KDA 使用 sequence-first `[B,T,H,D]`。Gated Delta Rule 默认 `
 
 - [`chunk_gla`](./src/flag_attn/FLA/gated_linear_attention/chunk.py) 实现带 autograd 的分块 gated linear attention，支持初始/最终递归状态。
 - [`chunk_gated_delta_rule`](./src/flag_attn/FLA/gated_delta_rule/api.py) 是纯前向 delta-rule 实现；`head_first=True` 时布局为 `[B,H,T,D]`，当前 `BT` 固定为 64。
-- [`chunk_gdn2`](./src/flag_attn/gdn2/chunk.py) 在原生 Triton、TLE 和厂商特化的 GDN2 前向路径之间派发。
+- [`chunk_gdn2`](./src/flag_attn/gdn2/__init__.py) 通过厂商注册表派发。[通用前向实现](./src/flag_attn/gdn2/chunk.py) 使用标准 Triton。[NVIDIA 后端](./src/flag_attn/runtime/backend/_nvidia/gdn2/chunk.py) 在 GPU 和 TLE 编译器均兼容时使用 16-token chunk 融合路径。
 - [`chunk_kda`](./src/flag_attn/FLA/chunk_kda.py) 是推理 API。通用 CUDA 路径需要提供 TLE 的 Triton build，并且会拒绝开启梯度的调用、非 BF16 或非连续输入、`K != 128`、`V != 128` 以及 GVA。chunk size 默认为 16；厂商实现的约束可能不同。
 - [`log_linear_attn`](./src/flag_attn/FLA/log_linear_attn/chunk_tle.py) 是基于 TLE kernel 的稠密纯前向 Log-Linear Attention 入口，接收 `(q, k, v, g, level_scales)`，其中 `level_scales` 提供各层级的门控缩放。`chunk_log_linear_attn` 是同一函数的清单名称。
 - [`parallel_parallax`](./src/flag_attn/FLA/parallax) 是参数化局部线性注意力，单一公开入口通过 `stage=` 选择三个阶段。Prefill（`"prefill"`，默认）接收 `(q, r, k, v)`，其中 `q/r: [B,T,HQ,D]`、`k/v: [B,T,H,D]`，支持 GQA、autograd、可选 `window_size`，并通过 `cu_seqlens` 支持 packed varlen。注意 `r` 不会被 `scale` 预先缩放。`"decode"` 和 `"kvcache"` 阶段则路由到 KV-cache decode kernel。

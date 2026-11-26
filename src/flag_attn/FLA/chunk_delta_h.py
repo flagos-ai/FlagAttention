@@ -41,7 +41,8 @@ def _prune_state_configs(configs, named_args, **kwargs):
     }
 )
 @libtuner(
-    configs=runtime.get_tuned_config("chunk_gated_delta_rule_fwd_kernel_h_blockdim64"),
+    configs=runtime.get_tuned_config("chunk_gated_delta_rule_fwd_kernel_h_blockdim64")
+    or [triton.Config({"BV": 32}, num_warps=4, num_stages=1)],
     key=[
         "N",
         "T",
@@ -51,6 +52,8 @@ def _prune_state_configs(configs, named_args, **kwargs):
         "V",
         "BT",
         "IS_VARLEN",
+        "USE_G",
+        "USE_GK",
         "USE_INITIAL_STATE",
         "STORE_FINAL_STATE",
     ],
@@ -83,6 +86,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    GK_BASE2: tl.constexpr = False,
     N: tl.constexpr = 1,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -226,7 +230,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 mask=(o_k1 < K),
                 other=0.0,
             ).to(tl.float32)
-            b_h1 *= exp(b_gk_last1)[:, None]
+            b_h1 *= (tl.exp2(b_gk_last1) if GK_BASE2 else exp(b_gk_last1))[:, None]
             if K > 64:
                 o_k2 = 64 + o_k1
                 b_gk_last2 = tl.load(
@@ -234,7 +238,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k2 < K),
                     other=0.0,
                 ).to(tl.float32)
-                b_h2 *= exp(b_gk_last2)[:, None]
+                b_h2 *= (tl.exp2(b_gk_last2) if GK_BASE2 else exp(b_gk_last2))[:, None]
             if K > 128:
                 o_k3 = 128 + o_k1
                 b_gk_last3 = tl.load(
@@ -242,7 +246,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k3 < K),
                     other=0.0,
                 ).to(tl.float32)
-                b_h3 *= exp(b_gk_last3)[:, None]
+                b_h3 *= (tl.exp2(b_gk_last3) if GK_BASE2 else exp(b_gk_last3))[:, None]
             if K > 192:
                 o_k4 = 192 + o_k1
                 b_gk_last4 = tl.load(
@@ -250,7 +254,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k4 < K),
                     other=0.0,
                 ).to(tl.float32)
-                b_h4 *= exp(b_gk_last4)[:, None]
+                b_h4 *= (tl.exp2(b_gk_last4) if GK_BASE2 else exp(b_gk_last4))[:, None]
         b_v = b_v.to(k.dtype.element_ty)
 
         p_k = tl.make_block_ptr(k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1))
@@ -294,6 +298,8 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
+    *,
+    gk_base2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Each group of value heads shares one query/key head.
     B, T, Hg, K, V = *k.shape, u.shape[-1]
@@ -339,5 +345,6 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         N=N,
+        GK_BASE2=gk_base2,
     )
     return h, v_new, final_state

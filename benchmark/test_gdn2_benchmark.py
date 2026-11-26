@@ -26,8 +26,8 @@ except ModuleNotFoundError:
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gdn2, runtime
-from flag_attn.gdn2.chunk import HAS_TLE_GDN2
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
+from flag_attn.runtime.backend._nvidia.gdn2.chunk import supports_fused_gdn2
 
 
 ALL_SHAPES = [
@@ -107,7 +107,8 @@ def _public_forward(inputs):
         output_final_state=True,
         chunk_size=(
             16
-            if HAS_TLE_GDN2 or runtime.device.vendor_name in {"mthreads", "metax"}
+            if runtime.device.vendor_name in {"mthreads", "metax"}
+            or (test_backend.is_nvidia() and supports_fused_gdn2(q.device))
             else 64
         ),
     )
@@ -127,7 +128,7 @@ def run_benchmark(
 
     if not test_backend.supports_operator("chunk_gdn2"):
         raise RuntimeError("GDN2 benchmark requires an available accelerator")
-    compare_native = HAS_TLE_GDN2
+    compare_native = test_backend.is_nvidia() and supports_fused_gdn2(torch.device(test_backend.device))
     baseline_name = "FlagAttention native Triton" if compare_native else None
 
     dtype = getattr(torch, args.dtype)

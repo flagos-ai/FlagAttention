@@ -113,10 +113,10 @@ def chunk_gdn2_fwd_kernel_intra_token_parallel(
         b + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
     )
 
-    b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
-    b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
-    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
-    b_b = tl.load(p_b, boundary_check=(0, 1)).to(tl.float32)
+    b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    b_g = tl.load(p_g, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    b_b = tl.load(p_b, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
 
     # Fold channel-wise erase gate into the key tile.
     b_k = b_k * b_b
@@ -128,8 +128,8 @@ def chunk_gdn2_fwd_kernel_intra_token_parallel(
         p_gj = tl.make_block_ptr(
             g + j * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
         )
-        b_kj = tl.load(p_kj, boundary_check=(0, 1)).to(tl.float32)
-        b_gj = tl.load(p_gj, boundary_check=(0, 1)).to(tl.float32)
+        b_kj = tl.load(p_kj, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+        b_gj = tl.load(p_gj, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
 
         b_kgj = b_kj * exp2(b_g - b_gj)
         b_kgj = tl.where(m_k[None, :], b_kgj, 0.0)

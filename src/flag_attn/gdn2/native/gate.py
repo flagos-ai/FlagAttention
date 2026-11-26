@@ -438,12 +438,12 @@ def kda_gate_chunk_cumsum_vector_kernel(
         (1, 0),
     )
     # [BT, BS]
-    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+    b_s = tl.load(p_s, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
 
     # Apply dt_bias if exists
     if HAS_BIAS:
         p_b = tl.make_block_ptr(dt_bias + i_h * S, (S,), (1,), (i_s * BS,), (BS,), (0,))
-        b_bias = tl.load(p_b, boundary_check=(0,)).to(tl.float32)
+        b_bias = tl.load(p_b, boundary_check=(0,), padding_option="zero").to(tl.float32)
         b_s = b_s + b_bias[None, :]
 
     b_A = tl.load(A_log + i_h).to(tl.float32)
