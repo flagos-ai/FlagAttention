@@ -323,6 +323,10 @@ def benchmark(
 ) -> None:
     if not test_backend.supports_operator("sage_attention"):
         raise RuntimeError("SageAttention benchmark requires an available accelerator")
+    if not test_backend.is_nvidia():
+        raise RuntimeError(
+            "The causal SageAttention benchmark currently targets the NVIDIA backend"
+        )
 
     output_dtype = getattr(torch, args.output_dtype)
     shapes = tuple(

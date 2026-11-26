@@ -23,12 +23,27 @@ from flag_attn import sage_attention
 from flag_attn.sageattention import per_block_int8
 
 
-pytestmark = pytest.mark.skipif(not test_backend.supports_operator("sage_attention"), reason=test_backend.skip_reason("sage_attention"))
+pytestmark = pytest.mark.skipif(
+    not test_backend.supports_operator("sage_attention"),
+    reason=test_backend.skip_reason("sage_attention"),
+)
 
 _NVIDIA_ONLY = pytest.mark.skipif(
     not (test_backend.is_nvidia() and torch.cuda.is_available()),
     reason="blocked causal processing is implemented by the NVIDIA SageAttention kernel",
 )
+
+
+def _sage(*args, **kwargs):
+    """Call the backend-dispatched operator with backend-neutral semantics.
+
+    The NVIDIA kernel defaults to causal self-attention, so generic
+    (non-causal) tests request ``is_causal=False`` explicitly there. Other
+    backends have no ``is_causal`` parameter and stay non-causal by default.
+    """
+    if test_backend.is_nvidia() and "is_causal" not in kwargs:
+        kwargs["is_causal"] = False
+    return sage_attention(*args, **kwargs)
 
 
 def _expand_scale(scale, block_size, length):
@@ -79,11 +94,50 @@ def _reference(q, k, v, q_scale, k_scale, tensor_layout, attn_mask=None, is_caus
 @pytest.mark.sage_attention
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
+def test_forward_matches_dequantized_reference(tensor_layout, num_kv_heads):
+    torch.manual_seed(2026)
+    batch_size, num_query_heads, seq_len, head_dim = 1, 2, 128, 64
+    q = torch.randn(batch_size, num_query_heads, seq_len, head_dim, device=test_backend.device, dtype=torch.float16)
+    k = torch.randn(batch_size, num_kv_heads, seq_len, head_dim, device=test_backend.device, dtype=torch.float16)
+    v = torch.randn(batch_size, num_query_heads, seq_len, head_dim, device=test_backend.device, dtype=torch.float16)
+
+    if tensor_layout == "NHD":
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k, tensor_layout=tensor_layout)
+    actual, actual_lse = _sage(
+        q_int8,
+        k_int8,
+        v,
+        q_scale,
+        k_scale,
+        tensor_layout=tensor_layout,
+        return_lse=True,
+    )
+    expected, expected_lse = _reference(
+        q_int8,
+        k_int8,
+        v,
+        q_scale,
+        k_scale,
+        tensor_layout,
+    )
+
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@_NVIDIA_ONLY
+@pytest.mark.sage_attention
+@pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tuned", [False, True])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_forward_matches_dequantized_reference(
+def test_causal_matches_dequantized_reference(
     tensor_layout, num_kv_heads, head_dim, output_dtype, tuned, is_causal
 ):
     torch.manual_seed(2026)
@@ -133,7 +187,7 @@ def test_forward_rejects_non_positive_maxnreg():
     k_scale = torch.ones((1, 1, 2), device=test_backend.device)
 
     with pytest.raises(ValueError, match="maxnreg must be positive"):
-        sage_attention(q, k, v, q_scale, k_scale, maxnreg=0)
+        _sage(q, k, v, q_scale, k_scale, maxnreg=0)
 
 
 @pytest.mark.sage_attention
@@ -153,7 +207,7 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len):
         attn_mask[..., ::3] = -2.0
 
     q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
-    actual, actual_lse = sage_attention(
+    actual, actual_lse = _sage(
         q_int8,
         k_int8,
         v,
@@ -161,7 +215,6 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len):
         k_scale,
         attn_mask=attn_mask,
         return_lse=True,
-        is_causal=False,
     )
     expected, expected_lse = _reference(
         q_int8,
