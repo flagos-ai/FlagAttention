@@ -131,7 +131,8 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
                                     4 - STAGE, offs_m, offs_n
                                     )
     if STAGE == 3:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
+                                        K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
                                         start_m, mask_ptrs, stride_maskn,
                                         BLOCK_M, HEAD_DIM, BLOCK_N,
                                         2, offs_m, offs_n)

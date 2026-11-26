@@ -216,7 +216,7 @@ def _print_header(
     is_causal: bool = True,
 ) -> None:
     print(f"\n{'=' * 104}")
-    print("  sage_attention benchmark — FWD ONLY")
+    print("  sage_attention benchmark - FWD ONLY")
     print(f"  provider: {_baseline_name(output_dtype)} vs flag_attn_sage_attention")
     print("  timing: SageAttention includes Q/K quantization + attention; SDPA includes its output cast")
     print(f"  is_causal={is_causal}; both providers start from the same FP16 Q/K/V inputs")
