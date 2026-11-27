@@ -19,9 +19,9 @@ from __future__ import annotations
 import importlib
 
 _OPERATOR_EXPORTS = {
-    'parallel_parallax': ('.FLA.parallax.parallel', 'parallel_parallax'),
-    'parallax_decode': ('.FLA.parallax.decode', 'parallax_decode'),
-    'parallax_attn_with_kvcache': ('.FLA.parallax.decode', 'parallax_attn_with_kvcache'),
+    "parallel_parallax": (".FLA.parallax.parallel", "parallel_parallax"),
+    "parallax_decode": (".FLA.parallax.decode", "parallax_decode"),
+    "parallax_attn_with_kvcache": (".FLA.parallax.decode", "parallax_attn_with_kvcache"),
     "inkling_fa4_rel_attention": (".inkling_fa4.relative_attention", "inkling_fa4_rel_attention"),
     "SPARSE_BLOCK_SIZE": (".minimax_sparse_attention.index_topk", "SPARSE_BLOCK_SIZE"),
     "minimax_m3_index_decode": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode"),

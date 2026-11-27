@@ -1,3 +1,4 @@
+# Copyright 2026 FlagOS Contributors
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 #
 # This source code is licensed under the MIT license found in the
@@ -19,7 +20,6 @@ from flag_attn.utils import input_guard
 
 # Packed chunk indices and all query/KV passes use the same tile size.
 _BLOCK_T = 64
-
 
 
 @triton.jit
@@ -56,6 +56,7 @@ def parallel_parallax_fwd_kernel(
     BT: tl.constexpr,
     BS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    SAVE_STATS: tl.constexpr = True,
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -203,11 +204,118 @@ def parallel_parallax_fwd_kernel(
     b_o = b_barv + b_bart * b_barv - Rv_acc * inv_d1
 
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_qk)
-    tl.store(p_barv, b_barv.to(p_barv.dtype.element_ty), mask=m_qk)
-    tl.store(p_d1, d1_acc, mask=row_mask)
-    tl.store(p_bart, b_bart, mask=row_mask)
-    tl.store(p_m, m_acc, mask=row_mask)
+    if SAVE_STATS:
+        tl.store(p_barv, b_barv.to(p_barv.dtype.element_ty), mask=m_qk)
+        tl.store(p_d1, d1_acc, mask=row_mask)
+        tl.store(p_bart, b_bart, mask=row_mask)
+        tl.store(p_m, m_acc, mask=row_mask)
 
+
+@triton.jit(do_not_specialize=["T"])
+def parallel_parallax_fwd_kernel_split_k(
+    q,
+    r,
+    k,
+    v,
+    o,
+    barv,
+    d1,
+    bart,
+    m,
+    scale,
+    T,
+    HQ: tl.constexpr,
+    H: tl.constexpr,
+    G: tl.constexpr,
+    K: tl.constexpr,
+    BK: tl.constexpr,
+    BT: tl.constexpr,
+    BS: tl.constexpr,
+    SAVE_STATS: tl.constexpr,
+):
+    """Dense full-window forward that streams two 64-wide head-dim chunks.
+
+    Accumulate the score over two head-dimension halves before normalization,
+    then update and store the corresponding output halves independently.
+    """
+    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    i_b, i_hq = i_bh // HQ, i_bh % HQ
+    i_h = i_hq // G
+    bos = (i_b * T).to(tl.int64)
+    row_offset = i_t * BT
+    row_indices = row_offset + tl.arange(0, BT)
+    row_mask = row_indices[:, None] < T
+    NUM_TOTAL_BLOCKS = tl.cdiv(tl.minimum(T, row_offset + BT), BS)
+    NUM_SAFE_BLOCKS = tl.minimum(row_offset, T) // BS
+    HK: tl.constexpr = BK // 2
+    o_k0 = tl.arange(0, HK)
+    o_k1 = HK + tl.arange(0, HK)
+    p_q = q + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K)
+    p_r = r + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K)
+    b_q0 = tl.load(p_q + o_k0[None, :], mask=row_mask, other=0.0)
+    b_q1 = tl.load(p_q + o_k1[None, :], mask=row_mask, other=0.0)
+    b_r0 = tl.load(p_r + o_k0[None, :], mask=row_mask, other=0.0)
+    b_r1 = tl.load(p_r + o_k1[None, :], mask=row_mask, other=0.0)
+
+    m_acc = tl.zeros((BT, 1), dtype=tl.float32) - float("inf")
+    d1_acc = tl.zeros((BT, 1), dtype=tl.float32)
+    d2_acc = tl.zeros((BT, 1), dtype=tl.float32)
+    barv0 = tl.zeros((BT, HK), dtype=tl.float32)
+    barv1 = tl.zeros((BT, HK), dtype=tl.float32)
+    Rv0 = tl.zeros((BT, HK), dtype=tl.float32)
+    Rv1 = tl.zeros((BT, HK), dtype=tl.float32)
+    scale_log2 = scale * 1.4426950216
+
+    for col_block_id in range(0, NUM_TOTAL_BLOCKS):
+        col_indices = col_block_id.to(tl.int64) * BS + tl.arange(0, BS)
+        m_kv = col_indices[:, None] < T
+        p_k = k + (bos * H + i_h) * K + col_indices[:, None] * (H * K)
+        b_k0 = tl.load(p_k + o_k0[None, :], mask=m_kv, other=0.0)
+        b_k1 = tl.load(p_k + o_k1[None, :], mask=m_kv, other=0.0)
+        qk = tl.dot(b_q0, tl.trans(b_k0), out_dtype=tl.float32)
+        qk = tl.dot(b_q1, tl.trans(b_k1), out_dtype=tl.float32, acc=qk) * scale_log2
+        rk = tl.dot(b_r0, tl.trans(b_k0), out_dtype=tl.float32)
+        rk = tl.dot(b_r1, tl.trans(b_k1), out_dtype=tl.float32, acc=rk)
+        if col_block_id >= NUM_SAFE_BLOCKS:
+            mask = (row_indices[:, None] >= col_indices[None, :]) & row_mask & (col_indices[None, :] < T)
+            qk = tl.where(mask, qk, -float("inf"))
+        m_new = tl.maximum(m_acc, tl.max(qk, axis=1, keep_dims=True))
+        safe_m = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = exp2(m_acc - safe_m)
+        w = exp2(qk - safe_m)
+        d1_acc = alpha * d1_acc + tl.sum(w, axis=1, keep_dims=True)
+        wr = w * rk
+        d2_acc = alpha * d2_acc + tl.sum(wr, axis=1, keep_dims=True)
+        p_v = v + (bos * H + i_h) * K + col_indices[:, None] * (H * K)
+        b_v0 = tl.load(p_v + o_k0[None, :], mask=m_kv, other=0.0)
+        b_v1 = tl.load(p_v + o_k1[None, :], mask=m_kv, other=0.0)
+        barv0 = alpha * barv0
+        barv1 = alpha * barv1
+        barv0 = tl.dot(w.to(b_v0.dtype), b_v0, out_dtype=tl.float32, acc=barv0)
+        barv1 = tl.dot(w.to(b_v1.dtype), b_v1, out_dtype=tl.float32, acc=barv1)
+        Rv0 = alpha * Rv0
+        Rv1 = alpha * Rv1
+        Rv0 = tl.dot(wr.to(b_v0.dtype), b_v0, out_dtype=tl.float32, acc=Rv0)
+        Rv1 = tl.dot(wr.to(b_v1.dtype), b_v1, out_dtype=tl.float32, acc=Rv1)
+        m_acc = m_new
+
+    inv_d1 = tl.where(row_mask, 1.0 / d1_acc, 0.0)
+    b_bart = d2_acc * inv_d1
+    b_barv0 = barv0 * inv_d1
+    b_barv1 = barv1 * inv_d1
+    p_o = o + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K)
+    o0 = b_barv0 + b_bart * b_barv0 - Rv0 * inv_d1
+    o1 = b_barv1 + b_bart * b_barv1 - Rv1 * inv_d1
+    tl.store(p_o + o_k0[None, :], o0.to(o.dtype.element_ty), mask=row_mask)
+    tl.store(p_o + o_k1[None, :], o1.to(o.dtype.element_ty), mask=row_mask)
+    if SAVE_STATS:
+        p_barv = barv + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K)
+        tl.store(p_barv + o_k0[None, :], b_barv0.to(barv.dtype.element_ty), mask=row_mask)
+        tl.store(p_barv + o_k1[None, :], b_barv1.to(barv.dtype.element_ty), mask=row_mask)
+        p_s = bos * HQ + i_hq + row_indices[:, None] * HQ
+        tl.store(d1 + p_s, d1_acc, mask=row_mask)
+        tl.store(bart + p_s, b_bart, mask=row_mask)
+        tl.store(m + p_s, m_acc, mask=row_mask)
 
 @triton.heuristics(
     {
@@ -263,14 +371,17 @@ def parallel_parallax_bwd_kernel_preprocess(
     tl.store(p_b, b_b, mask=m_t)
 
 
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
 @triton.jit(do_not_specialize=["T"])
-def _parallel_parallax_bwd_kernel_dqr(
+def parallel_parallax_bwd_kernel_dqr(
     q,
     r,
     k,
     v,
-    o,
-    barv,
     d1,
     bart,
     m,
@@ -292,7 +403,6 @@ def _parallel_parallax_bwd_kernel_dqr(
     BT: tl.constexpr,
     BS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    FUSED_PREPROCESS: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -346,19 +456,8 @@ def _parallel_parallax_bwd_kernel_dqr(
     b_bart = tl.load(p_bart, mask=row_mask, other=0.0)
     b_m = tl.load(p_m, mask=row_mask, other=0.0)
     grad_o_tile = tl.load(p_grad_o, mask=m_qk, other=0.0)
-    if FUSED_PREPROCESS:
-        p_o = o + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
-        p_barv = barv + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
-        grad_o_tile_fp32 = grad_o_tile.to(tl.float32)
-        b_o = tl.load(p_o, mask=m_qk, other=0.0).to(tl.float32)
-        b_barv = tl.load(p_barv, mask=m_qk, other=0.0).to(tl.float32)
-        b_t = tl.sum(grad_o_tile_fp32 * b_o, axis=1, keep_dims=True)
-        b_b = tl.sum(grad_o_tile_fp32 * b_barv, axis=1, keep_dims=True)
-        tl.store(p_t, b_t, mask=row_mask)
-        tl.store(p_b, b_b, mask=row_mask)
-    else:
-        b_t = tl.load(p_t, mask=row_mask, other=0.0)
-        b_b = tl.load(p_b, mask=row_mask, other=0.0)
+    b_t = tl.load(p_t, mask=row_mask, other=0.0)
+    b_b = tl.load(p_b, mask=row_mask, other=0.0)
     grad_q_acc = tl.zeros((BT, BK), dtype=tl.float32)
     grad_r_acc = tl.zeros((BT, BK), dtype=tl.float32)
     scale_log2 = scale * RCP_LN2
@@ -454,71 +553,6 @@ def _parallel_parallax_bwd_kernel_dqr(
 
     tl.store(p_grad_q, grad_q_acc.to(p_grad_q.dtype.element_ty), mask=m_qk)
     tl.store(p_grad_r, grad_r_acc.to(p_grad_r.dtype.element_ty), mask=m_qk)
-
-
-@triton.heuristics(
-    {
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
-@triton.jit(do_not_specialize=["T"])
-def parallel_parallax_bwd_kernel_dqr(
-    q,
-    r,
-    k,
-    v,
-    d1,
-    bart,
-    m,
-    delta_t,
-    delta_b,
-    grad_o,
-    grad_q,
-    grad_r,
-    scale,
-    cu_seqlens,
-    chunk_indices,
-    T,
-    HQ: tl.constexpr,
-    H: tl.constexpr,
-    G: tl.constexpr,
-    K: tl.constexpr,
-    BK: tl.constexpr,
-    WINDOW_SIZE_LEFT: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    _parallel_parallax_bwd_kernel_dqr(
-        q,
-        r,
-        k,
-        v,
-        q,
-        q,
-        d1,
-        bart,
-        m,
-        delta_t,
-        delta_b,
-        grad_o,
-        grad_q,
-        grad_r,
-        scale,
-        cu_seqlens,
-        chunk_indices,
-        T,
-        HQ,
-        H,
-        G,
-        K,
-        BK,
-        WINDOW_SIZE_LEFT,
-        BT,
-        BS,
-        IS_VARLEN,
-        False,
-    )
 
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
@@ -715,8 +749,7 @@ def parallel_parallax_bwd_kernel_reduce_gqa(
     tl.store(grad_v + offsets, grad_v_acc, mask=mask)
 
 
-
-def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None, window_size_left=-1):
+def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None, window_size_left=-1, save_stats=True):
     """Return output and FP32 statistics for dense or packed causal attention."""
     B, T, HQ, K = q.shape
     H = k.shape[2]
@@ -725,12 +758,27 @@ def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None
     if cu_seqlens is not None and chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     grid = (len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT), B * HQ)
-    o, barv = torch.empty_like(q), torch.empty_like(q)
-    d1, bart, m = torch.empty((3, B, T, HQ), device=q.device, dtype=torch.float32).unbind(0)
+    o = torch.empty_like(q)
+    if save_stats:
+        barv = torch.empty_like(q)
+        d1, bart, m = torch.empty((3, B, T, HQ), device=q.device, dtype=torch.float32).unbind(0)
+    else:
+        barv = d1 = bart = m = None
+    if cu_seqlens is None and window_size_left < 0 and K == BK and BK == 128:
+        parallel_parallax_fwd_kernel_split_k[grid](
+            q, r, k, v, o, barv if save_stats else q,
+            d1 if save_stats else q, bart if save_stats else q, m if save_stats else q,
+            scale, T,
+            HQ=HQ, H=H, G=HQ // H, K=K, BK=BK, BT=BT, BS=BT,
+            SAVE_STATS=save_stats, num_warps=4, num_stages=2,
+        )
+        return o, barv, d1, bart, m
     parallel_parallax_fwd_kernel[grid](
-        q, r, k, v, o, barv, d1, bart, m, scale, cu_seqlens, chunk_indices, T,
-        HQ=HQ, H=H, G=HQ // H, K=K, BK=BK, BT=BT, BS=BT,
-        WINDOW_SIZE_LEFT=window_size_left, num_warps=4, num_stages=1,
+        q, r, k, v, o, barv if save_stats else q,
+        d1 if save_stats else q, bart if save_stats else q, m if save_stats else q,
+        scale, cu_seqlens, chunk_indices, T,
+        HQ=HQ, H=H, G=HQ // H, K=K, BK=BK, BT=BT, BS=BT, SAVE_STATS=save_stats,
+        WINDOW_SIZE_LEFT=window_size_left, num_warps=8, num_stages=1,
     )
     return o, barv, d1, bart, m
 
@@ -753,10 +801,11 @@ def parallel_parallax_bwd(
     delta_t, delta_b = torch.empty((2, B, T, HQ), device=q.device, dtype=torch.float32).unbind(0)
     parallel_parallax_bwd_kernel_preprocess[grid](
         grad_o, o, barv, delta_t, delta_b, cu_seqlens, chunk_indices, T,
-        HQ=HQ, K=K, BK=BK, BT=BT, BP=BT, num_warps=4, num_stages=1,
+        HQ=HQ, K=K, BK=BK, BT=BT, BP=BT, num_warps=8, num_stages=1,
     )
     common = dict(HQ=HQ, H=H, G=G, K=K, BK=BK, BT=BT, BS=BT,
-                  WINDOW_SIZE_LEFT=window_size_left, num_warps=4, num_stages=1)
+                  WINDOW_SIZE_LEFT=window_size_left,
+                  num_warps=8, num_stages=1)
     parallel_parallax_bwd_kernel_dqr[grid](
         q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
         scale, cu_seqlens, chunk_indices, T, **common,
@@ -771,10 +820,9 @@ def parallel_parallax_bwd(
     n = grad_k.numel()
     parallel_parallax_bwd_kernel_reduce_gqa[(triton.cdiv(n, 256),)](
         grad_k_buf, grad_v_buf, grad_k, grad_v, n,
-        HQ=HQ, H=H, G=G, K=K, BLOCK=256, num_warps=4,
+        HQ=HQ, H=H, G=G, K=K, BLOCK=256, num_warps=8,
     )
     return grad_q, grad_r, grad_k, grad_v
-
 
 
 def _validate_parallel_parallax_inputs(q, r, k, v, window_size, cu_seqlens):
@@ -827,6 +875,16 @@ def _validate_parallel_parallax_inputs(q, r, k, v, window_size, cu_seqlens):
             raise TypeError(f"cu_seqlens must be int32 or int64, got {cu_seqlens.dtype}")
         if cu_seqlens.device != q.device:
             raise ValueError("cu_seqlens must be on the same CUDA device as q")
+
+
+@input_guard
+def _parallel_parallax_inference(q, r, k, v, scale, window_size_left, cu_seqlens):
+    # Inference needs the same online moments for the output, but has no
+    # consumer for saved backward statistics or their global stores.
+    return parallel_parallax_fwd(
+        q, r, k, v, scale, cu_seqlens=cu_seqlens,
+        window_size_left=window_size_left, save_stats=False,
+    )[0]
 
 
 class ParallaxFunction(torch.autograd.Function):
@@ -927,4 +985,6 @@ def parallel_parallax(
     # The kernel keeps cols [i - W + 1, i] (W keys total, diagonal included),
     # matching FLA's `window_size=W` semantics exactly (no off-by-one).
     window_size_left = -1 if window_size is None else window_size
+    if not torch.is_grad_enabled() or not any(t.requires_grad for t in (q, r, k, v)):
+        return _parallel_parallax_inference(q, r, k, v, float(scale), window_size_left, cu_seqlens)
     return ParallaxFunction.apply(q, r, k, v, float(scale), window_size_left, cu_seqlens)

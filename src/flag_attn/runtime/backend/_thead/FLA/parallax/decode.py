@@ -1,3 +1,4 @@
+# Copyright 2026 FlagOS Contributors
 # Copyright (c) 2026 Parallax authors.
 #
 # This source code is licensed under the MIT license found in the
@@ -257,7 +258,7 @@ def _env_choice(name: str, default: int, choices: tuple[int, ...]) -> int:
     return value
 
 
-def _launch_config(kv_len: int, head_dim: int) -> tuple[int, int, int, int]:
+def _launch_config() -> tuple[int, int, int, int]:
     """Use portable launch defaults with optional explicit tuning overrides."""
     block_n = _env_choice("PARALLAX_BLOCK_N", _BLOCK_N, (64, 128))
     num_warps = _env_choice("PARALLAX_NUM_WARPS", _NUM_WARPS, (2, 4, 8))
@@ -295,7 +296,7 @@ _WORKSPACE_CACHE: dict[tuple, tuple[torch.Tensor, ...]] = {}
 def _split_workspace(
     device: torch.device, batch_heads: int, num_splits: int, head_dim: int
 ) -> tuple[torch.Tensor, ...]:
-    """Return stable split buffers (also avoids allocations during timing)."""
+    """Reuse split-reduction buffers for a device and workload."""
     key = (device.type, device.index, batch_heads, num_splits, head_dim)
     ws = _WORKSPACE_CACHE.get(key)
     if ws is None:
@@ -310,8 +311,6 @@ def _split_workspace(
         )
         _WORKSPACE_CACHE[key] = ws
     return ws
-
-
 
 
 def _validate_inputs(
@@ -413,7 +412,7 @@ def parallax_attn_with_kvcache(
     result = torch.empty_like(q) if out is None else out
     BK = triton.next_power_of_2(D)
     batch_heads = B * HQ
-    block_n, num_warps, num_stages, max_splits = _launch_config(L, D)
+    block_n, num_warps, num_stages, max_splits = _launch_config()
     device_index = q.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
@@ -509,4 +508,4 @@ def parallax_decode(
     )
 
 
-__all__ = [ "parallax_attn_with_kvcache", "parallax_decode"]
+__all__ = ["parallax_attn_with_kvcache", "parallax_decode"]
