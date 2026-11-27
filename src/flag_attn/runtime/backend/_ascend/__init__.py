@@ -4,6 +4,8 @@
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "infllmv2_attention": (".infllmv2", "infllmv2_attention"),
+    "infllmv2_decode": (".infllmv2", "infllmv2_decode"),
     "chunk_gated_delta_rule": (".FLA.gated_delta_rule.api", "chunk_gated_delta_rule"),
     "chunk_gated_delta_rule_fwd": (".FLA.gated_delta_rule.chunk", "chunk_gated_delta_rule_fwd"),
     "fused_recurrent_gated_delta_rule_fwd": (
