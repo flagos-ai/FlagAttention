@@ -17,6 +17,7 @@
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "chunk_gdn2": (".gdn2.chunk", "chunk_gdn2"),
     "minimax_m3_index_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_score"),
     "minimax_m3_index_decode_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode_score"),
     "minimax_m3_index_decode": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode"),

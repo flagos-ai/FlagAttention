@@ -52,12 +52,6 @@ def chunk_local_cumsum_vector_kernel(
     else:
         bos = i_b * T
 
-    offsets = tl.arange(0, BT)
-    if REVERSE:
-        mask = tl.where(offsets[:, None] <= offsets[None, :], 1.0, 0.0)
-    else:
-        mask = tl.where(offsets[:, None] >= offsets[None, :], 1.0, 0.0)
-
     if HEAD_FIRST:
         p_s = tl.make_block_ptr(
             s + (bos * H + i_h * T) * S,
@@ -92,8 +86,8 @@ def chunk_local_cumsum_vector_kernel(
             (BT, BS),
             (1, 0),
         )
-    values = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
-    result = tl.dot(mask, values, allow_tf32=False)
+    values = tl.load(p_s, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    result = tl.cumsum(values, axis=0, reverse=REVERSE)
     tl.store(p_o, result.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -107,7 +101,6 @@ def chunk_local_cumsum(
     **kwargs,
 ) -> torch.Tensor:
     """Compute cumsum independently inside each chunk of a 4-D gate tensor."""
-    del kwargs
     if g.ndim != 4:
         raise ValueError(f"GDN2 gate must be 4-D, got shape {tuple(g.shape)}")
     if cu_seqlens is not None and g.shape[0] != 1:
@@ -119,11 +112,9 @@ def chunk_local_cumsum(
         B, H, T, S = g.shape
     else:
         B, T, H, S = g.shape
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
+    chunk_indices = kwargs.get("chunk_indices")
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     num_chunks = triton.cdiv(T, chunk_size) if cu_seqlens is None else len(chunk_indices)
     source = g
     output = torch.empty_like(g, dtype=output_dtype or g.dtype)
