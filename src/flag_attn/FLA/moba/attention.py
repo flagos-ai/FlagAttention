@@ -512,6 +512,8 @@ def _triton_varlen_backward(
     )
     num_k_blocks = cdiv(max_seqlen_k, block_n)
     dkdv_grid = (num_k_blocks * num_sequences * num_heads,)
+    # D=256 needs an extra dout buffer for pipelined WGMMA operands.
+    dkdv_num_stages = 1 if block_d >= 256 else num_stages
     _varlen_attn_bwd_dkdv_kernel[dkdv_grid](
         *common,
         dk,
@@ -535,7 +537,7 @@ def _triton_varlen_backward(
         NUM_BLOCKS=num_k_blocks,
         CAUSAL=causal,
         num_warps=num_warps,
-        num_stages=num_stages,
+        num_stages=dkdv_num_stages,
     )
 
 
