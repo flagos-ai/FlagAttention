@@ -41,7 +41,8 @@ def _prune_state_configs(configs, named_args, **kwargs):
     }
 )
 @libtuner(
-    configs=runtime.get_tuned_config("chunk_gated_delta_rule_fwd_kernel_h_blockdim64"),
+    configs=runtime.get_tuned_config("chunk_gated_delta_rule_fwd_kernel_h_blockdim64")
+    or [triton.Config({"BV": 32}, num_warps=4, num_stages=1)],
     key=[
         "N",
         "T",
@@ -51,6 +52,8 @@ def _prune_state_configs(configs, named_args, **kwargs):
         "V",
         "BT",
         "IS_VARLEN",
+        "USE_G",
+        "USE_GK",
         "USE_INITIAL_STATE",
         "STORE_FINAL_STATE",
     ],
