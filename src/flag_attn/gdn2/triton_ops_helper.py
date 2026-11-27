@@ -3,7 +3,10 @@
 import triton
 import triton.language as tl
 
-from flag_attn.FLA.utils import autotune_cache_kwargs, exp
+from flag_attn.runtime import autotune_cache_kwargs as _autotune_cache_kwargs
+
+autotune_cache_kwargs = _autotune_cache_kwargs()
+exp = tl.exp
 
 
 @triton.jit

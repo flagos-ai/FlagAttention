@@ -30,10 +30,6 @@ from .chunk_intra_token_parallel import chunk_gdn2_fwd_intra_token_parallel
 from ..triton_ops_helper import autotune_cache_kwargs, exp2
 from .wy_fast import recompute_w_u_fwd_gdn2
 
-IS_TF32_SUPPORTED = (
-    torch.cuda.is_available() and torch.version.cuda is not None and torch.cuda.get_device_capability()[0] >= 8
-)
-
 IS_GATHER_SUPPORTED = hasattr(tl, "gather")
 
 if IS_GATHER_SUPPORTED:
@@ -47,10 +43,7 @@ else:
         return None
 
 
-if IS_TF32_SUPPORTED:
-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
-else:
-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
+SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
 
 
 @triton.heuristics(
@@ -120,10 +113,10 @@ def chunk_gdn2_fwd_kernel_intra_sub_chunk(
     p_g = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_ti, 0), (BC, BK), (1, 0))
     p_b = tl.make_block_ptr(b, (T, K), (H * K, 1), (i_ti, 0), (BC, BK), (1, 0))
 
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_g = tl.load(p_g, boundary_check=(0, 1))
-    b_b = tl.load(p_b, boundary_check=(0, 1))
+    b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
+    b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
+    b_g = tl.load(p_g, boundary_check=(0, 1), padding_option="zero")
+    b_b = tl.load(p_b, boundary_check=(0, 1), padding_option="zero")
 
     if USE_GATHER:
         b_gn = gather(
@@ -142,8 +135,8 @@ def chunk_gdn2_fwd_kernel_intra_sub_chunk(
 
     b_bk = (b_b.to(tl.float32) * b_k.to(tl.float32)).to(b_k.dtype)
 
-    b_Aqk = tl.dot(b_q * b_gq, b_kgt) * scale
-    b_Akk = tl.dot(b_bk * b_gq, b_kgt)
+    b_Aqk = tl.dot(b_q * b_gq, b_kgt, input_precision="ieee") * scale
+    b_Akk = tl.dot(b_bk * b_gq, b_kgt, input_precision="ieee")
 
     o_i = tl.arange(0, BC)
     m_Aqk = o_i[:, None] >= o_i[None, :]
@@ -183,7 +176,7 @@ def chunk_gdn2_fwd_kernel_intra_sub_chunk(
         for BK in [32, 64]
         for num_warps in [1, 2, 4]
     ],
-    key=["H", "K", "BC"],
+    key=["H", "K", "BT", "BC"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -267,10 +260,10 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
         p_g0 = tl.make_block_ptr(
             g, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
         )
-        b_k0 = tl.load(p_k0, boundary_check=(0, 1)).to(tl.float32)
-        b_g0 = tl.load(p_g0, boundary_check=(0, 1)).to(tl.float32)
+        b_k0 = tl.load(p_k0, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+        b_g0 = tl.load(p_g0, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
 
-        if i_tc1 < T:
+        if BT > BC and i_tc1 < T:
             p_q1 = tl.make_block_ptr(
                 q, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0)
             )
@@ -283,18 +276,18 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
             p_b1 = tl.make_block_ptr(
                 b, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0)
             )
-            b_q1 = tl.load(p_q1, boundary_check=(0, 1)).to(tl.float32)
-            b_k1 = tl.load(p_k1, boundary_check=(0, 1)).to(tl.float32)
-            b_g1 = tl.load(p_g1, boundary_check=(0, 1)).to(tl.float32)
-            b_b1 = tl.load(p_b1, boundary_check=(0, 1)).to(tl.float32)
+            b_q1 = tl.load(p_q1, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            b_k1 = tl.load(p_k1, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            b_g1 = tl.load(p_g1, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            b_b1 = tl.load(p_b1, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
             b_gn1 = tl.load(g + i_tc1 * H * K + o_k, mask=m_k, other=0).to(tl.float32)
             b_gqn = tl.where(m_tc1[:, None], exp2(b_g1 - b_gn1[None, :]), 0)
             b_kgt = tl.trans(b_k0 * exp2(b_gn1[None, :] - b_g0))
             b_bk1 = b_b1 * b_k1
-            b_Aqk10 += tl.dot(b_q1 * b_gqn, b_kgt)
-            b_Akk10 += tl.dot(b_bk1 * b_gqn, b_kgt)
+            b_Aqk10 += tl.dot(b_q1 * b_gqn, b_kgt, input_precision="ieee")
+            b_Akk10 += tl.dot(b_bk1 * b_gqn, b_kgt, input_precision="ieee")
 
-            if i_tc2 < T:
+            if BT > 2 * BC and i_tc2 < T:
                 p_q2 = tl.make_block_ptr(
                     q, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0)
                 )
@@ -307,10 +300,10 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
                 p_b2 = tl.make_block_ptr(
                     b, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0)
                 )
-                b_q2 = tl.load(p_q2, boundary_check=(0, 1)).to(tl.float32)
-                b_k2 = tl.load(p_k2, boundary_check=(0, 1)).to(tl.float32)
-                b_g2 = tl.load(p_g2, boundary_check=(0, 1)).to(tl.float32)
-                b_b2 = tl.load(p_b2, boundary_check=(0, 1)).to(tl.float32)
+                b_q2 = tl.load(p_q2, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+                b_k2 = tl.load(p_k2, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+                b_g2 = tl.load(p_g2, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+                b_b2 = tl.load(p_b2, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
                 b_gn2 = tl.load(g + i_tc2 * H * K + o_k, mask=m_k, other=0).to(
                     tl.float32
                 )
@@ -318,13 +311,13 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
                 b_qg2 = b_q2 * b_gqn2
                 b_bkg2 = (b_b2 * b_k2) * b_gqn2
                 b_kgt = tl.trans(b_k0 * exp2(b_gn2[None, :] - b_g0))
-                b_Aqk20 += tl.dot(b_qg2, b_kgt)
-                b_Akk20 += tl.dot(b_bkg2, b_kgt)
+                b_Aqk20 += tl.dot(b_qg2, b_kgt, input_precision="ieee")
+                b_Akk20 += tl.dot(b_bkg2, b_kgt, input_precision="ieee")
                 b_kgt = tl.trans(b_k1 * exp2(b_gn2[None, :] - b_g1))
-                b_Aqk21 += tl.dot(b_qg2, b_kgt)
-                b_Akk21 += tl.dot(b_bkg2, b_kgt)
+                b_Aqk21 += tl.dot(b_qg2, b_kgt, input_precision="ieee")
+                b_Akk21 += tl.dot(b_bkg2, b_kgt, input_precision="ieee")
 
-                if i_tc3 < T:
+                if BT > 3 * BC and i_tc3 < T:
                     p_q3 = tl.make_block_ptr(
                         q, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0)
                     )
@@ -337,10 +330,10 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
                     p_b3 = tl.make_block_ptr(
                         b, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0)
                     )
-                    b_q3 = tl.load(p_q3, boundary_check=(0, 1)).to(tl.float32)
-                    b_k3 = tl.load(p_k3, boundary_check=(0, 1)).to(tl.float32)
-                    b_g3 = tl.load(p_g3, boundary_check=(0, 1)).to(tl.float32)
-                    b_b3 = tl.load(p_b3, boundary_check=(0, 1)).to(tl.float32)
+                    b_q3 = tl.load(p_q3, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+                    b_k3 = tl.load(p_k3, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+                    b_g3 = tl.load(p_g3, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+                    b_b3 = tl.load(p_b3, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
                     b_gn3 = tl.load(g + i_tc3 * H * K + o_k, mask=m_k, other=0).to(
                         tl.float32
                     )
@@ -348,23 +341,23 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
                     b_qg3 = b_q3 * b_gqn3
                     b_bkg3 = (b_b3 * b_k3) * b_gqn3
                     b_kgt = tl.trans(b_k0 * exp2(b_gn3[None, :] - b_g0))
-                    b_Aqk30 += tl.dot(b_qg3, b_kgt)
-                    b_Akk30 += tl.dot(b_bkg3, b_kgt)
+                    b_Aqk30 += tl.dot(b_qg3, b_kgt, input_precision="ieee")
+                    b_Akk30 += tl.dot(b_bkg3, b_kgt, input_precision="ieee")
                     b_kgt = tl.trans(b_k1 * exp2(b_gn3[None, :] - b_g1))
-                    b_Aqk31 += tl.dot(b_qg3, b_kgt)
-                    b_Akk31 += tl.dot(b_bkg3, b_kgt)
+                    b_Aqk31 += tl.dot(b_qg3, b_kgt, input_precision="ieee")
+                    b_Akk31 += tl.dot(b_bkg3, b_kgt, input_precision="ieee")
                     b_kgt = tl.trans(b_k2 * exp2(b_gn3[None, :] - b_g2))
-                    b_Aqk32 += tl.dot(b_qg3, b_kgt)
-                    b_Akk32 += tl.dot(b_bkg3, b_kgt)
+                    b_Aqk32 += tl.dot(b_qg3, b_kgt, input_precision="ieee")
+                    b_Akk32 += tl.dot(b_bkg3, b_kgt, input_precision="ieee")
 
-    if i_tc1 < T:
+    if BT > BC and i_tc1 < T:
         p_Aqk10 = tl.make_block_ptr(
             Aqk, (T, BT), (H * BT, 1), (i_tc1, 0), (BC, BC), (1, 0)
         )
         tl.store(
             p_Aqk10, (b_Aqk10 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1)
         )
-    if i_tc2 < T:
+    if BT > 2 * BC and i_tc2 < T:
         p_Aqk20 = tl.make_block_ptr(
             Aqk, (T, BT), (H * BT, 1), (i_tc2, 0), (BC, BC), (1, 0)
         )
@@ -377,7 +370,7 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
         tl.store(
             p_Aqk21, (b_Aqk21 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1)
         )
-    if i_tc3 < T:
+    if BT > 3 * BC and i_tc3 < T:
         p_Aqk30 = tl.make_block_ptr(
             Aqk, (T, BT), (H * BT, 1), (i_tc3, 0), (BC, BC), (1, 0)
         )
@@ -409,10 +402,10 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
     p_Akk33 = tl.make_block_ptr(
         Akkd, (T, BC), (H * BC, 1), (i_tc3, 0), (BC, BC), (1, 0)
     )
-    b_Ai00 = tl.load(p_Akk00, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai11 = tl.load(p_Akk11, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai22 = tl.load(p_Akk22, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai33 = tl.load(p_Akk33, boundary_check=(0, 1)).to(tl.float32)
+    b_Ai00 = tl.load(p_Akk00, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    b_Ai11 = tl.load(p_Akk11, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    b_Ai22 = tl.load(p_Akk22, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    b_Ai33 = tl.load(p_Akk33, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
 
     if not USE_SAFE_GATE:
         m_A = o_i[:, None] > o_i[None, :]
@@ -509,15 +502,18 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
     )
 
     tl.store(p_Akk00, b_Ai00.to(Akk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk10, b_Ai10.to(Akk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk11, b_Ai11.to(Akk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk20, b_Ai20.to(Akk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk21, b_Ai21.to(Akk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk22, b_Ai22.to(Akk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk30, b_Ai30.to(Akk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk31, b_Ai31.to(Akk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk32, b_Ai32.to(Akk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk33, b_Ai33.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+    if BT > BC:
+        tl.store(p_Akk10, b_Ai10.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk11, b_Ai11.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+    if BT > 2 * BC:
+        tl.store(p_Akk20, b_Ai20.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk21, b_Ai21.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk22, b_Ai22.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+    if BT > 3 * BC:
+        tl.store(p_Akk30, b_Ai30.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk31, b_Ai31.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk32, b_Ai32.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk33, b_Ai33.to(Akk.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.heuristics(
@@ -878,7 +874,7 @@ def chunk_gdn2_fwd_intra(
 
     if safe_gate:
         grid = (NT, triton.cdiv(BT, BC), B * H)
-        BK = triton.next_power_of_2(K)
+        BK = max(16, triton.next_power_of_2(K))
         chunk_gdn2_fwd_kernel_intra_sub_chunk[grid](
             q=q,
             k=k,

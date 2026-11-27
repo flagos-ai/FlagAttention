@@ -74,11 +74,8 @@ def chunk_gdn2_fwd(
             chunk_size=chunk_size,
             cu_seqlens=cu_seqlens,
             output_dtype=torch.float32,
+            chunk_indices=chunk_indices,
         )
-    # The intra/output kernels use exp2, while this repository's state kernel
-    # uses natural exp for gk. Keep both bases explicit.
-    g_K2 = g * LN2
-
     w_wy, u_wy, qg, kg, Aqk, Akk = chunk_gdn2_fwd_intra(
         q=q,
         k=k,
@@ -94,12 +91,17 @@ def chunk_gdn2_fwd(
         disable_recompute=disable_recompute,
     )
 
+    recurrence_initial_state = initial_state
+    if initial_state is not None:
+        if state_v_first:
+            recurrence_initial_state = initial_state.transpose(-1, -2)
+        recurrence_initial_state = recurrence_initial_state.contiguous()
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w_wy,
         u=u_wy,
-        gk=g_K2,
-        initial_state=initial_state,
+        gk=g * LN2,
+        initial_state=recurrence_initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,

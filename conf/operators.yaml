@@ -101,7 +101,7 @@ ops:
       - tests/flag_attn/test_gated_delta_rule.py
     benchmark: benchmark/test_gated_delta_rule_benchmark.py
   - id: chunk_gdn2
-    description: Compare native and TLE chunked GDN2 implementations and resource controls.
+    description: Verify chunked GDN2 recurrence and state continuation through the public API.
     for:
       - chunk_gdn2
     labels:

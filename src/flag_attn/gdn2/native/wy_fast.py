@@ -95,7 +95,7 @@ def recompute_w_u_fwd_gdn2_kernel(
         (BT, BT),
         (1, 0),
     )
-    b_A = tl.load(p_A, boundary_check=(0, 1))
+    b_A = tl.load(p_A, boundary_check=(0, 1), padding_option="zero")
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(
@@ -122,8 +122,8 @@ def recompute_w_u_fwd_gdn2_kernel(
             (BT, BV),
             (1, 0),
         )
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_wg = tl.load(p_wg, boundary_check=(0, 1))
+        b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
+        b_wg = tl.load(p_wg, boundary_check=(0, 1), padding_option="zero")
         b_vb = (b_v * b_wg).to(b_v.dtype)
         b_u = tl.dot(b_A, b_vb)
         tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
@@ -153,8 +153,8 @@ def recompute_w_u_fwd_gdn2_kernel(
             (BT, BK),
             (1, 0),
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_b = tl.load(p_b, boundary_check=(0, 1))
+        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
+        b_b = tl.load(p_b, boundary_check=(0, 1), padding_option="zero")
         b_kb = b_k * b_b
 
         p_gk = tl.make_block_ptr(
@@ -165,7 +165,7 @@ def recompute_w_u_fwd_gdn2_kernel(
             (BT, BK),
             (1, 0),
         )
-        b_gk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
+        b_gk = tl.load(p_gk, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
         b_kb *= exp2(b_gk)
 
         if STORE_QG:
@@ -185,7 +185,7 @@ def recompute_w_u_fwd_gdn2_kernel(
                 (BT, BK),
                 (1, 0),
             )
-            b_q = tl.load(p_q, boundary_check=(0, 1))
+            b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
             b_qg = b_q * exp2(b_gk)
             tl.store(p_qg, b_qg.to(p_qg.dtype.element_ty), boundary_check=(0, 1))
 
