@@ -23,6 +23,13 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..hygon import (
+    HygonDecodeWorkspace,
+    attention_decode_hygon,
+    is_hygon_decode_device,
+    prepare_hygon_decode,
+)
+
 from ..assign_task import (
     _bf16_compact__assign_prefix_kernel as _dynamic__assign_prefix_kernel,
     _bf16_compact__assign_records_kernel as _dynamic__assign_records_kernel,
@@ -10791,6 +10798,8 @@ def _base_workspace(workspace) -> DynamicBF16Workspace:
 
 def prepare_dynamic_bf16_workspace(inputs: DynamicBF16Inputs):
     """Prepare the fixed MTP1/MTP2/MTP3 winner, with a generic fallback."""
+    if is_hygon_decode_device(inputs.q.device):
+        return prepare_hygon_decode(inputs, -1)
     if not USE_TLE:
         return prepare_pure_triton_mtp1_workspace(inputs, "bf16")
     mtp, _, _ = _dynamic__validate(inputs)
@@ -10872,9 +10881,11 @@ def prepare_dynamic_bf16_workspace(inputs: DynamicBF16Inputs):
 
 
 def attention_decode_bf16_dynamic(inputs: DynamicBF16Inputs, workspace):
+    """Run the route selected during workspace preparation."""
+    if isinstance(workspace, HygonDecodeWorkspace):
+        return attention_decode_hygon(inputs, workspace)
     if isinstance(workspace, PureTritonMTP1Workspace):
         return attention_decode_pure_triton_mtp1(inputs, workspace)
-    """Run the fixed production route selected during workspace preparation."""
     if isinstance(workspace, _FinalDynamicBF16Workspace):
         if isinstance(workspace.implementation, _SkewedDetachedWorkspace):
             return _run_skewed_detached(inputs, workspace.implementation)
@@ -10912,6 +10923,9 @@ def attention_decode_bf16_dynamic(inputs: DynamicBF16Inputs, workspace):
 
 def refresh_dynamic_bf16_task_map(inputs: DynamicBF16Inputs, workspace) -> None:
     """Refresh a base/final workspace without changing its selected route."""
+    if isinstance(workspace, HygonDecodeWorkspace):
+        # Hygon computes the task map from the current lengths on each call.
+        return
     if isinstance(workspace, PureTritonMTP1Workspace):
         if inputs.mtp != 1:
             raise NotImplementedError("the no-TLE fallback supports MTP=1 only")
@@ -10925,7 +10939,7 @@ def refresh_dynamic_bf16_task_map(inputs: DynamicBF16Inputs, workspace) -> None:
 
 def bf16_dynamic_workspace_is_reset(workspace) -> bool:
     """Return whether cooperative-finalization counters are replay-ready."""
-    if isinstance(workspace, PureTritonMTP1Workspace):
+    if isinstance(workspace, (HygonDecodeWorkspace, PureTritonMTP1Workspace)):
         return True
     base = _base_workspace(workspace)
     return not bool(torch.count_nonzero(base.completion).item())

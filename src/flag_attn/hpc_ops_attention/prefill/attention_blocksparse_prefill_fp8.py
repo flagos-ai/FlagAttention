@@ -208,6 +208,37 @@ def _hopper_autotune_configs():
     return _load_autotune_configs("attention_blocksparse_prefill_fp8_hopper", _hopper_autotune_configs_fallback)
 
 
+@triton.jit
+def _gfx936_round_probability_e4m3(p):
+    # The scaled exponential lies in [0, 256]. E4M3 has three fraction bits,
+    # with a minimum spacing of 2**-9 in the subnormal range.
+    bits = p.to(tl.int32, bitcast=True)
+    exponent = tl.maximum((bits & 0x7F800000) - (3 << 23), 118 << 23)
+    step = exponent.to(tl.float32, bitcast=True)
+    inverse_step = ((254 << 23) - exponent).to(tl.float32, bitcast=True)
+    rounded = tl.inline_asm_elementwise(
+        "v_rndne_f32 $0, $1",
+        constraints="=v,v",
+        args=[p * inverse_step],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    return (rounded * step).to(tl.float16)
+
+
+@triton.jit
+def _gfx936_load_e4m3_as_half(ptrs, valid):
+    # Reuse the E4M3 exponent/mantissa fields, then correct the exponent bias.
+    # Convert the preliminary half to FP32 before scaling for subnormals.
+    raw = tl.load(ptrs.to(tl.pointer_type(tl.uint8)), mask=valid, other=0)
+    raw = raw.to(tl.uint16)
+    mag = raw & 127
+    half_bits = ((raw & 128) << 8) | (mag << 7)
+    value = half_bits.to(tl.float16, bitcast=True).to(tl.float32) * 256.0
+    return tl.where(mag == 127, float("nan"), value).to(tl.float16)
+
+
 @triton.autotune(
     configs=_autotune_configs(),
     key=[
@@ -218,6 +249,7 @@ def _hopper_autotune_configs():
         "HAS_BLOCK_MASK",
         "K_SCALE_PER_TOKEN",
         "KV_LAYOUT",
+        "GFX936",
     ],
 )
 @triton.jit
@@ -271,6 +303,7 @@ def _bsa_fp8_prefill_kernel(
     KV_LEN_BUCKET: tl.constexpr,
     SPARSITY_BUCKET: tl.constexpr,
     KV_LAYOUT: tl.constexpr,
+    GFX936: tl.constexpr,
     SCALE_LOG2E_OVER_SQRT_D: tl.constexpr,
     FP8_P_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -278,7 +311,7 @@ def _bsa_fp8_prefill_kernel(
     HEAD_DIM: tl.constexpr,
 ):
     """One program computes one [BLOCK_M, HEAD_DIM] output tile."""
-    tl.static_assert(BLOCK_M == 128)
+    tl.static_assert(BLOCK_M == (64 if GFX936 else 128))
     tl.static_assert(BLOCK_N == 128)
     tl.static_assert(BLOCK_N % PAGE_SIZE == 0)
     q_tile = tl.program_id(0)
@@ -301,7 +334,10 @@ def _bsa_fp8_prefill_kernel(
     q_valid = offs_m < q_len
 
     q_offsets = (q_begin + offs_m[:, None]) * stride_q_token + q_head * stride_q_head + offs_d[None, :] * stride_q_dim
-    q = tl.load(q_ptr + q_offsets, mask=q_valid[:, None], other=0.0)
+    if GFX936:
+        q = _gfx936_load_e4m3_as_half(q_ptr + q_offsets, q_valid[:, None])
+    else:
+        q = tl.load(q_ptr + q_offsets, mask=q_valid[:, None], other=0.0)
 
     qs_offsets = batch * stride_qs_batch + q_head * stride_qs_head + offs_m * stride_qs_token
     q_scale = tl.load(qscale_ptr + qs_offsets, mask=q_valid, other=0.0).to(tl.float32)
@@ -311,8 +347,7 @@ def _bsa_fp8_prefill_kernel(
     l_i = tl.zeros((BLOCK_M,), tl.float32)
     acc = tl.zeros((BLOCK_M, HEAD_DIM), tl.float32)
 
-    # Only tiles up to the causal end of this Q tile can contribute.  The loop
-    # still has a compile-time maximum so Triton can pipeline it.
+    # Bound the causal range by the page-table capacity.
     q_tile_end = tl.minimum(q_local_start + BLOCK_M, q_len)
     causal_kv_end = q_start_in_kv + q_tile_end
     num_causal_kv_tiles = (causal_kv_end + BLOCK_N - 1) // BLOCK_N
@@ -324,14 +359,23 @@ def _bsa_fp8_prefill_kernel(
     # same value into tl.range would additionally pipeline most pointer-chasing
     # loads and produced NaNs / intermittent illegal accesses at depth 4 on
     # the Triton 3.6 FlagTree backend.
-    for kv_tile in tl.range(0, max_kv_tiles, 1, num_stages=2):
-        tile_active = program_valid & (kv_tile < num_causal_kv_tiles)
+    if GFX936:
+        loop_end = tl.where(program_valid, tl.minimum(num_causal_kv_tiles, max_kv_tiles), 0)
+        full_kv_tiles = (q_start_in_kv + q_local_start + 1) // BLOCK_N
+        if not K_SCALE_PER_TOKEN:
+            qk_scale = q_scale[:, None] * tl.load(kscale_ptr).to(tl.float32)
+    else:
+        loop_end = max_kv_tiles
+
+    for kv_tile in tl.range(0, loop_end, 1, num_stages=2):
+        tile_active = True if GFX936 else program_valid & (kv_tile < num_causal_kv_tiles)
         if HAS_BLOCK_MASK:
+            # Both 64-row programs use the same 128-row block-mask entry.
             mask_in_range = kv_tile < num_mask_kv_tiles
             mask_offset = (
                 batch * stride_mask_batch
                 + q_head * stride_mask_head
-                + q_tile * stride_mask_qtile
+                + (q_local_start // 128) * stride_mask_qtile
                 + kv_tile * stride_mask_kvtile
             )
             selected = (
@@ -368,10 +412,12 @@ def _bsa_fp8_prefill_kernel(
                 + kv_head * stride_k_head
                 + offs_d[None, :] * stride_k_dim
             )
-            k = tl.load(k_ptr + k_offsets, mask=kv_valid[:, None], other=0.0)
+            if GFX936:
+                k = _gfx936_load_e4m3_as_half(k_ptr + k_offsets, kv_valid[:, None])
+            else:
+                k = tl.load(k_ptr + k_offsets, mask=kv_valid[:, None], other=0.0)
 
-            # FP8 x FP8 -> FP32.  On NVIDIA targets Triton lowers this to the
-            # architecture-appropriate Tensor-Core operation.
+            # Use FP32 accumulation with either native FP8 or decoded FP16 operands.
             scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
 
             if K_SCALE_PER_TOKEN:
@@ -391,18 +437,19 @@ def _bsa_fp8_prefill_kernel(
                     other=0.0,
                 ).to(tl.float32)
                 score_scale = q_scale[:, None] * k_scale[None, :]
+            elif GFX936:
+                score_scale = qk_scale
             else:
                 k_scale = tl.load(kscale_ptr).to(tl.float32)
                 score_scale = q_scale[:, None] * k_scale
 
-            q_positions = q_start_in_kv + offs_m
-            causal_valid = kv_tokens[None, :] <= q_positions[:, None]
-            score_valid = q_valid[:, None] & kv_valid[None, :] & causal_valid
-            scores = tl.where(
-                score_valid,
-                scores * score_scale * SCALE_LOG2E_OVER_SQRT_D,
-                -float("inf"),
-            )
+            scores = scores * score_scale * SCALE_LOG2E_OVER_SQRT_D
+            needs_mask = kv_tile >= full_kv_tiles if GFX936 else True
+            if needs_mask:
+                q_positions = q_start_in_kv + offs_m
+                causal_valid = kv_tokens[None, :] <= q_positions[:, None]
+                score_valid = q_valid[:, None] & kv_valid[None, :] & causal_valid
+                scores = tl.where(score_valid, scores, -float("inf"))
 
             # Online softmax in base 2, equivalent to the CUDA implementation.
             tile_max = tl.max(scores, axis=1)
@@ -416,7 +463,10 @@ def _bsa_fp8_prefill_kernel(
 
             # This quantization is part of the original BSA algorithm, not an
             # input Q/K/V quantization step.
-            p_fp8 = (p * FP8_P_SCALE).to(tl.float8e4nv)
+            if GFX936:
+                p_for_dot = _gfx936_round_probability_e4m3(p * FP8_P_SCALE)
+            else:
+                p_for_dot = (p * FP8_P_SCALE).to(tl.float8e4nv)
 
             v_offsets = (
                 physical_pages[:, None] * stride_v_page
@@ -424,8 +474,11 @@ def _bsa_fp8_prefill_kernel(
                 + kv_head * stride_v_head
                 + offs_d[None, :] * stride_v_dim
             )
-            v = tl.load(v_ptr + v_offsets, mask=kv_valid[:, None], other=0.0)
-            acc = tl.dot(p_fp8, v, acc, out_dtype=tl.float32)
+            if GFX936:
+                v = _gfx936_load_e4m3_as_half(v_ptr + v_offsets, kv_valid[:, None])
+            else:
+                v = tl.load(v_ptr + v_offsets, mask=kv_valid[:, None], other=0.0)
+            acc = tl.dot(p_for_dot, v, acc, out_dtype=tl.float32)
             m_i = new_max
 
     if K_SCALE_PER_TOKEN:
@@ -665,7 +718,12 @@ def attention_with_kvcache_blocksparse_prefill_fp8_triton(
     mask_strides = launch.mask_strides
     ks_strides = kscale_kernel.stride() if quant_type_value == 0 else (0, 0, 0, 0)
 
-    grid = (triton.cdiv(max_seqlens_q, _BLOCK_M), num_head_q, num_batch)
+    use_gfx936 = False
+    if torch.version.hip is not None:
+        device_properties = torch.cuda.get_device_properties(q.device)
+        use_gfx936 = getattr(device_properties, "gcnArchName", "").split(":", 1)[0] == "gfx936"
+    block_m = 64 if use_gfx936 else _BLOCK_M
+    grid = (triton.cdiv(max_seqlens_q, block_m), num_head_q, num_batch)
     with torch.cuda.device(q.device):
         _bsa_fp8_prefill_kernel[grid](
             q,
@@ -698,9 +756,10 @@ def attention_with_kvcache_blocksparse_prefill_fp8_triton(
             KV_LEN_BUCKET=kv_len_bucket,
             SPARSITY_BUCKET=workload_sparsity_bucket,
             KV_LAYOUT=kv_layout,
+            GFX936=use_gfx936,
             SCALE_LOG2E_OVER_SQRT_D=_LOG2E / 11.313708498984761,
             FP8_P_SCALE=_FP8_P_SCALE,
-            BLOCK_M=_BLOCK_M,
+            BLOCK_M=block_m,
             BLOCK_N=_BLOCK_N,
             HEAD_DIM=_HEAD_DIM,
         )
