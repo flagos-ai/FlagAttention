@@ -14,16 +14,17 @@
 
 
 import math
-from pathlib import Path
 
 import pytest
 import torch
 
+import flag_attn
+from flag_attn import chunk_log_linear_attn, log_linear_attn
+from flag_attn.runtime.backend import resolve_operator
 from flag_attn.testing import backend as test_backend
 from flag_attn.testing.log_linear_attn import log_linear_attn_reference
 
 pytestmark = pytest.mark.log_linear_attn
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _make_inputs(batch, sequence, heads, dim):
@@ -54,13 +55,16 @@ def _assert_close(name, expected, actual, ratio=0.004):
 
 
 def test_chunk_log_linear_attn_public_export():
-    root_init = (REPO_ROOT / "src/flag_attn/__init__.py").read_text()
-    operator_init = (
-        REPO_ROOT / "src/flag_attn/FLA/log_linear_attn/__init__.py"
-    ).read_text()
-    assert '"chunk_log_linear_attn"' in root_init
-    assert "flag_attn.FLA.log_linear_attn" in root_init
-    assert "from flag_attn.FLA.log_linear_attn.chunk_tle import" in operator_init
+    assert "log_linear_attn" in flag_attn.__all__
+    assert "chunk_log_linear_attn" in flag_attn.__all__
+    assert callable(log_linear_attn)
+    assert callable(chunk_log_linear_attn)
+    assert log_linear_attn is resolve_operator(
+        "log_linear_attn", "flag_attn.FLA.log_linear_attn.chunk_tle", "log_linear_attn"
+    )
+    assert chunk_log_linear_attn is resolve_operator(
+        "chunk_log_linear_attn", "flag_attn.FLA.log_linear_attn", "chunk_log_linear_attn"
+    )
 
 
 @pytest.mark.skipif(not test_backend.supports_operator("log_linear_attn", tle=True), reason="selected Log-Linear implementation is unavailable")
@@ -77,7 +81,6 @@ def test_chunk_log_linear_attn_matches_reference(batch, sequence, heads, dim):
     torch.manual_seed(42)
     inputs = _make_inputs(batch, sequence, heads, dim)
     expected = log_linear_attn_reference(*inputs)
-    from flag_attn import log_linear_attn
 
     actual = log_linear_attn(*inputs)
     _assert_close("output", expected, actual)
