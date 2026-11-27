@@ -16,6 +16,8 @@
 
 import torch
 
+from flag_attn.testing import backend as test_backend
+
 
 def make_case(
     n=4,
@@ -35,30 +37,30 @@ def make_case(
     pool_min=0,
     projection_padding=0,
 ):
-    gen = torch.Generator(device="cuda").manual_seed(seed)
+    gen = torch.Generator(device=test_backend.device).manual_seed(seed)
     lengths = [length] * n if lengths is None else list(lengths)
     total = sum(lengths)
     width = 2 * h * kdim + hv * vdim
-    packed = torch.randn((total, width + projection_padding), device="cuda", dtype=dtype, generator=gen)
+    packed = torch.randn((total, width + projection_padding), device=test_backend.device, dtype=dtype, generator=gen)
     q, k, v = packed[:, :width].split((h * kdim, h * kdim, hv * vdim), dim=-1)
     q, k, v = q.reshape(1, total, h, kdim), k.reshape(1, total, h, kdim), v.reshape(1, total, hv, vdim)
     if not strided:
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    g = -torch.rand((1, total, hv), device="cuda", dtype=torch.float32, generator=gen)
+    g = -torch.rand((1, total, hv), device=test_backend.device, dtype=torch.float32, generator=gen)
     beta_shape = (1, total, hv, vdim) if vector_beta else (1, total, hv)
-    beta = torch.rand(beta_shape, device="cuda", dtype=torch.float32, generator=gen)
+    beta = torch.rand(beta_shape, device=test_backend.device, dtype=torch.float32, generator=gen)
     maxlen = max(max(lengths, default=0), 1)
     pool = max(pool_min, n * maxlen + 7)
     # One distinct row per request/token; slot zero is reserved.
-    idx = (torch.randperm(n * maxlen, device="cuda", generator=gen) + 1).reshape(n, maxlen).to(torch.int32)
+    idx = (torch.randperm(n * maxlen, device=test_backend.device, generator=gen) + 1).reshape(n, maxlen).to(torch.int32)
     if padding and n > 1:
         idx[-1] = 0
-    accepted = (torch.arange(n, device="cuda", dtype=torch.int32) % maxlen + 1) if spec else None
-    state = torch.randn((pool, hv, vdim, kdim), device="cuda", dtype=state_dtype, generator=gen) * 0.05
+    accepted = (torch.arange(n, device=test_backend.device, dtype=torch.int32) % maxlen + 1) if spec else None
+    state = torch.randn((pool, hv, vdim, kdim), device=test_backend.device, dtype=state_dtype, generator=gen) * 0.05
     offsets = [0]
     for l in lengths:
         offsets.append(offsets[-1] + l)
-    cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    cu = torch.tensor(offsets, device=test_backend.device, dtype=torch.int32)
     return dict(
         q=q,
         k=k,
@@ -135,24 +137,6 @@ def check_close(out, state, ref_out, ref_state):
     assert torch.isfinite(out).all() and torch.isfinite(state).all()
 
 
-def record_recurrent_launch(monkeypatch):
-    import flag_attn.FLA.gated_delta_rule.fused_recurrent as module
-
-    kernel = module._recurrent_fwd_kernel
-    calls = []
-
-    class Recorder:
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                calls.append({**dict(zip(kernel.arg_names, args)), **kwargs})
-                return kernel[grid](*args, **kwargs)
-
-            return launch
-
-    monkeypatch.setattr(module, "_recurrent_fwd_kernel", Recorder())
-    return calls
-
-
 def make_packed_case(
     n=4,
     h=4,
@@ -170,11 +154,11 @@ def make_packed_case(
     )
     width = 2 * h * kdim + hv * vdim
     mixed = c["q"].as_strided((n, width), (c["q"].stride(1), 1), storage_offset=0)
-    gen = torch.Generator(device="cuda").manual_seed(seed + 71)
-    a = torch.randn((n, hv), device="cuda", dtype=dtype, generator=gen)
-    b = torch.randn((n, hv), device="cuda", dtype=dtype, generator=gen)
-    A_log = torch.randn((hv,), device="cuda", generator=gen) * 0.2
-    dt_bias = torch.randn((hv,), device="cuda", generator=gen)
+    gen = torch.Generator(device=test_backend.device).manual_seed(seed + 71)
+    a = torch.randn((n, hv), device=test_backend.device, dtype=dtype, generator=gen)
+    b = torch.randn((n, hv), device=test_backend.device, dtype=dtype, generator=gen)
+    A_log = torch.randn((hv,), device=test_backend.device, generator=gen) * 0.2
+    dt_bias = torch.randn((hv,), device=test_backend.device, generator=gen)
     return dict(
         mixed_qkv=mixed,
         a=a,
@@ -183,7 +167,7 @@ def make_packed_case(
         dt_bias=dt_bias,
         scale=c["scale"],
         initial_state=c["initial_state"],
-        out=torch.empty((n, 1, hv, vdim), device="cuda", dtype=dtype),
+        out=torch.empty((n, 1, hv, vdim), device=test_backend.device, dtype=dtype),
         ssm_state_indices=c["ssm_state_indices"][:, 0],
         use_qk_l2norm_in_kernel=True,
     )

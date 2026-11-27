@@ -12,7 +12,7 @@ import triton.language as tl
 from flag_attn import runtime
 from flag_attn.FLA.compat import libentry, libtuner
 from flag_attn.FLA.index import prepare_chunk_indices
-from flag_attn.FLA.utils import exp, is_nvidia_hopper
+from triton.language import exp
 from flag_attn.utils import check_shared_mem
 from flag_attn.FLA.utils import FLA_GDN_FIX_BT
 
@@ -32,8 +32,7 @@ BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
         for config in runtime.get_tuned_config(
             "chunk_fwd_kernel_o" if BKV_LIST[0] == 64 else "chunk_fwd_kernel_o_small_shared"
         )
-        if not is_nvidia_hopper or config.num_warps in (2, 4)
-    ],
+    ] or [triton.Config({"BK": 32, "BV": 32}, num_warps=4, num_stages=1)],
     key=["T", "H", "Hg", "K", "V", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])

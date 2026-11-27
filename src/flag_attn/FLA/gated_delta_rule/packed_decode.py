@@ -70,7 +70,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     """Update one token per request, returning the supplied out and cache tensors.
 
     mixed_qkv: [N, 2*H*K + HV*V], a/b: [N,HV], A_log/dt_bias: [HV].
-    State: [pool,HV,V,K], output: [N,1,HV,V], indices: [N] CUDA int32/int64.
+    State: [pool,HV,V,K], output: [N,1,HV,V], indices: [N] device int32/int64.
     g=-exp(A_log)*softplus(a+dt_bias, threshold=20), beta=sigmoid(b).
     Beta is rounded to b.dtype before the FP32 state update, matching vLLM.
     H divides HV. K/V are in 1..256; N and HV each must be <=65535.
@@ -83,8 +83,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     """
     tensors = (mixed_qkv, a, b, A_log, dt_bias, initial_state, out, ssm_state_indices)
     dev = mixed_qkv.device
-    if dev.type != "cuda" or any(x.device != dev for x in tensors):
-        raise ValueError("all tensors must be on the same CUDA device")
+    if any(x.device != dev for x in tensors):
+        raise ValueError("all tensors must be on the same device")
     if torch.is_grad_enabled() and any(x.requires_grad for x in tensors):
         raise RuntimeError("packed GDN decode supports forward inference only")
     if mixed_qkv.ndim != 2 or mixed_qkv.stride(-1) != 1:
@@ -94,7 +94,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     n = mixed_qkv.shape[0]
     hv, dv, dk = initial_state.shape[1:]
     if not (0 < dk <= 256 and 0 < dv <= 256 and 0 < hv <= 65535 and n <= 65535):
-        raise ValueError("unsupported dimensions or CUDA grid limits")
+        raise ValueError("unsupported dimensions or grid limits")
     qk_dim = mixed_qkv.shape[1] - hv * dv
     if qk_dim <= 0 or qk_dim % (2 * dk) or hv % (qk_dim // (2 * dk)):
         raise ValueError("invalid packed QKV width or grouped head ratio")

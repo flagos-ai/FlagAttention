@@ -11,20 +11,17 @@ import triton.language as tl
 from flag_attn import runtime
 from flag_attn.FLA.compat import libentry, libtuner
 from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
-from flag_attn.FLA.utils import exp
+from triton.language import exp
 from flag_attn.FLA.utils import use_cuda_graph
 
 
 def _prune_state_configs(configs, named_args, **kwargs):
     args = {**named_args, **kwargs}
-    k = args["k"]
     use_narrow = (
         args["K"] <= 128
         and not args["IS_VARLEN"]
         and args["USE_G"]
         and not args["USE_GK"]
-        and triton.runtime.driver.active.get_current_target().backend == "cuda"
-        and torch.cuda.get_device_capability(k.device)[0] == 9
     )
     return [config for config in configs if use_narrow or config.kwargs["BV"] != 16]
 

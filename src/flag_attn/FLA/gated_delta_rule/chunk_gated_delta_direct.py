@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 
 from flag_attn.FLA.compat import libentry
-from flag_attn.FLA.utils import exp
+from triton.language import exp
 
 _DIRECT_MAX_T = 128
 _DIRECT_MAX_K = 128

@@ -27,7 +27,6 @@ _CUDA_GENERIC_OPERATORS = {
     "inkling_fa4_rel_attention",
     "diffkv_attention",
     "hy3_attention",
-    "chunk_gated_delta_rule",
     "parallel_parallax",
     "parallax_decode",
     "parallax_attn_with_kvcache",

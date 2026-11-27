@@ -17,17 +17,10 @@
 import torch
 import triton
 import triton.language as tl
-import triton.experimental.tle.language as tle
 
 
 @triton.jit
 def _load(ptr, mask, USE_TLE: tl.constexpr, ASYNC: tl.constexpr = False, CG: tl.constexpr = False):
-    if USE_TLE:
-        if CG:
-            return tle.load(ptr, mask=mask, other=0, is_async=ASYNC, cache_modifier=".cg")
-        return tle.load(ptr, mask=mask, other=0, is_async=ASYNC)
-    if CG:
-        return tl.load(ptr, mask=mask, other=0, cache_modifier=".cg")
     return tl.load(ptr, mask=mask, other=0)
 
 
@@ -114,9 +107,6 @@ def _recurrent_fwd_kernel(
         state_idx = tl.load(Indices + n * IS[0] + it * IS[1]).to(tl.int64)
     rk = tl.arange(0, BK)
     rv = iv * BV + tl.arange(0, BV)
-    if LAYOUT is not None:
-        rk = tle.gpu.set_layout(rk, tle.gpu.SlicedEncoding(0, LAYOUT))
-        rv = tle.gpu.set_layout(rv, tle.gpu.SlicedEncoding(1, LAYOUT))
     if WIDE_OFFSETS:
         rk, rv = rk.to(tl.int64), rv.to(tl.int64)
     mk, mv = rk < DK, rv < DV
@@ -219,7 +209,8 @@ def _launch(
     use_tle=True,
     gate_parameters=None,
 ):
-    """Launch the shared recurrence with caller-provided output and state buffers."""
+    """Launch portable recurrence; use_tle is retained for signature compatibility."""
+    del use_tle
     direct_packed = gate_parameters is not None and k is None
     if direct_packed:
         HV, DV, DK = initial_state.shape[1:]
@@ -231,7 +222,6 @@ def _launch(
     N = B if cu_seqlens is None else cu_seqlens.numel() - 1
     if N == 0 or T == 0:
         return None
-    layout_vec = 0
     cache_state = reuse_packed_state = False
     # Trade live FP32 state registers against repeated Q/K and gate work.
     if config is None:
@@ -247,47 +237,9 @@ def _launch(
                 # Half-size snapshots favor wider tiles once the grid is large.
                 tile = min(32, 4096 // triton.next_power_of_2(DK))
         config = (tile, 1, False)
-        dense_cache = initial_state.stride()[1:] == (DV * DK, DK, 1)
-        vector_cache = (
-            use_tle
-            and DK == 128
-            and DV >= 64
-            and DV % 16 == 0
-            and dense_cache
-            and torch.cuda.get_device_capability(q.device)[0] == 9
-        )
-        if vector_cache and initial_state.dtype in (torch.float32, torch.bfloat16):
-            state_bytes = N * HV * DK * DV * initial_state.element_size()
-            tokens_per_request = B * T // N
-            if (
-                direct_packed
-                and inplace_final_state
-                and final_state is initial_state
-                and ssm_state_indices is not None
-                and ssm_state_indices.ndim == 1
-                and num_accepted_tokens is None
-                and state_bytes >= 64 * 1024**2
-            ):
-                # Large caches favor fewer CTAs; packed decode writes the slot it read.
-                config = (32, 1, False)
-                cache_state = reuse_packed_state = True
-            elif (
-                gate_parameters is None
-                and tokens_per_request > 1
-                and state_bytes * (tokens_per_request + 1) >= 64 * 1024**2
-                and hasattr(tle.gpu, "set_layout")
-                and q.stride(-1) == 1
-                and k.stride(-1) == 1
-            ):
-                # Put warps on V so the K reductions stay within a warp.
-                warps, layout_vec = (4, 4) if initial_state.dtype == torch.float32 else (1, 8)
-                config = (16, warps, False)
     BV, warps, async_state = config
     BV = min(triton.next_power_of_2(DV), BV)
     layout = None
-    if layout_vec:
-        threads_k = min(32, triton.next_power_of_2(DK) // layout_vec)
-        layout = tle.gpu.BlockEncoding([1, layout_vec], [32 // threads_k, threads_k], [warps, 1], [1, 0])
     idx_strides = (1, 0)
     if ssm_state_indices is not None:
         idx_strides = (ssm_state_indices.stride(0), 0) if ssm_state_indices.ndim == 1 else ssm_state_indices.stride()
@@ -355,7 +307,7 @@ def _launch(
         inplace_final_state,
         beta.ndim == 4,
         normalize,
-        use_tle,
+        False,
         async_state,
         gate_parameters is not None,
         split_grid,
@@ -388,7 +340,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     beta: [B,T,HV] or [B,T,HV,V]. HV must be divisible by H.
     initial_state: [pool,HV,V,K]; dense no-index mode uses one row per sequence.
     Packed variable lengths require B=1 and contiguous cu_seqlens [N+1].
-    K and V must be in 1..256. N and HV must each fit the CUDA Y/Z-grid limit 65535.
+    K and V must be in 1..256. N and HV must each fit the launch-grid limit 65535.
     A selected initial index <=0 marks a padded request: its outputs and returned
     snapshots are zero and cache is untouched. For an active request, nonpositive
     per-token write indices suppress only that store; recurrence/output continues.
@@ -400,8 +352,8 @@ def fused_recurrent_gated_delta_rule_fwd(
     metadata; they must be valid and remain device resident (no host sync).
     """
     tensors = (q, k, v, g, beta, initial_state)
-    if any(x.device != q.device for x in tensors) or q.device.type != "cuda":
-        raise ValueError("all tensors must be on the same CUDA device")
+    if any(x.device != q.device for x in tensors):
+        raise ValueError("all tensors must be on the same device")
     if any(x.requires_grad for x in tensors) and torch.is_grad_enabled():
         raise RuntimeError("fused recurrent GDN supports forward inference only")
     if q.ndim != 4 or v.ndim != 4 or k.shape != q.shape or v.shape[:2] != q.shape[:2]:
@@ -437,7 +389,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         raise ValueError("request and value-head counts must each not exceed 65535")
     for metadata in (cu_seqlens, ssm_state_indices, num_accepted_tokens):
         if metadata is not None and (metadata.device != q.device or metadata.dtype not in (torch.int32, torch.int64)):
-            raise ValueError("offsets, indices and counts must be CUDA int32/int64 tensors")
+            raise ValueError("offsets, indices and counts must be device int32/int64 tensors")
     if ssm_state_indices is not None and ssm_state_indices.shape[0] != N:
         raise ValueError("state indices need one row per sequence")
     if ssm_state_indices is not None and ssm_state_indices.ndim == 2:
