@@ -35,7 +35,7 @@ try:
     if not test_backend.is_nvidia():
         raise ImportError("FlashKDA is an optional NVIDIA comparison")
     import flash_kda
-except ImportError:
+except (ImportError, RuntimeError):
     flash_kda = None
 
 LOWER_BOUND = -5.0
@@ -98,7 +98,7 @@ def benchmark_case(
     results = {}
 
     for provider in providers:
-        if provider == "tle":
+        if provider in ("flag-attn", "tle"):
 
             def run():
                 with torch.inference_mode():
@@ -136,23 +136,24 @@ def benchmark_case(
             f"latency={latency_ms:>8.3f} ms token-head/s={token_heads_per_second:>12.0f}"
         )
 
-    if "tle" in results and "flash-kda" in results:
-        speedup = results["flash-kda"][0] / results["tle"][0]
-        print(f"{'comparison':<10} {name:<18} TLE speedup vs FlashKDA={speedup:.3f}x")
+    candidate_name = "flag-attn" if "flag-attn" in results else "tle"
+    if candidate_name in results and "flash-kda" in results:
+        speedup = results["flash-kda"][0] / results[candidate_name][0]
+        print(f"{'comparison':<10} {name:<18} FlagAttention speedup vs FlashKDA={speedup:.3f}x")
 
     return results
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark the TLE chunk KDA kernel against an optional FlashKDA baseline"
+        description="Benchmark automatically dispatched KDA against an optional FlashKDA baseline"
     )
     parser.add_argument("--case", choices=BENCHMARK_CASES, action="append")
     parser.add_argument("--seq-lens", type=int, nargs="+", help="custom sequence lengths; overrides --case")
     parser.add_argument("--heads", type=int, default=DEFAULT_HEADS)
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)
-    parser.add_argument("--provider", choices=("tle", "flash-kda"), action="append")
+    parser.add_argument("--provider", choices=("flag-attn", "tle", "flash-kda"), action="append")
     args = parser.parse_args()
 
     if not test_backend.is_available():
@@ -166,15 +167,16 @@ def main() -> None:
         names = args.case or list(BENCHMARK_CASES)
         cases = [(name, BENCHMARK_CASES[name]) for name in names]
 
-    providers = args.provider or ["tle"] + (["flash-kda"] if flash_kda is not None else [])
+    providers = args.provider or ["flag-attn"] + (["flash-kda"] if flash_kda is not None else [])
 
     torch.manual_seed(42)
     print(f"GPU: {test_backend.get_device_name()} | dtype=bfloat16 | D={D_HEAD}")
     metrics = []
     for name, seq_lens in cases:
         results = benchmark_case(name, seq_lens, args.heads, args.warmup, args.rep, providers)
-        if "tle" in results:
-            latency = results["tle"][0]
+        candidate_name = "flag-attn" if "flag-attn" in results else "tle"
+        if candidate_name in results:
+            latency = results[candidate_name][0]
             baseline = results.get("flash-kda")
             baseline_ms = baseline[0] if baseline is not None else None
             metrics.append(
@@ -194,13 +196,13 @@ def main() -> None:
     if metrics:
         record_benchmark_result(
             None,
-            op_name="chunk_kda",
+            op_name="KDA",
             dtype=str(torch.bfloat16),
             result=metrics,
             baseline="FlashKDA" if "flash-kda" in providers else None,
         )
     else:
-        print("[benchmark] FlagAttention TLE provider not selected; no speedup record")
+        print("[benchmark] FlagAttention provider not selected; no speedup record")
 
 
 if __name__ == "__main__":

@@ -20,16 +20,17 @@ import torch
 import torch.nn.functional as F
 
 from flag_attn.testing import backend as test_backend
-if not test_backend.has_specialization("chunk_kda_fwd_infer"):
-    pytest.importorskip("triton.experimental.tle.language", reason="generic chunk_kda requires Triton TLE >= 3.6")
 
-from flag_attn import chunk_kda
+import flag_attn
 
 LOWER_BOUND = -5.0
 ASSERT_RATIO = 0.005
 D_HEAD = 128
 
-pytestmark = [pytest.mark.chunk_kda, pytest.mark.skipif(not test_backend.is_available(), reason="requires an available accelerator")]
+pytestmark = [
+    pytest.mark.KDA,
+    pytest.mark.skipif(not test_backend.is_available(), reason="requires an available accelerator"),
+]
 
 
 def _lower_bound_gate(
@@ -38,9 +39,7 @@ def _lower_bound_gate(
     dt_bias: torch.Tensor,
 ) -> torch.Tensor:
     H = g.shape[-2]
-    return LOWER_BOUND * torch.sigmoid(
-        A_log.view(H, 1).float().exp() * (g.float() + dt_bias.view(H, -1))
-    )
+    return LOWER_BOUND * torch.sigmoid(A_log.view(H, 1).float().exp() * (g.float() + dt_bias.view(H, -1)))
 
 
 def _recurrent_reference(
@@ -69,8 +68,8 @@ def _recurrent_reference(
         g_i, beta_i = g[:, i], beta[:, i]
         state = state * g_i[..., None].exp()
         residual = v_i - (k_i[..., None] * state).sum(-2)
-        state = state + torch.einsum("bhk,bhv->bhkv", beta_i[..., None] * k_i, residual)
-        output[:, i] = torch.einsum("bhk,bhkv->bhv", q_i, state)
+        state = state + (beta_i[..., None] * k_i)[..., None] * residual[..., None, :]
+        output[:, i] = (q_i[..., None] * state).sum(-2)
 
     final_state = state.transpose(-1, -2).contiguous() if output_final_state else None
     return output.to(dtype), final_state
@@ -96,9 +95,7 @@ def _reference(
     beta = beta.float().sigmoid()
 
     if cu_seqlens is None:
-        return _recurrent_reference(
-            q, k, v, g, beta, scale, initial_state, output_final_state
-        )
+        return _recurrent_reference(q, k, v, g, beta, scale, initial_state, output_final_state)
 
     outputs = []
     final_states = []
@@ -199,15 +196,12 @@ def _make_inputs(
 def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
     actual = actual.float()
     expected = expected.float()
-    assert not torch.isnan(actual).any(), f"{name}: NaN in TLE output"
-    assert not torch.isnan(expected).any(), f"{name}: NaN in reference output"
+    assert torch.isfinite(actual).all(), f"{name}: non-finite output"
+    assert torch.isfinite(expected).all(), f"{name}: non-finite reference output"
     absolute_error = (actual - expected).abs().max().item()
-    relative_error = (actual - expected).square().mean().sqrt() / (
-        expected.square().mean().sqrt() + 1e-8
-    )
+    relative_error = (actual - expected).square().mean().sqrt() / (expected.square().mean().sqrt() + 1e-8)
     assert absolute_error <= 1e-6 or relative_error.item() < ASSERT_RATIO, (
-        f"{name}: max error={absolute_error:.6f}, RMS ratio={relative_error.item():.6f}, "
-        f"limit={ASSERT_RATIO}"
+        f"{name}: max error={absolute_error:.6f}, RMS ratio={relative_error.item():.6f}, " f"limit={ASSERT_RATIO}"
     )
 
 
@@ -221,8 +215,10 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
         pytest.param([17, 15], 1, torch.bfloat16, True, True, True, id="varlen-noncontiguous-bf16-state"),
     ],
 )
+@pytest.mark.parametrize("api", ["chunk_kda", "chunk_kda_fwd_infer"])
 @torch.inference_mode()
 def test_chunk_kda_matches_recurrent_reference(
+    api,
     seq_lens,
     B,
     state_dtype,
@@ -241,7 +237,7 @@ def test_chunk_kda_matches_recurrent_reference(
         noncontiguous=noncontiguous,
     )
 
-    actual, actual_final = chunk_kda(*args, **kwargs)
+    actual, actual_final = getattr(flag_attn, api)(*args, **kwargs)
     expected, expected_final = _reference(
         *args,
         scale=kwargs["scale"],

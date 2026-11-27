@@ -20,19 +20,18 @@ import torch
 import torch.nn.functional as F
 
 from flag_attn.testing import backend as test_backend
-from flag_attn.runtime.backend._enflame.FLA.kda import chunk_kda
+from flag_attn import chunk_kda
 
 LOWER_BOUND = -5.0
 ASSERT_RATIO = 0.005
 
 
 def _accelerator_available() -> bool:
-    return test_backend.runtime.device.vendor_name == "enflame" and test_backend.is_available()
+    return test_backend.is_available()
 
 
 pytestmark = [
-    pytest.mark.chunk_kda,
-    pytest.mark.chunk_kda_enflame,
+    pytest.mark.KDA,
     pytest.mark.skipif(
         not _accelerator_available(),
         reason="chunk_kda tests require an available Enflame GCU",
@@ -82,12 +81,9 @@ def _naive_recurrent_kda(
     for i in range(T):
         q_i, k_i, v_i, g_i, beta_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
         state = state * g_i[..., None].exp()
-        state = state + torch.einsum(
-            "b h k, b h v -> b h k v",
-            beta_i[..., None] * k_i,
-            v_i - (k_i[..., None] * state).sum(-2),
-        )
-        out[:, i] = torch.einsum("b h k, b h k v -> b h v", q_i, state)
+        residual = v_i - (k_i[..., None] * state).sum(-2)
+        state = state + (beta_i[..., None] * k_i)[..., None] * residual[..., None, :]
+        out[:, i] = (q_i[..., None] * state).sum(-2)
 
     return out.to(dtype), state if output_final_state else None
 
@@ -150,9 +146,7 @@ def _reference_chunk_kda(
     cu_seqlens_list = cu_seqlens.detach().cpu().tolist()
     outs, final_states = [], []
     for i, (start, end) in enumerate(zip(cu_seqlens_list[:-1], cu_seqlens_list[1:])):
-        initial_state_i = (
-            initial_state[i : i + 1] if initial_state is not None else None
-        )
+        initial_state_i = initial_state[i : i + 1] if initial_state is not None else None
         out_i, final_state_i = _naive_recurrent_kda(
             q=q[:, start:end],
             k=k[:, start:end],
@@ -185,7 +179,7 @@ def _make_inputs(
     use_initial_state: bool,
     output_final_state: bool,
 ) -> tuple[tuple[torch.Tensor, ...], dict]:
-    device = "gcu"
+    device = test_backend.device
     T = sum(seq_lens)
     N = len(seq_lens)
 
@@ -195,9 +189,7 @@ def _make_inputs(
     v = rand(1, T, HV, D, device=device, dtype=dtype)
     g = torch.randn(1, T, HV, D, device=device, dtype=dtype)
     beta = torch.randn(1, T, HV, device=device, dtype=dtype)
-    A_log = torch.log(
-        torch.empty(HV, device=device, dtype=torch.float32).uniform_(1, 16)
-    )
+    A_log = torch.log(torch.empty(HV, device=device, dtype=torch.float32).uniform_(1, 16))
     dt_bias = torch.randn(HV, D, device=device, dtype=torch.float32)
 
     initial_state = None
@@ -216,9 +208,6 @@ def _make_inputs(
         "scale": scale,
         "initial_state": initial_state,
         "output_final_state": output_final_state,
-        "use_qk_l2norm_in_kernel": True,
-        "use_gate_in_kernel": True,
-        "use_beta_sigmoid_in_kernel": True,
         "safe_gate": True,
         "lower_bound": LOWER_BOUND,
         "A_log": A_log,
@@ -249,13 +238,11 @@ def _assert_close(
     expected = expected.float()
     abs_err = _abs_err(expected, actual)
     err_ratio = _err_ratio(expected, actual)
-    msg = (
-        f"{name} diff: {abs_err:.6f} ratio: {err_ratio:.6f} " f"(limit {ASSERT_RATIO})"
-    )
+    msg = f"{name} diff: {abs_err:.6f} ratio: {err_ratio:.6f} " f"(limit {ASSERT_RATIO})"
     if abs_err <= 1e-6:
         return
-    assert not torch.isnan(expected).any(), f"{name}: NaN detected in reference"
-    assert not torch.isnan(actual).any(), f"{name}: NaN detected in actual"
+    assert torch.isfinite(expected).all(), f"{name}: non-finite reference"
+    assert torch.isfinite(actual).all(), f"{name}: non-finite output"
     assert err_ratio < ASSERT_RATIO, msg
 
 
