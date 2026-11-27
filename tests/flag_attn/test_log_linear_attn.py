@@ -18,6 +18,9 @@ import math
 import pytest
 import torch
 
+import flag_attn
+from flag_attn import chunk_log_linear_attn, log_linear_attn
+from flag_attn.runtime.backend import resolve_operator
 from flag_attn.testing import backend as test_backend
 from flag_attn.testing.log_linear_attn import log_linear_attn_reference
 
@@ -52,21 +55,16 @@ def _assert_close(name, expected, actual, ratio=0.004):
 
 
 def test_chunk_log_linear_attn_public_export():
-    import flag_attn
-    from flag_attn.runtime.backend import resolve_operator
-
-    exports = (
-        ("log_linear_attn", "flag_attn.FLA.log_linear_attn.chunk_tle"),
-        ("chunk_log_linear_attn", "flag_attn.FLA.log_linear_attn"),
+    assert "log_linear_attn" in flag_attn.__all__
+    assert "chunk_log_linear_attn" in flag_attn.__all__
+    assert callable(log_linear_attn)
+    assert callable(chunk_log_linear_attn)
+    assert log_linear_attn is resolve_operator(
+        "log_linear_attn", "flag_attn.FLA.log_linear_attn.chunk_tle", "log_linear_attn"
     )
-
-    for name, module in exports:
-        assert name in flag_attn.__all__
-        actual = getattr(flag_attn, name)
-        assert callable(actual), f"{name} is not callable"
-
-        expected = resolve_operator(name, module, name)
-        assert actual is expected, f"{name} resolves to an unexpected implementation"
+    assert chunk_log_linear_attn is resolve_operator(
+        "chunk_log_linear_attn", "flag_attn.FLA.log_linear_attn", "chunk_log_linear_attn"
+    )
 
 
 @pytest.mark.skipif(not test_backend.supports_operator("log_linear_attn", tle=True), reason="selected Log-Linear implementation is unavailable")
@@ -83,7 +81,6 @@ def test_chunk_log_linear_attn_matches_reference(batch, sequence, heads, dim):
     torch.manual_seed(42)
     inputs = _make_inputs(batch, sequence, heads, dim)
     expected = log_linear_attn_reference(*inputs)
-    from flag_attn import log_linear_attn
 
     actual = log_linear_attn(*inputs)
     _assert_close("output", expected, actual)
