@@ -17,6 +17,11 @@
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "chunk_gated_delta_rule": (".gated_delta_rule", "chunk_gated_delta_rule"),
+    "chunk_gated_delta_rule_fwd": (".gated_delta_rule", "chunk_gated_delta_rule_fwd"),
+    "fused_recurrent_gated_delta_rule_fwd": (".gated_delta_rule", "fused_recurrent_gated_delta_rule_fwd"),
+    "fused_recurrent_gated_delta_rule_packed_decode": (".gated_delta_rule", "fused_recurrent_gated_delta_rule_packed_decode"),
+
     "chunk_gdn2": (".gdn2.chunk", "chunk_gdn2"),
     "minimax_m3_index_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_score"),
     "minimax_m3_index_decode_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode_score"),

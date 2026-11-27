@@ -10,6 +10,7 @@ Selection is cached for the process's detected vendor; callers can supply
 vendor explicitly for inspection. No kernel is called by the registry.
 """
 
+import os
 from functools import lru_cache
 from importlib import import_module
 from importlib.util import resolve_name
@@ -55,6 +56,10 @@ def resolve_operator(
     facades resolve each primitive separately, preserving their controls.
     Unknown symbols and dependency errors in declared overrides propagate.
     """
+    # Set before importing public operators; useful for validating portable
+    # implementations on a device that also has optimized kernels.
+    if os.environ.get("FLAG_ATTN_FORCE_GENERIC", "0").lower() in {"1", "true", "yes", "on"}:
+        return getattr(import_module(generic_module), generic_name or name)
     if vendor is None:
         vendor = import_module("flag_attn.runtime").device.vendor_name
     return _resolve_operator(name, generic_module, generic_name or name, vendor)
