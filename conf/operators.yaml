@@ -132,8 +132,8 @@ ops:
       - tests/flag_attn/test_chunk_gla.py::test_chunk_state_v_first
       - tests/flag_attn/test_chunk_gla.py::test_chunk_varlen
     benchmark: benchmark/test_chunk_gla_benchmark.py
-  - id: chunk_kda
-    description: Run Kimi Delta Attention inference on the selected backend against its recurrent reference.
+  - id: KDA
+    description: Run portable and automatically selected Kimi Delta Attention inference.
     for:
       - chunk_kda
       - chunk_kda_fwd_infer
@@ -147,22 +147,8 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/test_FLA/test_chunk_kda.py
-    benchmark: benchmark/test_FLA/bench_chunk_kda.py
-  - id: chunk_kda_enflame
-    description: Run Enflame Kimi Delta Attention accuracy tests and its pytest benchmark.
-    for:
-      - chunk_kda
-    labels:
-      - fused
-      - FLA
-      - enflame
-      - NoCPU
-    kind:
-      - Attention
-    stages:
-      - alpha: 'unreleased'
-    tests:
       - tests/flag_attn/test_chunk_kda.py
+      - tests/flag_attn/test_kda_portability.py
     benchmark: benchmark/test_chunk_kda.py
   - id: flash_attention
     description: Run FlashAttention forward, including its auxiliary-output path.

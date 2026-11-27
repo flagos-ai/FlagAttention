@@ -1,283 +1,130 @@
 # Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
-import itertools
+"""Portable KDA inference timings through the two public API names."""
+
 import math
-
+import os
+import sys
 
 import pytest
 import torch
-import torch.nn.functional as F
 
-from benchmark.base import Benchmark
+import flag_attn
 from flag_attn.testing import backend as test_backend
-from flag_attn.runtime.backend._enflame.FLA.kda import chunk_kda
-
-DEVICE = "gcu"
-LOWER_BOUND = -5.0
-DEFAULT_H = 96
-DEFAULT_D = 128
-FIXED_CASES = [
-    [8192],
-]
-VARLEN_CASES = [
-    [1300, 547, 2048, 963, 271, 3063],
-    [1024] * 8,
-]
-FLASHKDA_CASES = FIXED_CASES + VARLEN_CASES
-
-
-def _gcu_available() -> bool:
-    return test_backend.runtime.device.vendor_name == "enflame" and test_backend.is_available()
-
-
-def _chunk_kda_inference_op(*args, **kwargs):
-    with torch.inference_mode():
-        return chunk_kda(*args, **kwargs)
-
-
-def _naive_kda_lowerbound_gate(
-    g: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor | None = None,
-    lower_bound: float = LOWER_BOUND,
-) -> torch.Tensor:
-    H, _ = g.shape[-2:]
-    g = g.float()
-    if dt_bias is not None:
-        g = g + dt_bias.view(H, -1)
-    return lower_bound * torch.sigmoid(A_log.view(H, 1).float().exp() * g)
-
-
-def _naive_recurrent_kda(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float | None = None,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = False,
-):
-    dtype = v.dtype
-    B, T, H, K = q.shape
-    HV, V = v.shape[2], v.shape[-1]
-    G = HV // H
-    if scale is None:
-        scale = K**-0.5
-
-    q, k, v, g, beta = map(lambda x: x.to(torch.float), [q, k, v, g, beta])
-    q = q.repeat_interleave(G, dim=2) * scale
-    k = k.repeat_interleave(G, dim=2)
-
-    state = k.new_zeros(B, HV, K, V).to(q)
-    if initial_state is not None:
-        state = state + initial_state
-
-    out = torch.zeros_like(v)
-    for i in range(T):
-        q_i, k_i, v_i, g_i, beta_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
-        state = state * g_i[..., None].exp()
-        state = state + torch.einsum(
-            "b h k, b h v -> b h k v",
-            beta_i[..., None] * k_i,
-            v_i - (k_i[..., None] * state).sum(-2),
-        )
-        out[:, i] = torch.einsum("b h k, b h k v -> b h v", q_i, state)
-
-    return out.to(dtype), state if output_final_state else None
-
-
-def _state_to_kv_layout(
-    state: torch.Tensor | None,
-    state_v_first: bool,
-) -> torch.Tensor | None:
-    if state is None:
-        return None
-    if state_v_first:
-        return state.transpose(-1, -2).contiguous()
-    return state
-
-
-def _state_from_kv_layout(
-    state: torch.Tensor | None,
-    state_v_first: bool,
-) -> torch.Tensor | None:
-    if state is None:
-        return None
-    if state_v_first:
-        return state.transpose(-1, -2).contiguous()
-    return state
-
-
-def _chunk_kda_torch_reference_op(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    scale=None,
-    initial_state=None,
-    output_final_state=False,
-    safe_gate=True,
-    lower_bound=LOWER_BOUND,
-    A_log=None,
-    dt_bias=None,
-    state_v_first=False,
-    cu_seqlens=None,
-    **kwargs,
-):
-    if not safe_gate:
-        raise ValueError("chunk_kda torch reference currently expects safe_gate=True")
-    if A_log is None or dt_bias is None:
-        raise ValueError("chunk_kda torch reference requires A_log and dt_bias")
-
-    with torch.inference_mode():
-        q = F.normalize(q.float(), p=2.0, dim=-1)
-        k = F.normalize(k.float(), p=2.0, dim=-1)
-        g = _naive_kda_lowerbound_gate(g, A_log, dt_bias, lower_bound=lower_bound)
-        beta = beta.float().sigmoid()
-
-        if cu_seqlens is None:
-            out, final_state = _naive_recurrent_kda(
-                q=q,
-                k=k,
-                v=v.float(),
-                g=g,
-                beta=beta,
-                scale=scale,
-                initial_state=_state_to_kv_layout(initial_state, state_v_first),
-                output_final_state=output_final_state,
-            )
-            return out.to(v.dtype), _state_from_kv_layout(final_state, state_v_first)
-
-        cu_seqlens_list = cu_seqlens.detach().cpu().tolist()
-        outs, final_states = [], []
-        for i, (start, end) in enumerate(
-            zip(cu_seqlens_list[:-1], cu_seqlens_list[1:])
-        ):
-            initial_state_i = (
-                initial_state[i : i + 1] if initial_state is not None else None
-            )
-            out_i, final_state_i = _naive_recurrent_kda(
-                q=q[:, start:end],
-                k=k[:, start:end],
-                v=v[:, start:end].float(),
-                g=g[:, start:end],
-                beta=beta[:, start:end],
-                scale=scale,
-                initial_state=_state_to_kv_layout(initial_state_i, state_v_first),
-                output_final_state=output_final_state,
-            )
-            outs.append(out_i)
-            if output_final_state:
-                final_states.append(_state_from_kv_layout(final_state_i, state_v_first))
-
-        out = torch.cat(outs, dim=1).to(v.dtype)
-        final_state = torch.cat(final_states, dim=0) if output_final_state else None
-        return out, final_state
-
-
-class ChunkKDABenchmark(Benchmark):
-    DEFAULT_DTYPES = [torch.bfloat16]
-    DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
-    DEFAULT_SHAPES = [
-        tuple(itertools.chain(seq_lens, [DEFAULT_H, DEFAULT_D]))
-        for seq_lens in FLASHKDA_CASES
-    ]
-    DEFAULT_SHAPE_DESC = "seq_lens..., H, D"
-
-    def init_user_config(self):
-        super().init_user_config()
-        if any(len(shape) < 3 for shape in self.shapes):
-            self.shapes = self.DEFAULT_SHAPES
-
-    def get_input_iter(self, cur_dtype):
-        for shape in self.shapes:
-            *seq_lens, H, D = shape
-            yield self._build_inputs(seq_lens, H, D, cur_dtype)
-
-    def _build_inputs(self, seq_lens, H, D, dtype):
-        device = DEVICE
-        T_total = sum(seq_lens)
-        N = len(seq_lens)
-        scale = 1.0 / math.sqrt(D)
-
-        q = F.normalize(
-            torch.randn((1, T_total, H, D), dtype=torch.float32, device=device),
-            p=2.0,
-            dim=-1,
-        ).to(dtype)
-        k = F.normalize(
-            torch.randn((1, T_total, H, D), dtype=torch.float32, device=device),
-            p=2.0,
-            dim=-1,
-        ).to(dtype)
-        v = torch.randn((1, T_total, H, D), dtype=dtype, device=device)
-        g = torch.randn((1, T_total, H, D), dtype=dtype, device=device)
-        beta = torch.randn((1, T_total, H), dtype=dtype, device=device)
-        A_log = torch.rand(H, dtype=torch.float32, device=device)
-        dt_bias = torch.rand(H, D, dtype=torch.float32, device=device)
-        initial_state = (
-            torch.arange(N * H * D * D, dtype=torch.float32, device=device)
-            .reshape(N, H, D, D)
-            .to(dtype)
-            .float()
-        )
-
-        cu_seqlens = None
-        if N > 1:
-            cu_seqlens = torch.tensor(
-                [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
-                dtype=torch.int32,
-                device=device,
-            )
-
-        return (
-            q,
-            k,
-            v,
-            g,
-            beta,
-            {
-                "scale": scale,
-                "initial_state": initial_state,
-                "output_final_state": True,
-                "use_qk_l2norm_in_kernel": True,
-                "use_gate_in_kernel": True,
-                "use_beta_sigmoid_in_kernel": True,
-                "safe_gate": True,
-                "lower_bound": LOWER_BOUND,
-                "A_log": A_log,
-                "dt_bias": dt_bias,
-                "state_v_first": True,
-                "cu_seqlens": cu_seqlens,
-                "chunk_size": 32,
-            },
-        )
-
-
-@pytest.mark.skipif(
-    not _gcu_available(),
-    reason="chunk_kda benchmark requires an available Enflame GCU",
+from flag_attn.utils import has_triton_tle
+from benchmark.recording import benchmark_metric, record_benchmark_result
+from benchmark.test_FLA.bench_chunk_kda import (
+    BENCHMARK_CASES,
+    DEFAULT_HEADS,
+    _make_inputs,
+    flash_kda,
 )
-@pytest.mark.chunk_kda
-@pytest.mark.chunk_kda_enflame
-def test_chunk_kda(record_property):
-    bench = ChunkKDABenchmark(
-        op_name="chunk_kda",
-        torch_op=_chunk_kda_torch_reference_op,
+
+pytestmark = [
+    pytest.mark.KDA,
+    pytest.mark.skipif(not test_backend.is_available(), reason="requires an available accelerator"),
+]
+
+
+@pytest.mark.parametrize("api", ["chunk_kda", "chunk_kda_fwd_infer"])
+@pytest.mark.parametrize("chunk_size", [16, 32])
+@pytest.mark.parametrize("case", list(BENCHMARK_CASES))
+@torch.inference_mode()
+def test_chunk_kda(case, chunk_size, api, record_property):
+    """Retain all three original 8192-token layouts and the BT=32 coverage."""
+    torch.manual_seed(42)
+    lengths = BENCHMARK_CASES[case]
+    args, kwargs = _make_inputs(lengths, DEFAULT_HEADS)
+    kwargs["chunk_size"] = chunk_size
+    operator = getattr(flag_attn, api)
+
+    def candidate():
+        return operator(*args, **kwargs)
+
+    candidate()  # Compile and autotune before observing dispatch or measuring.
+    sources = []
+    previous_profile = sys.getprofile()
+
+    def record_call(frame, event, arg):
+        if event == "call" and frame.f_code.co_name.startswith("chunk_kda"):
+            if frame.f_globals.get("__name__", "").startswith("flag_attn."):
+                sources.append(frame.f_code.co_filename)
+
+    sys.setprofile(record_call)
+    try:
+        actual = candidate()
+    finally:
+        sys.setprofile(previous_profile)
+    assert sources
+    candidate_source = sources[-1]
+    force_generic = os.environ.get("FLAG_ATTN_FORCE_GENERIC", "0").lower() in {"1", "true", "yes", "on"}
+    if force_generic:
+        assert candidate_source.endswith("/FLA/chunk_kda.py")
+    elif test_backend.is_nvidia():
+        required = ("gpu.alloc", "gpu.local_ptr", "gpu.copy", "gpu.warp_specialize", "pipe")
+        hopper = test_backend.cuda_capability()[0] == 9 and has_triton_tle(3, 6, 0, required_api=required)
+        if hopper:
+            from triton._C.libtriton import ir
+
+            hopper = hasattr(ir.builder, "make_swizzled_shared_encoding_attr")
+        expected = "/runtime/backend/_nvidia/hopper/kda.py" if hopper and chunk_size == 16 else "/FLA/chunk_kda.py"
+        assert candidate_source.endswith(expected)
+    assert all(torch.isfinite(value).all() for value in actual)
+    baseline_ms = None
+    if flash_kda is not None:
+
+        def baseline():
+            output = torch.empty_like(args[2])
+            final = torch.empty_like(kwargs["initial_state"])
+            flash_kda.fwd(
+                *args,
+                kwargs["scale"],
+                output,
+                kwargs["A_log"],
+                kwargs["dt_bias"],
+                kwargs["lower_bound"],
+                initial_state=kwargs["initial_state"],
+                final_state=final,
+                cu_seqlens=kwargs["cu_seqlens"],
+            )
+            return output, final
+
+        expected = baseline()
+        for result, reference in zip(actual, expected):
+            assert torch.isfinite(reference).all()
+            error = (result.float() - reference.float()).square().mean().sqrt()
+            magnitude = reference.float().square().mean().sqrt()
+            assert error / (magnitude + 1e-8) < 0.005
+        baseline_ms = test_backend.do_bench(baseline, warmup=25, rep=100, return_mode="median")
+    latency = test_backend.do_bench(candidate, warmup=25, rep=100, return_mode="median")
+    assert math.isfinite(latency) and latency > 0
+    record_benchmark_result(
+        record_property,
+        op_name="KDA",
+        dtype="bfloat16",
+        mode="inference",
+        result=[
+            benchmark_metric(
+                shape_detail={
+                    "case": case,
+                    "seq_lens": lengths,
+                    "H": DEFAULT_HEADS,
+                    "K": 128,
+                    "V": 128,
+                    "chunk_size": chunk_size,
+                    "api": api,
+                },
+                latency=latency,
+                candidate_source=candidate_source,
+                latency_base=baseline_ms,
+                speedup=baseline_ms / latency if baseline_ms is not None else None,
+                accuracy="passed" if baseline_ms is not None else None,
+            )
+        ],
+        baseline_name="FlashKDA" if flash_kda is not None else None,
+        warmup_ms=25,
+        rep_ms=100,
+        return_mode="median",
     )
-    bench.set_gems(_chunk_kda_inference_op)
-    bench.run(record_property)
+    print(f"{api} {case} chunk_size={chunk_size}: {latency:.6f} ms")

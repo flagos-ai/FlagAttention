@@ -60,7 +60,7 @@ FlagAttention 是一个使用 [Triton](https://github.com/triton-lang/triton) �
 | Chunk GLA | `flag_attn.chunk_gla` | 递归 gated linear attention；`[B,T,H,D]`，支持定长及 packed varlen | 前向 + 反向 | Alpha |
 | Chunk Gated Delta Rule | `flag_attn.chunk_gated_delta_rule` | 分块 delta-rule 递归；支持 head-first/sequence-first | 前向 | Alpha |
 | GDN2 | `flag_attn.chunk_gdn2` | 原生 Triton/TLE 及厂商路径的分块 GDN2 prefill | 前向/推理 | Alpha |
-| Kimi Delta Attention | `flag_attn.chunk_kda` | 特化的分块 KDA 推理；约束随当前后端变化 | 推理 | Alpha |
+| Kimi Delta Attention | `flag_attn.chunk_kda` | 可移植 KDA 推理，自动选择后端实现 | 推理 | Alpha |
 | Log-Linear Attention | `flag_attn.log_linear_attn`、`chunk_log_linear_attn` | 带多层级门控缩放的稠密对数线性注意力；TLE kernel | 前向 | Alpha |
 | Parallax | `flag_attn.parallel_parallax` | 参数化局部线性注意力；含 prefill、decode 和 KV-cache decode 三个阶段 | 前向 + 反向（prefill） | Alpha |
 | Wall Attention | `flag_attn.parallel_wall_attn` | 带门控的窗口注意力，可选 sink bias，支持 packed varlen | 前向 + 反向 | Alpha |
@@ -303,7 +303,7 @@ GLA、GDN2 和 KDA 使用 sequence-first `[B,T,H,D]`。Gated Delta Rule 默认 `
 - [`chunk_gla`](./src/flag_attn/FLA/gated_linear_attention/chunk.py) 实现带 autograd 的分块 gated linear attention，支持初始/最终递归状态。
 - [`chunk_gated_delta_rule`](./src/flag_attn/FLA/gated_delta_rule/api.py) 是纯前向 delta-rule 实现；`head_first=True` 时布局为 `[B,H,T,D]`，当前 `BT` 固定为 64。
 - [`chunk_gdn2`](./src/flag_attn/gdn2/__init__.py) 通过厂商注册表派发。[通用前向实现](./src/flag_attn/gdn2/chunk.py) 使用标准 Triton。[NVIDIA 后端](./src/flag_attn/runtime/backend/_nvidia/gdn2/chunk.py) 在 GPU 和 TLE 编译器均兼容时使用 16-token chunk 融合路径。
-- [`chunk_kda`](./src/flag_attn/FLA/chunk_kda.py) 是推理 API。通用 CUDA 路径需要提供 TLE 的 Triton build，并且会拒绝开启梯度的调用、非 BF16 或非连续输入、`K != 128`、`V != 128` 以及 GVA。chunk size 默认为 16；厂商实现的约束可能不同。
+- [`chunk_kda`](./src/flag_attn/FLA/chunk_kda.py) 和 `chunk_kda_fwd_infer` 保持原有推理接口签名。通用实现使用纯 Triton，支持 FP16/BF16/FP32、分组值头、变长序列及两种状态布局，要求 inference/no-grad 模式。Hopper 上满足条件的 BF16 输入会自动使用 `runtime/backend/_nvidia/hopper` 下的 TLE 实现；缺少 TLE 或不符合特化条件时使用通用实现。在导入顶层 API 前设置 `FLAG_ATTN_FORCE_GENERIC=1` 可验证通用路径。chunk size 默认为 16；已有厂商实现的输入约束可能不同。
 - [`log_linear_attn`](./src/flag_attn/FLA/log_linear_attn/chunk_tle.py) 是基于 TLE kernel 的稠密纯前向 Log-Linear Attention 入口，接收 `(q, k, v, g, level_scales)`，其中 `level_scales` 提供各层级的门控缩放。`chunk_log_linear_attn` 是同一函数的清单名称。
 - [`parallel_parallax`](./src/flag_attn/FLA/parallax) 是参数化局部线性注意力，单一公开入口通过 `stage=` 选择三个阶段。Prefill（`"prefill"`，默认）接收 `(q, r, k, v)`，其中 `q/r: [B,T,HQ,D]`、`k/v: [B,T,H,D]`，支持 GQA、autograd、可选 `window_size`，并通过 `cu_seqlens` 支持 packed varlen。注意 `r` 不会被 `scale` 预先缩放。`"decode"` 和 `"kvcache"` 阶段则路由到 KV-cache decode kernel。
 - [`parallel_wall_attn`](./src/flag_attn/FLA/wall_attn/parallel.py) 是带门控的窗口注意力，接收 `(q, k, v, g)`，可选 `g_scalar`、`sink_bias`、`window_size` 和 `cu_seqlens`，提供前向与反向。公开入口会校验输入并在经过数值检查的快速路径与通用实现之间选择；校验需要与 host 同步，因此 graph capture 场景始终使用通用实现。
@@ -360,7 +360,7 @@ pytest -m "sage_attention" --record json --output accuracy_sage_attention.json -
 
 `--output` 文件只保留与 FlagGems 兼容的原始用例或算子记录；同目录的 `summary.json` 顶层包含 `timestamp`、`env` 和 `result`。每个 `result[算子名]` 分别记录 `accuracy` 与 `performance`；`performance.data` 按 dtype 汇总具有有效基线的各 shape 延迟和加速比。从仓库根目录无路径运行 `--record json -m OP_NAME` 时，也会收集 `benchmark/`。省略 `--output` 时，包含 benchmark 的命令默认写入 `benchmark_result.json`，仅运行精度测试时写入 `accuracy_result.json`。即使复用输出路径，上传汇总也只描述本次运行。
 
-`OP_NAME` 是 pytest marker。算子清单中的 `chunk_gated_delta_rule_fwd` 和 `chunk_kda_enflame` 与原有的短名称 marker 都可使用。没有匹配测试的 marker 会得到 `NotRun` 精度、`Skipped` 性能，且没有加速比数据。
+`OP_NAME` 是 pytest marker。KDA 的测试标记和算子清单 id 统一为 `KDA`，覆盖 `chunk_kda` 和 `chunk_kda_fwd_infer`；使用 `pytest -m KDA`，或在测试运行器中指定 `--ops KDA`。`chunk_gated_delta_rule_fwd` 仍可与原有短名称 marker 一起使用。没有匹配测试的 marker 会得到 `NotRun` 精度、`Skipped` 性能，且没有加速比数据。
 
 ## 性能测试
 
