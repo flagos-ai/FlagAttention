@@ -13,6 +13,7 @@ vendor explicitly for inspection. No kernel is called by the registry.
 from functools import lru_cache
 from importlib import import_module
 from importlib.util import resolve_name
+import os
 
 
 @lru_cache(maxsize=None)
@@ -54,7 +55,10 @@ def resolve_operator(
     public facade that would recursively resolve the same operator. Stage
     facades resolve each primitive separately, preserving their controls.
     Unknown symbols and dependency errors in declared overrides propagate.
+    FLAG_ATTN_FORCE_GENERIC=1 disables overrides for portable-kernel validation.
     """
+    if os.environ.get("FLAG_ATTN_FORCE_GENERIC") == "1":
+        return getattr(import_module(generic_module), generic_name or name)
     if vendor is None:
         vendor = import_module("flag_attn.runtime").device.vendor_name
     return _resolve_operator(name, generic_module, generic_name or name, vendor)

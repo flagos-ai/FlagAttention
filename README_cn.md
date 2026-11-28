@@ -306,6 +306,15 @@ GLA、GDN2 和 KDA 使用 sequence-first `[B,T,H,D]`。Gated Delta Rule 默认 `
 - [`chunk_kda`](./src/flag_attn/FLA/chunk_kda.py) 是推理 API。通用 CUDA 路径需要提供 TLE 的 Triton build，并且会拒绝开启梯度的调用、非 BF16 或非连续输入、`K != 128`、`V != 128` 以及 GVA。chunk size 默认为 16；厂商实现的约束可能不同。
 - [`log_linear_attn`](./src/flag_attn/FLA/log_linear_attn/chunk_tle.py) 是基于 TLE kernel 的稠密纯前向 Log-Linear Attention 入口，接收 `(q, k, v, g, level_scales)`，其中 `level_scales` 提供各层级的门控缩放。`chunk_log_linear_attn` 是同一函数的清单名称。
 - [`parallel_parallax`](./src/flag_attn/FLA/parallax) 是参数化局部线性注意力，单一公开入口通过 `stage=` 选择三个阶段。Prefill（`"prefill"`，默认）接收 `(q, r, k, v)`，其中 `q/r: [B,T,HQ,D]`、`k/v: [B,T,H,D]`，支持 GQA、autograd、可选 `window_size`，并通过 `cu_seqlens` 支持 packed varlen。注意 `r` 不会被 `scale` 预先缩放。`"decode"` 和 `"kvcache"` 阶段则路由到 KV-cache decode kernel。
+
+  通用实现仅使用标准 Triton；Hopper 调优、TLE 异步加载和 cluster kernel 位于 [`runtime/backend/_nvidia/hopper/parallax`](./src/flag_attn/runtime/backend/_nvidia/hopper/parallax)。运行时根据输入设备和 TLE API 可用性自动选择实现；不支持特化的设备或缺少 TLE 的 decode 使用通用实现。`flag_attn.parallax_decode` 和 `flag_attn.parallax_attn_with_kvcache` 别名保持原有参数，并使用相同的分发机制。验证通用路径时，在 pytest 命令前设置 `FLAG_ATTN_FORCE_GENERIC=1`；正常使用无需设置。
+
+  ```bash
+  # 两条路径均通过顶层 API 测试精度及性能；按实际环境使用 python。
+  FLAG_ATTN_FORCE_GENERIC=1 python -m pytest -m parallel_parallax tests/flag_attn/test_parallax*.py benchmark/test_parallax*_benchmark.py
+  env -u FLAG_ATTN_FORCE_GENERIC python -m pytest -m parallel_parallax tests/flag_attn/test_parallax*.py benchmark/test_parallax*_benchmark.py
+  ```
+
 - [`parallel_wall_attn`](./src/flag_attn/FLA/wall_attn/parallel.py) 是带门控的窗口注意力，接收 `(q, k, v, g)`，可选 `g_scalar`、`sink_bias`、`window_size` 和 `cu_seqlens`，提供前向与反向。公开入口会校验输入并在经过数值检查的快速路径与通用实现之间选择；校验需要与 host 同步，因此 graph capture 场景始终使用通用实现。
 
 ### Native Sparse Attention

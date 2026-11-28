@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Correctness tests for TLE decode.
+"""Correctness tests for the public Parallax decode API.
 
 When the external ``parallax-kernel`` package with the ``[cutedsl]`` extra
 (https://github.com/Yifei-Zuo/Parallax) is available, its CuTe SM90 kernel is
@@ -29,7 +29,6 @@ import torch
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import parallel_parallax
-from flag_attn.FLA.parallax import HAS_TLE
 
 
 pytestmark = pytest.mark.parallel_parallax
@@ -100,12 +99,11 @@ def _inputs(B, L, HQ, H, D, dtype, seed=0):
     return q, r, k, v
 
 
-def _require_tle():
-    if not test_backend.supports_operator("parallax_decode", tle=True):
+def _require_decode():
+    if not test_backend.supports_operator("parallax_decode"):
         pytest.skip("selected Parallax decode implementation is unavailable")
 
 
-@pytest.mark.sm90
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "B,L,HQ,H,D,window",
@@ -117,8 +115,8 @@ def _require_tle():
         (2, 2048, 8, 2, 64, 257),  # GQA + unaligned sliding window
     ],
 )
-def test_tle_decode_matches_reference_and_cute_when_available(B, L, HQ, H, D, window, dtype):
-    _require_tle()
+def test_decode_matches_reference_and_cute_when_available(B, L, HQ, H, D, window, dtype):
+    _require_decode()
     q, r, k, v = _inputs(B, L, HQ, H, D, dtype, seed=B * 1009 + L + D)
     scale = 1.0 / math.sqrt(D)
 
@@ -135,10 +133,9 @@ def test_tle_decode_matches_reference_and_cute_when_available(B, L, HQ, H, D, wi
         assert _rel_err(actual, baseline) < 1e-2
 
 
-@pytest.mark.sm90
-def test_tle_runtime_seqused_k_matches_cute():
+def test_runtime_seqused_k_matches_cute():
     """Exercise the canonical serving API with per-batch active cache lengths."""
-    _require_tle()
+    _require_decode()
 
     B, L, HQ, H, D = 2, 2048, 8, 2, 128
     q, r, k, v = _inputs(B, L, HQ, H, D, torch.bfloat16, seed=123)
@@ -188,10 +185,9 @@ def test_tle_runtime_seqused_k_matches_cute():
         assert _rel_err(actual, baseline) < 1e-2
 
 
-@pytest.mark.sm90
-def test_tle_noncontiguous_decode_inputs():
+def test_noncontiguous_decode_inputs():
     """Decode commonly receives q[:, -1:], which need not be contiguous."""
-    _require_tle()
+    _require_decode()
     B, L, H, D = 2, 1024, 8, 128
     generator = torch.Generator(device="cpu" if test_backend.device == "gcu" else test_backend.device).manual_seed(7)
     q_full = torch.randn(B, 3, H, D, device=test_backend.device, dtype=torch.bfloat16, generator=generator)
@@ -207,7 +203,7 @@ def test_tle_noncontiguous_decode_inputs():
     reference = _decode_reference(q, r, k, v, D**-0.5)
     assert _rel_err(actual, reference) < 1e-2
     if cute_decode is not None:
-        # CuTe's public contract requires contiguous q/r, whereas the TLE
+        # CuTe's public contract requires contiguous q/r, whereas the FlagAttention
         # wrapper deliberately accepts the common q[:, -1:] decode view and
         # materializes it internally. Compare values under each backend's
         # documented input contract.

@@ -88,8 +88,8 @@ _OPERATOR_EXPORTS = {
     ),
     "chunk_kda_fwd_infer": ("FLA.chunk_kda",),
     "forgetting_attention": ("forgetting.parallel", "forgetting_attention", "parallel_forgetting_attn"),
-    "parallax_decode": ("FLA.parallax.decode",),
-    "parallax_attn_with_kvcache": ("FLA.parallax.decode",),
+    "parallax_decode": ("FLA.parallax", "parallax_decode", None),
+    "parallax_attn_with_kvcache": ("FLA.parallax", "parallax_attn_with_kvcache", None),
 }
 
 
