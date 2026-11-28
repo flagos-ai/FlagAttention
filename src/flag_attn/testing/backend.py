@@ -34,9 +34,6 @@ _CUDA_GENERIC_OPERATORS = {
     "parallel_wall_attn",
     "log_linear_attn",
     "parallel_forgetting_attn",
-    "minimax_m3_sparse_attn",
-    "minimax_m3_sparse_attn_decode",
-    "minimax_m3_index_topk",
 }
 
 
