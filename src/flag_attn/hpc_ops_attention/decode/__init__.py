@@ -16,29 +16,18 @@
 
 from __future__ import annotations
 
-
 from dataclasses import dataclass, replace
 
 import torch
 import triton
 import triton.language as tl
 
-
-try:
-    import triton.experimental.tle.language as tle
-    from triton.experimental.tle.language.gpu import types as gpu_types
-    HAS_TLE = hasattr(tle, "device_mesh")
-except (ImportError, AttributeError):
-    tle = None
-    gpu_types = None
-    HAS_TLE = False
-
-USE_TLE = HAS_TLE and hasattr(tle, "device_mesh")
+from ..fp8 import decode_e4m3, round_e4m3
 
 
 @dataclass
 class PureTritonMTP1Workspace:
-    """Portable GQA8 split-K workspace used when TLE is unavailable."""
+    """Portable GQA8 split-K workspace used on every backend."""
 
     task_map: torch.Tensor
     split_out: torch.Tensor
@@ -103,80 +92,83 @@ def _pure_triton_bf16_gqa8_splitk_kernel(
     offs_d = tl.arange(0, D)
     offs_n = tl.arange(0, BLOCK_N)
     scale = tl.rsqrt(tl.full((), D, tl.float32))
-    for slot in tl.static_range(0, MAX_TASKS):
+    slot = 0
+    has_task = True
+    while (slot < MAX_TASKS) & has_task:
         task = ((MAX_TASKS * cta + slot) + 1) * 12
         hkv = tl.load(TASK_MAP + task + 0)
         batch = tl.load(TASK_MAP + task + 1)
-        if hkv < 0:
-            return
-        chunk = tl.load(TASK_MAP + task + 2)
-        seq_start = tl.load(TASK_MAP + task + 3)
-        seq_len = tl.load(TASK_MAP + task + 4)
-        hq = hkv * HEADS_PER_GROUP + offs_h
-        q = tl.load(
-            Q + batch * Q_SB + hq[:, None] * Q_SH + offs_d[None, :],
-            mask=valid_h[:, None],
-            other=0.0,
-        )
-        m_i = tl.full((GROUP_M,), -float("inf"), tl.float32)
-        l_i = tl.zeros((GROUP_M,), tl.float32)
-        acc = tl.zeros((GROUP_M, D), tl.float32)
-        start = 0
-        while start < seq_len:
-            local_n = start + offs_n
-            logical = seq_start + local_n
-            page = logical // BLOCK_SIZE
-            pos = logical - page * BLOCK_SIZE
-            valid_n = local_n < seq_len
-            physical = tl.load(
-                BLOCK_IDS + batch * MAX_BLOCKS + page,
-                mask=valid_n,
-                other=0,
-            )
-            k = tl.load(
-                K + physical[:, None] * K_SBLOCK + pos[:, None] * K_STOKEN + hkv * K_SHEAD + offs_d[None, :] * K_SD,
-                mask=valid_n[:, None],
+        has_task = hkv >= 0
+        if has_task:
+            chunk = tl.load(TASK_MAP + task + 2)
+            seq_start = tl.load(TASK_MAP + task + 3)
+            seq_len = tl.load(TASK_MAP + task + 4)
+            hq = hkv * HEADS_PER_GROUP + offs_h
+            q = tl.load(
+                Q + batch * Q_SB + hq[:, None] * Q_SH + offs_d[None, :],
+                mask=valid_h[:, None],
                 other=0.0,
             )
-            v = tl.load(
-                V + physical[:, None] * V_SBLOCK + pos[:, None] * V_STOKEN + hkv * V_SHEAD + offs_d[None, :] * V_SD,
-                mask=valid_n[:, None],
-                other=0.0,
+            m_i = tl.full((GROUP_M,), -float("inf"), tl.float32)
+            l_i = tl.zeros((GROUP_M,), tl.float32)
+            acc = tl.zeros((GROUP_M, D), tl.float32)
+            start = 0
+            while start < seq_len:
+                local_n = start + offs_n
+                logical = seq_start + local_n
+                page = logical // BLOCK_SIZE
+                pos = logical - page * BLOCK_SIZE
+                valid_n = local_n < seq_len
+                physical = tl.load(
+                    BLOCK_IDS + batch * MAX_BLOCKS + page,
+                    mask=valid_n,
+                    other=0,
+                )
+                k = tl.load(
+                    K + physical[:, None] * K_SBLOCK + pos[:, None] * K_STOKEN + hkv * K_SHEAD + offs_d[None, :] * K_SD,
+                    mask=valid_n[:, None],
+                    other=0.0,
+                )
+                v = tl.load(
+                    V + physical[:, None] * V_SBLOCK + pos[:, None] * V_STOKEN + hkv * V_SHEAD + offs_d[None, :] * V_SD,
+                    mask=valid_n[:, None],
+                    other=0.0,
+                )
+                scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
+                scores = tl.where(
+                    valid_h[:, None] & valid_n[None, :],
+                    scores,
+                    -float("inf"),
+                )
+                tile_max = tl.max(scores, axis=1)
+                m_new = tl.maximum(m_i, tile_max)
+                active = m_new != -float("inf")
+                safe_new = tl.where(active, m_new, 0.0)
+                safe_old = tl.where(m_i == -float("inf"), safe_new, m_i)
+                p = tl.where(active[:, None], tl.exp(scores - safe_new[:, None]), 0.0)
+                alpha = tl.where(active, tl.exp(safe_old - safe_new), 0.0)
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                acc = acc * alpha[:, None] + tl.dot(
+                    p.to(tl.bfloat16),
+                    v,
+                    out_dtype=tl.float32,
+                )
+                m_i = m_new
+                start += BLOCK_N
+            has_value = l_i > 0.0
+            partial = tl.where(has_value[:, None], acc / l_i[:, None], 0.0)
+            lse = tl.where(has_value, tl.log(l_i) + m_i, -float("inf"))
+            tl.store(
+                SPLIT_OUT + batch * SO_SB + chunk * SO_SC + hq[:, None] * SO_SH + offs_d[None, :],
+                partial,
+                mask=valid_h[:, None],
             )
-            scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
-            scores = tl.where(
-                valid_h[:, None] & valid_n[None, :],
-                scores,
-                -float("inf"),
+            tl.store(
+                SPLIT_LSE + batch * SL_SB + chunk * SL_SC + hkv * SL_SK + offs_h * SL_SH,
+                lse,
+                mask=valid_h,
             )
-            tile_max = tl.max(scores, axis=1)
-            m_new = tl.maximum(m_i, tile_max)
-            active = m_new != -float("inf")
-            safe_new = tl.where(active, m_new, 0.0)
-            safe_old = tl.where(m_i == -float("inf"), safe_new, m_i)
-            p = tl.where(active[:, None], tl.exp(scores - safe_new[:, None]), 0.0)
-            alpha = tl.where(active, tl.exp(safe_old - safe_new), 0.0)
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            acc = acc * alpha[:, None] + tl.dot(
-                p.to(tl.bfloat16),
-                v,
-                out_dtype=tl.float32,
-            )
-            m_i = m_new
-            start += BLOCK_N
-        has_value = l_i > 0.0
-        partial = tl.where(has_value[:, None], acc / l_i[:, None], 0.0)
-        lse = tl.where(has_value, tl.log(l_i) + m_i, -float("inf"))
-        tl.store(
-            SPLIT_OUT + batch * SO_SB + chunk * SO_SC + hq[:, None] * SO_SH + offs_d[None, :],
-            partial,
-            mask=valid_h[:, None],
-        )
-        tl.store(
-            SPLIT_LSE + batch * SL_SB + chunk * SL_SC + hkv * SL_SK + offs_h * SL_SH,
-            lse,
-            mask=valid_h,
-        )
+        slot += 1
 
 
 @triton.jit
@@ -232,95 +224,114 @@ def _pure_triton_fp8_gqa8_splitk_kernel(
     offs_d = tl.arange(0, D)
     offs_n = tl.arange(0, BLOCK_N)
     dot_scale = tl.rsqrt(tl.full((), D, tl.float32))
-    for slot in tl.static_range(0, MAX_TASKS):
+    slot = 0
+    has_task = True
+    while (slot < MAX_TASKS) & has_task:
         task = ((MAX_TASKS * cta + slot) + 1) * 12
         hkv = tl.load(TASK_MAP + task + 0)
         batch = tl.load(TASK_MAP + task + 1)
-        if hkv < 0:
-            return
-        chunk = tl.load(TASK_MAP + task + 2)
-        seq_start = tl.load(TASK_MAP + task + 3)
-        seq_len = tl.load(TASK_MAP + task + 4)
-        hq = hkv * HEADS_PER_GROUP + offs_h
-        q = tl.load(
-            Q + batch * Q_SB + hq[:, None] * Q_SH + offs_d[None, :],
-            mask=valid_h[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        q_scale = tl.load(
-            Q_SCALE + batch * QS_SB + hq * QS_SH,
-            mask=valid_h,
-            other=1.0,
-        ).to(tl.float32)
-        value_scale = tl.load(V_SCALE + (hkv if QUANT_TYPE == 0 else 0)).to(tl.float32) / 256.0
-        tensor_k_scale = tl.load(K_SCALE).to(tl.float32) if QUANT_TYPE == 1 else 1.0
-        m_i = tl.full((GROUP_M,), -float("inf"), tl.float32)
-        l_i = tl.zeros((GROUP_M,), tl.float32)
-        acc = tl.zeros((GROUP_M, D), tl.float32)
-        start = 0
-        while start < seq_len:
-            local_n = start + offs_n
-            logical = seq_start + local_n
-            page = logical // BLOCK_SIZE
-            pos = logical - page * BLOCK_SIZE
-            valid_n = local_n < seq_len
-            physical = tl.load(
-                BLOCK_IDS + batch * MAX_BLOCKS + page,
-                mask=valid_n,
-                other=0,
+        has_task = hkv >= 0
+        if has_task:
+            chunk = tl.load(TASK_MAP + task + 2)
+            seq_start = tl.load(TASK_MAP + task + 3)
+            seq_len = tl.load(TASK_MAP + task + 4)
+            hq = hkv * HEADS_PER_GROUP + offs_h
+            q = decode_e4m3(
+                tl.load(
+                    Q.to(tl.pointer_type(tl.uint8)) + batch * Q_SB + hq[:, None] * Q_SH + offs_d[None, :],
+                    mask=valid_h[:, None],
+                    other=0.0,
+                )
             )
-            k = tl.load(
-                K + physical[:, None] * K_SBLOCK + pos[:, None] * K_STOKEN + hkv * K_SHEAD + offs_d[None, :] * K_SD,
-                mask=valid_n[:, None],
-                other=0.0,
+            q_scale = tl.load(
+                Q_SCALE + batch * QS_SB + hq * QS_SH,
+                mask=valid_h,
+                other=1.0,
             ).to(tl.float32)
-            v = tl.load(
-                V + physical[:, None] * V_SBLOCK + pos[:, None] * V_STOKEN + hkv * V_SHEAD + offs_d[None, :] * V_SD,
-                mask=valid_n[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            scores = tl.dot(q, tl.trans(k))
-            if QUANT_TYPE == 0:
-                byte_offset = physical * KS_SBLOCK + (pos // 32) * KS_STOKEN + hkv * KS_SHEAD + (pos % 32) * 4 * KS_SD
-                scale_ptr = (K_SCALE + byte_offset).to(tl.pointer_type(tl.float32))
-                k_scale = tl.load(scale_ptr, mask=valid_n, other=0.0).to(tl.float32)
-                scores *= q_scale[:, None] * k_scale[None, :] * dot_scale
-            else:
-                scores *= q_scale[:, None] * tensor_k_scale * dot_scale
-            scores = tl.where(
-                valid_h[:, None] & valid_n[None, :],
-                scores,
-                -float("inf"),
+            value_scale = tl.load(V_SCALE + (hkv if QUANT_TYPE == 0 else 0)).to(tl.float32) / 256.0
+            tensor_k_scale = tl.load(K_SCALE).to(tl.float32) if QUANT_TYPE == 1 else 1.0
+            m_i = tl.full((GROUP_M,), -float("inf"), tl.float32)
+            l_i = tl.zeros((GROUP_M,), tl.float32)
+            acc = tl.zeros((GROUP_M, D), tl.float32)
+            start = 0
+            while start < seq_len:
+                local_n = start + offs_n
+                logical = seq_start + local_n
+                page = logical // BLOCK_SIZE
+                pos = logical - page * BLOCK_SIZE
+                valid_n = local_n < seq_len
+                physical = tl.load(
+                    BLOCK_IDS + batch * MAX_BLOCKS + page,
+                    mask=valid_n,
+                    other=0,
+                )
+                k = decode_e4m3(
+                    tl.load(
+                        K.to(tl.pointer_type(tl.uint8))
+                        + physical[:, None] * K_SBLOCK
+                        + pos[:, None] * K_STOKEN
+                        + hkv * K_SHEAD
+                        + offs_d[None, :] * K_SD,
+                        mask=valid_n[:, None],
+                        other=0.0,
+                    )
+                )
+                v = decode_e4m3(
+                    tl.load(
+                        V.to(tl.pointer_type(tl.uint8))
+                        + physical[:, None] * V_SBLOCK
+                        + pos[:, None] * V_STOKEN
+                        + hkv * V_SHEAD
+                        + offs_d[None, :] * V_SD,
+                        mask=valid_n[:, None],
+                        other=0.0,
+                    )
+                )
+                scores = tl.dot(q, tl.trans(k))
+                if QUANT_TYPE == 0:
+                    byte_offset = (
+                        physical * KS_SBLOCK + (pos // 32) * KS_STOKEN + hkv * KS_SHEAD + (pos % 32) * 4 * KS_SD
+                    )
+                    scale_ptr = (K_SCALE + byte_offset).to(tl.pointer_type(tl.float32))
+                    k_scale = tl.load(scale_ptr, mask=valid_n, other=0.0).to(tl.float32)
+                    scores *= q_scale[:, None] * k_scale[None, :] * dot_scale
+                else:
+                    scores *= q_scale[:, None] * tensor_k_scale * dot_scale
+                scores = tl.where(
+                    valid_h[:, None] & valid_n[None, :],
+                    scores,
+                    -float("inf"),
+                )
+                tile_max = tl.max(scores, axis=1)
+                m_new = tl.maximum(m_i, tile_max)
+                active = m_new != -float("inf")
+                safe_new = tl.where(active, m_new, 0.0)
+                safe_old = tl.where(m_i == -float("inf"), safe_new, m_i)
+                p = tl.where(active[:, None], tl.exp(scores - safe_new[:, None]), 0.0)
+                alpha = tl.where(active, tl.exp(safe_old - safe_new), 0.0)
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                p_scaled = round_e4m3(p * 256.0)
+                acc = acc * alpha[:, None] + tl.dot(p_scaled, v)
+                m_i = m_new
+                start += BLOCK_N
+            has_value = l_i > 0.0
+            partial = tl.where(
+                has_value[:, None],
+                acc / l_i[:, None] * value_scale,
+                0.0,
             )
-            tile_max = tl.max(scores, axis=1)
-            m_new = tl.maximum(m_i, tile_max)
-            active = m_new != -float("inf")
-            safe_new = tl.where(active, m_new, 0.0)
-            safe_old = tl.where(m_i == -float("inf"), safe_new, m_i)
-            p = tl.where(active[:, None], tl.exp(scores - safe_new[:, None]), 0.0)
-            alpha = tl.where(active, tl.exp(safe_old - safe_new), 0.0)
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            p_scaled = (p * 256.0).to(tl.float8e4nv).to(tl.float32)
-            acc = acc * alpha[:, None] + tl.dot(p_scaled, v)
-            m_i = m_new
-            start += BLOCK_N
-        has_value = l_i > 0.0
-        partial = tl.where(
-            has_value[:, None],
-            acc / l_i[:, None] * value_scale,
-            0.0,
-        )
-        lse = tl.where(has_value, tl.log(l_i) + m_i, -float("inf"))
-        tl.store(
-            SPLIT_OUT + batch * SO_SB + chunk * SO_SC + hq[:, None] * SO_SH + offs_d[None, :],
-            partial,
-            mask=valid_h[:, None],
-        )
-        tl.store(
-            SPLIT_LSE + batch * SL_SB + chunk * SL_SC + hkv * SL_SK + offs_h * SL_SH,
-            lse,
-            mask=valid_h,
-        )
+            lse = tl.where(has_value, tl.log(l_i) + m_i, -float("inf"))
+            tl.store(
+                SPLIT_OUT + batch * SO_SB + chunk * SO_SC + hq[:, None] * SO_SH + offs_d[None, :],
+                partial,
+                mask=valid_h[:, None],
+            )
+            tl.store(
+                SPLIT_LSE + batch * SL_SB + chunk * SL_SC + hkv * SL_SK + offs_h * SL_SH,
+                lse,
+                mask=valid_h,
+            )
+        slot += 1
 
 
 @triton.jit
@@ -385,7 +396,7 @@ def _pure_triton_splitk_combine_kernel(
 
 def prepare_pure_triton_mtp1_workspace(inputs, quant_type: str) -> PureTritonMTP1Workspace:
     if inputs.mtp != 1:
-        raise NotImplementedError("the no-TLE fallback intentionally supports MTP=1 only")
+        raise NotImplementedError("the portable decode intentionally supports MTP=1 only")
     if inputs.q.ndim != 3 or inputs.q.shape[-1] != 128:
         raise ValueError("q must have shape [batch, Hq, 128] for MTP=1")
     if inputs.k_cache.ndim != 4 or inputs.v_cache.ndim != 4:
@@ -416,11 +427,11 @@ def prepare_pure_triton_mtp1_workspace(inputs, quant_type: str) -> PureTritonMTP
     hq = int(inputs.q.shape[1])
     heads_per_group = hq // hkv
     padded_heads = triton.cdiv(heads_per_group, 8) * 8
-    properties = torch.cuda.get_device_properties(inputs.q.device)
-    num_ctas = properties.multi_processor_count * 4
+    # Scheduling capacity is independent of a device's multiprocessor count.
+    num_ctas = 256
     min_process_len = 512
     max_tasks, sched_ints, workspace_ints = pure_triton_task_map_metadata(
-        inputs.kv_lens,
+        torch.full_like(inputs.kv_lens, inputs.block_ids.shape[1] * 64),
         num_head_kv=hkv,
         num_ctas=num_ctas,
         min_process_len=min_process_len,
@@ -498,7 +509,7 @@ def attention_decode_pure_triton_mtp(
 
 def attention_decode_pure_triton_mtp1(inputs, workspace: PureTritonMTP1Workspace):
     if inputs.mtp != 1:
-        raise NotImplementedError("the no-TLE fallback intentionally supports MTP=1 only")
+        raise NotImplementedError("the portable decode intentionally supports MTP=1 only")
     batch = inputs.batch
     hq = int(inputs.q.shape[1])
     hkv = int(inputs.k_cache.shape[2])
@@ -518,7 +529,7 @@ def attention_decode_pure_triton_mtp1(inputs, workspace: PureTritonMTP1Workspace
     common = dict(
         H_Q=hq,
         HEADS_PER_GROUP=workspace.heads_per_group,
-        GROUP_M=8,
+        GROUP_M=16,
         D=inputs.q.shape[-1],
         BLOCK_SIZE=64,
         MAX_BLOCKS=inputs.block_ids.shape[1],
@@ -546,7 +557,7 @@ def attention_decode_pure_triton_mtp1(inputs, workspace: PureTritonMTP1Workspace
     )
     grid = (
         workspace.num_ctas,
-        triton.cdiv(workspace.heads_per_group, 8),
+        triton.cdiv(workspace.heads_per_group, 16),
     )
     if workspace.quant_type == "bf16":
         _pure_triton_bf16_gqa8_splitk_kernel[grid](
@@ -561,24 +572,26 @@ def attention_decode_pure_triton_mtp1(inputs, workspace: PureTritonMTP1Workspace
         )
     else:
         quant_type = 0 if workspace.quant_type == "qkpertoken_perhead_vperhead" else 1
+        # Keep FP8 types out of the kernel signature on targets lacking them.
+        k_scale = inputs.k_scale.view(torch.uint8) if quant_type == 0 else inputs.k_scale
         _pure_triton_fp8_gqa8_splitk_kernel[grid](
-            inputs.q,
-            inputs.k_cache,
-            inputs.v_cache,
+            inputs.q.view(torch.uint8),
+            inputs.k_cache.view(torch.uint8),
+            inputs.v_cache.view(torch.uint8),
             inputs.block_ids,
             workspace.task_map,
             inputs.q_scale,
-            inputs.k_scale,
+            k_scale,
             inputs.v_scale,
             workspace.split_out,
             workspace.split_lse,
             QUANT_TYPE=quant_type,
             QS_SB=inputs.q_scale.stride(0),
             QS_SH=inputs.q_scale.stride(1),
-            KS_SBLOCK=inputs.k_scale.stride(0),
-            KS_STOKEN=inputs.k_scale.stride(1) if inputs.k_scale.ndim > 1 else 0,
-            KS_SHEAD=inputs.k_scale.stride(2) if inputs.k_scale.ndim > 2 else 0,
-            KS_SD=inputs.k_scale.stride(3) if inputs.k_scale.ndim > 3 else 0,
+            KS_SBLOCK=k_scale.stride(0),
+            KS_STOKEN=k_scale.stride(1) if k_scale.ndim > 1 else 0,
+            KS_SHEAD=k_scale.stride(2) if k_scale.ndim > 2 else 0,
+            KS_SD=k_scale.stride(3) if k_scale.ndim > 3 else 0,
             **common,
         )
     _pure_triton_splitk_combine_kernel[(batch, hq)](
@@ -684,14 +697,10 @@ class DecodeWorkload:
 
 __all__ = [
     "DecodeWorkload",
-    "HAS_TLE",
-    "USE_TLE",
     "PureTritonMTP1Workspace",
     "PureTritonMTPWorkspace",
     "attention_decode_pure_triton_mtp",
     "attention_decode_pure_triton_mtp1",
     "prepare_pure_triton_mtp_workspace",
     "prepare_pure_triton_mtp1_workspace",
-    "gpu_types",
-    "tle",
 ]

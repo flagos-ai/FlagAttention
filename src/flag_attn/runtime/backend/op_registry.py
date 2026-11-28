@@ -11,6 +11,7 @@ vendor explicitly for inspection. No kernel is called by the registry.
 """
 
 from functools import lru_cache
+import os
 from importlib import import_module
 from importlib.util import resolve_name
 
@@ -57,6 +58,8 @@ def resolve_operator(
     """
     if vendor is None:
         vendor = import_module("flag_attn.runtime").device.vendor_name
+    if os.environ.get("FLAG_ATTN_FORCE_GENERIC", "0") == "1":
+        return _resolve_operator(name, generic_module, generic_name or name, "generic")
     return _resolve_operator(name, generic_module, generic_name or name, vendor)
 
 

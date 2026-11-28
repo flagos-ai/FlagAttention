@@ -18,13 +18,8 @@ import math
 import pytest
 import torch
 
-from flag_attn.testing import backend as test_backend
-from flag_attn import runtime
-
-if runtime.device.vendor_name == "ascend":
-    pytest.skip("HY3 FP8 attention is not supported on Ascend", allow_module_level=True)
-
 from flag_attn import hy3_attention
+from flag_attn.testing import backend as test_backend
 
 BLOCK = 128
 HEAD_DIM = 128
@@ -38,7 +33,7 @@ def test_attention_blocksparse_prefill_fp8_rejects_cpu():
     cache = torch.empty(1, 32, 1, HEAD_DIM)
     scale = torch.empty(1)
     metadata = torch.empty(1, dtype=torch.int32)
-    with pytest.raises(ValueError, match="must be a CUDA tensor"):
+    with pytest.raises(ValueError, match="must be an accelerator tensor"):
         hy3_attention(
             q,
             cache,
@@ -72,10 +67,7 @@ def _make_inputs(quant_type, kv_layout, masked, page_size):
     q_len, kv_len = 129, 257
     pages = math.ceil(kv_len / page_size)
 
-    q = (
-        torch.randn(q_len, Q_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
-        / math.sqrt(HEAD_DIM)
-    ).to(fp8)
+    q = (torch.randn(q_len, Q_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16) / math.sqrt(HEAD_DIM)).to(fp8)
     k = (
         torch.randn(
             pages,
@@ -162,9 +154,7 @@ def _reference(args):
     packed_k_scale = k_scale.view(torch.float32) if quant_type == 0 else None
     token_k_scale = None
     if packed_k_scale is not None:
-        token_k_scale = (
-            packed_k_scale[page_ids].permute(0, 1, 3, 2).reshape(-1, KV_HEADS)[:kv_len]
-        )
+        token_k_scale = packed_k_scale[page_ids].permute(0, 1, 3, 2).reshape(-1, KV_HEADS)[:kv_len]
 
     output = torch.empty_like(q, dtype=torch.bfloat16)
     group_size = Q_HEADS // KV_HEADS
@@ -180,12 +170,7 @@ def _reference(args):
         k_head = paged_k[:, kv_head].float()
         v_head = paged_v[:, kv_head].float()
         k_head_t = k_head.transpose(0, 1).contiguous()
-        scores = torch.stack(
-            [
-                torch.mm(q_group[index].contiguous(), k_head_t)
-                for index in range(group_size)
-            ]
-        )
+        scores = torch.stack([torch.mm(q_group[index].contiguous(), k_head_t) for index in range(group_size)])
         query_scale = q_scale[0, head_start:head_end, :q_len].unsqueeze(-1)
         if quant_type == 0:
             key_scale = token_k_scale[:, kv_head].view(1, 1, kv_len)
@@ -206,19 +191,16 @@ def _reference(args):
         denominator = probabilities.sum(dim=-1, keepdim=True)
         probabilities = (probabilities * 256.0).to(torch.float8_e4m3fn).float()
         v_head = v_head.contiguous()
-        result = torch.stack(
-            [
-                torch.mm(probabilities[index].contiguous(), v_head)
-                for index in range(group_size)
-            ]
-        )
+        result = torch.stack([torch.mm(probabilities[index].contiguous(), v_head) for index in range(group_size)])
         result = result * (value_scale / 256.0) / denominator
         output[:, head_start:head_end] = result.permute(1, 0, 2)
     return output
 
 
 @pytest.mark.hy3_attention
-@pytest.mark.skipif(not test_backend.supports_operator("hy3_attention"), reason=test_backend.skip_reason("hy3_attention"))
+@pytest.mark.skipif(
+    not test_backend.supports_operator("hy3_attention"), reason=test_backend.skip_reason("hy3_attention")
+)
 @pytest.mark.parametrize("quant_type", [0, 1])
 @pytest.mark.parametrize("kv_layout", ["nhd", "hnd"])
 @pytest.mark.parametrize("masked", [False, True])
