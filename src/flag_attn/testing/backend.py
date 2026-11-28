@@ -22,8 +22,6 @@ device_fn = runtime.torch_device_fn
 # overrides this restriction; a CUDA-compatible vendor retains the generic API.
 _CUDA_GENERIC_OPERATORS = {
     "parallel_moba",
-    "infllmv2_attention",
-    "infllmv2_decode",
     "inkling_fa4_rel_attention",
     "diffkv_attention",
     "hy3_attention",

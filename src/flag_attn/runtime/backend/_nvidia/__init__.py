@@ -17,6 +17,10 @@
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "infllmv2_stage1": (".infllmv2", "stage1"),
+    "infllmv2_select_blocks": (".infllmv2", "select_blocks"),
+    "infllmv2_sparse_attention": (".infllmv2", "sparse_attention"),
+    "infllmv2_dense_packed": (".infllmv2", "_dense_packed"),
     "chunk_gdn2": (".gdn2.chunk", "chunk_gdn2"),
     "minimax_m3_index_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_score"),
     "minimax_m3_index_decode_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode_score"),

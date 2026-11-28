@@ -13,24 +13,22 @@ selection interface:
 from __future__ import annotations
 
 
-import importlib
 import importlib.util
+import sys
 
 import pytest
 import torch
 
 from flag_attn.testing import backend as test_backend
-from flag_attn import InfLLMV2Config, infllmv2_attention
-from flag_attn.infllmv2 import forward as forward_impl
-from flag_attn.infllmv2.forward import (
-    _sparse_attention_forward,
-    compressed_lengths,
-    compress_k,
-    pool_scores,
-    select_blocks,
-    sparse_attention_tle_hopper,
-    stage1,
-    stage1_tle_hopper,
+from flag_attn import (
+    InfLLMV2Config,
+    infllmv2_attention,
+    infllmv2_decode,
+    infllmv2_compress_k as compress_k,
+    infllmv2_pool_scores as pool_scores,
+    infllmv2_select_blocks as select_blocks,
+    infllmv2_sparse_attention as sparse_attention,
+    infllmv2_stage1 as stage1,
 )
 from flag_attn.infllmv2.reference import (
     compress_k_ref,
@@ -46,8 +44,6 @@ HAS_GPU = (test_backend.supports_operator("infllmv2_attention") or test_backend.
 pytestmark = [
     pytest.mark.skipif(not HAS_GPU, reason="requires an available accelerator"),
 ]
-
-HAS_TLE = forward_impl._TLE_AVAILABLE
 
 
 def _cu(lengths: tuple[int, ...]) -> torch.Tensor:
@@ -231,6 +227,7 @@ def test_attention_dense_path(d: int) -> None:
     torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
 
 
+@pytest.mark.infllmv2_attention
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.skipif(not test_backend.supports_operator("infllmv2_attention"), reason=test_backend.skip_reason("infllmv2_attention"))
 def test_attention_sparse_backward(dtype: torch.dtype) -> None:
@@ -293,65 +290,86 @@ def test_wide_topk_tle_or_standard_matches_streaming() -> None:
 
 @pytest.mark.infllmv2_attention
 @pytest.mark.parametrize("d", [64, 128], ids=lambda value: f"d{value}")
-def test_tle_stage1_matches_standard_when_available(d: int) -> None:
-    if not HAS_TLE or test_backend.cuda_capability() != (9, 0):
-        pytest.skip("TLE Stage1 requires Hopper")
+def test_stage1_dispatch_matches_standard(d: int) -> None:
     q, k, _, cu_q, cu_k = _packed_inputs((1024,), (8192,), d=d, seed=37)
     k1, cu_k1 = compress_k(k, cu_k, 32, 16)
     k2, cu_k2 = compress_k(k, cu_k, 128, 64)
-    expected = stage1(q, k1, k2, cu_q, cu_k1, cu_k2, 1024, cu_seqlens_k=cu_k)
-    actual = stage1_tle_hopper(
-        q, k1, k2, cu_q, cu_k1, cu_k2, 1024, cu_seqlens_k=cu_k
+    # max_seqlen_q is an upper bound: this also checks masked trailing CTAs
+    # in the long-prefill dispatch without building a quadratic reference.
+    expected = stage1(
+        q, k1, k2, cu_q, cu_k1, cu_k2, 65536, cu_seqlens_k=cu_k, _allow_tle=False
     )
+    actual = stage1(q, k1, k2, cu_q, cu_k1, cu_k2, 65536, cu_seqlens_k=cu_k)
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.infllmv2_attention
-def test_tle_stage2_matches_standard_when_available() -> None:
-    if not HAS_TLE or test_backend.cuda_capability() != (9, 0):
-        pytest.skip("TLE Stage2 requires Hopper")
-    q, k, v, cu_q, cu_k = _packed_inputs((128,), (8192,), d=128, seed=23)
+def test_stage2_dispatch_matches_standard() -> None:
+    q, k, v, cu_q, cu_k = _packed_inputs((1024,), (8192,), d=128, seed=23)
     ids = torch.arange(64, device=test_backend.device, dtype=torch.int32)
-    selected = ids.view(1, 1, 64).expand(2, 128, 64).contiguous()
-    expected = _sparse_attention_forward(
-        q, k, v, selected, cu_q, cu_k, 128, store_lse=False
-    )[0]
-    actual = sparse_attention_tle_hopper(
-        q, k, v, selected, cu_q, cu_k, 128
+    selected = ids.view(1, 1, 64).expand(2, 1024, 64).contiguous()
+    expected = sparse_attention(
+        q, k, v, selected, cu_q, cu_k, 1024, _allow_tle=False
     )
+    actual = sparse_attention(q, k, v, selected, cu_q, cu_k, 1024)
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
 
 @pytest.mark.infllmv2_attention
-@pytest.mark.skipif(not test_backend.is_nvidia(), reason="tests the generic NVIDIA implementation contract")
-def test_d64_tle_stage1_dispatch_and_standard_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    kernels = importlib.import_module("flag_attn.infllmv2.forward")
-    q = torch.zeros((1, 32, 64), device=test_backend.device, dtype=torch.bfloat16)
-    k1 = torch.zeros((1, 2, 64), device=test_backend.device, dtype=torch.bfloat16)
-    k2 = torch.zeros_like(k1)
-    cu = torch.tensor([0, 1], device=test_backend.device, dtype=torch.int32)
-    sentinel = torch.empty((2, 1, 1), device=test_backend.device, dtype=torch.bfloat16)
+@pytest.mark.parametrize("capability", [None, (8, 0), (10, 0)], ids=["force-generic", "ampere", "blackwell"])
+def test_public_fallback_avoids_hopper(monkeypatch, capability) -> None:
+    q, k, v, cu_q, cu_k = _packed_inputs((1024,), (1024,), d=128)
+    if capability is None:
+        monkeypatch.setenv("FLAG_ATTN_FORCE_GENERIC", "1")
+    elif test_backend.is_nvidia():
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
+    calls = []
 
-    monkeypatch.setattr(kernels, "_TLE_AVAILABLE", True)
-    monkeypatch.setattr(kernels, "stage1_tle_hopper", lambda *args, **kwargs: sentinel)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
-    assert kernels.stage1(q, k1, k2, cu, cu, cu, 65536) is sentinel
+    def trace(frame, event, arg):
+        if event == "call":
+            module = frame.f_globals.get("__name__", "")
+            if ".hopper.infllmv2" in module:
+                calls.append(frame.f_code.co_name)
 
-    launches = []
+    previous = sys.getprofile()
+    sys.setprofile(trace)
+    try:
+        actual = infllmv2_attention(
+            q, k, v, cu_q, cu_k, 1024, 1024,
+            config=InfLLMV2Config(topk=16, dense_len=0),
+        )
+    finally:
+        sys.setprofile(previous)
+    assert not calls
+    expected = dense_attention_ref(q, k, v, cu_q, cu_k)
+    torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
 
-    class FakeKernel:
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                launches.append(grid)
 
-            return launch
+@pytest.mark.infllmv2_attention
+@pytest.mark.parametrize("max_q", [1, 32, 96])
+def test_portable_dense_backward(monkeypatch, max_q) -> None:
+    monkeypatch.setenv("FLAG_ATTN_FORCE_GENERIC", "1")
+    q, k, v, cu_q, cu_k = _packed_inputs(
+        (max_q, max_q + 1), (128, 193), d=64, hq=8, hkv=2, requires_grad=True,
+    )
+    qr, kr, vr = [x.detach().clone().requires_grad_(True) for x in (q, k, v)]
+    actual = infllmv2_attention(q, k, v, cu_q, cu_k, max_q + 1, 193)
+    expected = dense_attention_ref(qr, kr, vr, cu_q, cu_k)
+    grad = torch.randn_like(actual)
+    actual.backward(grad)
+    expected.backward(grad)
+    torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
+    for tensor, ref in zip((q, k, v), (qr, kr, vr)):
+        torch.testing.assert_close(tensor.grad, ref.grad, atol=7e-2, rtol=7e-2)
 
-    monkeypatch.setattr(kernels, "_TLE_AVAILABLE", False)
-    monkeypatch.setattr(kernels, "stage1_tle_hopper", lambda *args, **kwargs: pytest.fail("TLE called"))
-    monkeypatch.setattr(kernels, "_stage1_kernel", FakeKernel())
-    fallback = kernels.stage1(q, k1, k2, cu, cu, cu, 65536)
-    assert fallback.shape == (2, 1, 1)
-    assert launches
+
+@pytest.mark.infllmv2_attention
+def test_direct_decode_matches_stage_facade() -> None:
+    q, k, v, _, cu_k = _packed_inputs((1, 1), (31, 129), d=64)
+    config = InfLLMV2Config(topk=4, dense_len=0)
+    direct = infllmv2_decode(q, k, v, cu_k, 129, config=config)
+    staged = infllmv2_attention(q, k, v, cu_k, 129, stage="decode", config=config)
+    torch.testing.assert_close(direct, staged)
 
 
 @pytest.mark.infllmv2_attention

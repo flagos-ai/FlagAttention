@@ -309,6 +309,7 @@ def test_infllmv2_attention_benchmark(
     )
 
 
+@pytest.mark.infllmv2_attention
 @pytest.mark.parametrize("case", BACKWARD_CASES, ids=lambda case: case.name)
 @pytest.mark.skipif(not test_backend.supports_operator("infllmv2_attention"), reason=test_backend.skip_reason("infllmv2_attention"))
 def test_infllmv2_attention_backward_benchmark(
