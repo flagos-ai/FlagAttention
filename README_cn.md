@@ -317,7 +317,7 @@ GLA、GDN2 和 KDA 使用 sequence-first `[B,T,H,D]`。Gated Delta Rule 默认 `
 - [`infllmv2_attention`](./src/flag_attn/infllmv2) 默认执行连续 packed 因果 prefill，`stage="decode"` 时执行变长 decode。Prefill 接收 packed 的 `q/k/v` 以及 `cu_seqlens_q`、`cu_seqlens_k` 和两个最大长度；每个 Q 序列都是其 KV 序列的后缀，因此 KV 必须包含已缓存前缀和当前 chunk。块选择参数位于 `InfLLMV2Config`，目前仅支持因果模式。梯度可以回传到传入的所有 Q/K/V。该算子不执行 paged cache 或原地 cache 更新。
 - [`parallel_moba`](./src/flag_attn/FLA/moba/parallel.py) 是面向 packed `[seqlen, heads, head_dim]` 张量的因果变长 MoBA，接收 `cu_seqlens`、`max_seqlen`、`moba_chunk_size` 和 `moba_topk`。`moba_topk` 包含当前因果 chunk，与 FlashMoBA 一致。支持 MHA/GQA/MQA、最大 256 的 head dimension 以及最大 64 的 top-k。推理路径有意跳过对依赖具体数值的元数据的 host 侧校验，autograd 路径仍保留该校验。
 - [`hy3_attention`](./src/flag_attn/hpc_ops_attention) 提供 FP8 paged 块稀疏 prefill（`stage="prefill"`）以及由 `variant=` 选择的六种 decode 实现：`bf16_static`、`bf16_dynamic`、`fp8_qk_static`、`fp8_qk_dynamic`、`fp8_kv_static`、`fp8_kv_dynamic`。其中 `qk` 表示逐 token 量化 Q/K 并逐 head 量化 V，`kv` 表示逐 token 量化 Q 并逐 tensor 量化 K/V；`static` 与 `dynamic` 选择调度策略。Decode 会原样转发 `(inputs, workspace)`，因此需要先用对应实现模块准备 workspace。该算子族要求 PyTorch 2.7.0。
-- [`inkling_fa4_rel_attention`](./src/flag_attn/inkling_fa4) 是仅用于推理的 paged varlen 注意力，并叠加相对位置 logits，参数与同名 vLLM 算子一致。Cache 使用 `[num_blocks, block_size, num_kv_heads, head_dim]` 布局。`backend=` 接受 `"auto"`（默认）、`"triton"` 或 `"tle"`，环境变量 `INKLING_FA4_BACKEND` 可做同样选择；auto 优先使用 TLE，当 TLE 不可用或布局不支持时回落到 Triton。
+- [`inkling_fa4_rel_attention`](./src/flag_attn/inkling_fa4) 是仅用于推理的 paged varlen 注意力，并叠加相对位置 logits，参数与同名 vLLM 算子一致。Cache 使用 `[num_blocks, block_size, num_kv_heads, head_dim]` 布局。`backend=` 接受 `"auto"`（默认）、`"triton"` 或 `"tle"`，环境变量 `INKLING_FA4_BACKEND` 可做同样选择。auto 仅在 NVIDIA SM90、所需 TLE API 可用、页大小为 16、Q/K/V 维度均为 128，且 Q/K/V 连续并按 16 字节对齐时选用 [runtime 下的 Hopper 实现](./src/flag_attn/runtime/backend/_nvidia/hopper/inkling_fa4)，其他配置回落到纯 Triton。`backend="triton"` 始终选择通用内核，不导入 TLE，也不使用芯片特化的启动参数。精度和性能测试均通过 `flag_attn.inkling_fa4_rel_attention` 调用，可运行 `pytest -m inkling_fa4_rel_attention tests/flag_attn/test_relative_attention.py benchmark/test_inkling_fa4_benchmark.py`。
 - [`diffkv_attention`](./src/flag_attn/diffkv/api.py) 是 K/V head dimension 不对称的 paged decode：`query: [B,Hq,Dqk]`、`key_cache: [NB,BS,Hkv,Dqk]`、`value_cache: [NB,BS,Hkv,Dv]`，返回 `[B,Hq,Dv]`。`window_size=-1` 表示完整上下文；`path` 选择 `"2d"` 或 `"3d"` launch，`num_segments` 控制 3D 路径的 split-KV；`backend` 接受 `"auto"`、`"tle"` 或 `"triton"`。
 - [`parallel_forgetting_attn`](./src/flag_attn/forgetting/parallel.py) 通过 `log_fgate` 引入逐 token 的对数遗忘门，另有 `head_first=`、`seq_start=`、`sm_scale=` 和 `adaptive_threshold=`。在 SM90 且 TLE 兼容时使用 TLE kernel，否则由普通 Triton kernel 处理 16、32、60、64、100、128 这些 head dimension，通过零填充实现且不改变 attention 缩放与剪枝行为。
 - [`fused_attnres`](./src/flag_attn/FLA/attnres/fused.py) 聚合多个残差源：每个源先做 RMS 归一化用于与 `query` 打分，再由源维度上的 softmax 混合原始残差，`output_rms_weight` 可选地融合下一子层所需的 RMSNorm。该算子仅用于推理、不提供 autograd 公式，针对 Kimi K3 形状优化，支持最多 16 个源和最大 8192 的 hidden size。
@@ -416,7 +416,7 @@ FlagAttention/
 │   ├── hpc_ops_attention/          # Hy3 FP8 prefill + 六种 decode 变体
 │   ├── sage_attention/             # INT8 Q/K 量化与注意力
 │   ├── diffkv_attention/           # Paged DiffKV，Triton 与 TLE 路径
-│   ├── inkling_fa4/                # FA4 相对注意力，Triton 与 TLE 路径
+│   ├── inkling_fa4/                # 纯 Triton FA4 相对注意力
 │   ├── forgetting_attention/       # Forgetting Attention 及 naive 参考实现
 │   │
 │   │   # 第 2 层 —— 厂商分发

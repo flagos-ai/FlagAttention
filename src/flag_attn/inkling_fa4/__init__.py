@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Inkling FA4 paged relative attention with Triton and optional Hopper TLE."""
+"""Portable Inkling FA4 relative attention with automatic runtime dispatch."""
 
 from .relative_attention import (
     get_backend,

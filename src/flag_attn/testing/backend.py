@@ -24,7 +24,6 @@ _CUDA_GENERIC_OPERATORS = {
     "parallel_moba",
     "infllmv2_attention",
     "infllmv2_decode",
-    "inkling_fa4_rel_attention",
     "diffkv_attention",
     "hy3_attention",
     "chunk_gated_delta_rule",
