@@ -78,6 +78,9 @@ include = [
 ]
 namespaces = false
 
+[tool.setuptools.package-data]
+"flag_attn.runtime.backend._nvidia.hopper.hpc_ops_attention.prefill" = ["*.cu"]
+
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
 testpaths = [

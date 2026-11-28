@@ -17,6 +17,16 @@
 import importlib
 
 _OPERATOR_EXPORTS = {
+    **{
+        name: (".hopper.hpc_ops_attention.dispatch", name)
+        for name in (
+            "hy3_attention", "hy3_attention_prepare",
+            "hy3_attention_workspace_is_reset",
+            "hy3_attention_decode_bf16_static", "hy3_attention_decode_bf16_dynamic",
+            "hy3_attention_decode_fp8_qk_static", "hy3_attention_decode_fp8_qk_dynamic",
+            "hy3_attention_decode_fp8_kv_static", "hy3_attention_decode_fp8_kv_dynamic",
+        )
+    },
     "chunk_gdn2": (".gdn2.chunk", "chunk_gdn2"),
     "minimax_m3_index_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_score"),
     "minimax_m3_index_decode_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode_score"),

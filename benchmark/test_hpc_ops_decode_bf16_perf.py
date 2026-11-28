@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-
 import gc
 import math
 import statistics
@@ -24,11 +23,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn.functional as F
 import triton
-import pytest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
@@ -39,20 +37,24 @@ try:
 except ModuleNotFoundError:
     from recording import benchmark_metric, record_benchmark_result
 
+from flag_attn import (
+    HY3_DECODE_CASES as OFFICIAL_CASES,
+)
+from flag_attn import (
+    Hy3DynamicBF16Inputs as DynamicBF16Inputs,
+)
+from flag_attn import (
+    Hy3StaticBF16Inputs as StaticBF16Inputs,
+)
+from flag_attn import (
+    hy3_attention,
+    hy3_attention_prepare,
+    hy3_attention_workspace_is_reset,
+)
 from flag_attn.testing import backend as test_backend
-from flag_attn.hpc_ops_attention.decode.dynamic.bf16_dynamic import (  # noqa: E402
-    DynamicBF16Inputs,
-    bf16_dynamic_workspace_is_reset,
-)
-from flag_attn.hpc_ops_attention.decode import HAS_TLE  # noqa: E402
-from flag_attn.hpc_ops_attention.decode.static.bf16_static import (  # noqa: E402
-    BLOCK_SIZE,
-    HEAD_DIM,
-    OFFICIAL_CASES,
-    StaticBF16Inputs,
-)
-from flag_attn import hy3_attention, hy3_attention_prepare
 
+BLOCK_SIZE = 64
+HEAD_DIM = 128
 
 # Fixed pytest benchmark matrix.  Use pytest node IDs or ``-k`` to select a
 # subset without changing the benchmark configuration in the source file.
@@ -85,6 +87,7 @@ def _load_hpc():
         return None
     try:
         import hpc
+
         return hpc
     except (ImportError, OSError, AssertionError):
         # A source-tree ``hpc`` package may shadow the built extension and
@@ -92,23 +95,18 @@ def _load_hpc():
         sys.modules.pop("hpc", None)
     build_roots = (REPO_ROOT / "build", REPO_ROOT.parent / "build")
     build_libs = sorted(
-        path
-        for build_root in build_roots
-        for path in build_root.glob("lib.*")
-        if list((path / "hpc").glob("_C*.so"))
+        path for build_root in build_roots for path in build_root.glob("lib.*") if list((path / "hpc").glob("_C*.so"))
     )
     if not build_libs:
         searched = ", ".join(str(path) for path in build_roots)
-        print(f"hpc CUDA baseline unavailable ({searched}); omitting CUDA columns",
-              file=sys.stderr)
+        print(f"hpc CUDA baseline unavailable ({searched}); omitting CUDA columns", file=sys.stderr)
         return None
     sys.path.insert(0, str(build_libs[0]))
     try:
         import hpc
     except (ImportError, OSError, AssertionError) as error:
         sys.modules.pop("hpc", None)
-        print(f"hpc CUDA baseline unavailable ({error}); omitting CUDA columns",
-              file=sys.stderr)
+        print(f"hpc CUDA baseline unavailable ({error}); omitting CUDA columns", file=sys.stderr)
         return None
     return hpc
 
@@ -122,7 +120,9 @@ def _make_cuda_task_map(
 ) -> torch.Tensor:
     """Build the official CUDA dynamic schedule outside timed launches."""
     task_map = hpc.get_attention_decode_task_workspace(
-        len(kv_lens), int(kv_lens.max().item()), num_head_kv,
+        len(kv_lens),
+        int(kv_lens.max().item()),
+        num_head_kv,
         min_process_len=min_process_len,
     )
     hpc.assign_attention_decode_task(
@@ -141,7 +141,11 @@ def _as_hnd_view(cache: torch.Tensor) -> torch.Tensor:
 
 
 def make_inputs(
-    lengths, mtp: int, num_head_kv: int, num_head_q: int, layout: str,
+    lengths,
+    mtp: int,
+    num_head_kv: int,
+    num_head_q: int,
+    layout: str,
 ) -> Panel:
     torch.manual_seed(41)
     torch.manual_seed(41)
@@ -154,24 +158,28 @@ def make_inputs(
     capacity = int(total_blocks * 1.2) + len(lengths) + 8
     q = torch.randn(
         (len(lengths) * mtp, num_head_q, HEAD_DIM),
-        device=test_backend.device, dtype=torch.bfloat16,
+        device=test_backend.device,
+        dtype=torch.bfloat16,
     ) / math.sqrt(HEAD_DIM)
     k = torch.randn(
         (capacity, BLOCK_SIZE, num_head_kv, HEAD_DIM),
-        device=test_backend.device, dtype=torch.bfloat16,
+        device=test_backend.device,
+        dtype=torch.bfloat16,
     ) / math.sqrt(HEAD_DIM)
     v = torch.randn(
         (capacity, BLOCK_SIZE, num_head_kv, HEAD_DIM),
-        device=test_backend.device, dtype=torch.bfloat16,
+        device=test_backend.device,
+        dtype=torch.bfloat16,
     )
     packed = torch.randperm(capacity, device=test_backend.device)[:total_blocks].int()
     block_ids = torch.empty(
         (len(lengths), int(block_counts.max().item())),
-        device=test_backend.device, dtype=torch.int32,
+        device=test_backend.device,
+        dtype=torch.int32,
     )
     cursor = 0
     for batch, count in enumerate(block_counts.cpu().tolist()):
-        block_ids[batch, :count] = packed[cursor:cursor + count]
+        block_ids[batch, :count] = packed[cursor : cursor + count]
         cursor += count
     if layout == "HND":
         k, v = _as_hnd_view(k), _as_hnd_view(v)
@@ -195,12 +203,19 @@ def pytorch_reference(panel: Panel, mtp: int) -> torch.Tensor:
         scores = q[batch_idx].transpose(0, 1).float() @ k.transpose(-1, -2)
         scores /= math.sqrt(HEAD_DIM)
         history = length - mtp
-        causal = torch.cat((
-            torch.ones((mtp, history), dtype=torch.bool, device=panel.q.device),
-            torch.tril(torch.ones(
-                (mtp, mtp), dtype=torch.bool, device=panel.q.device,
-            )),
-        ), dim=-1)
+        causal = torch.cat(
+            (
+                torch.ones((mtp, history), dtype=torch.bool, device=panel.q.device),
+                torch.tril(
+                    torch.ones(
+                        (mtp, mtp),
+                        dtype=torch.bool,
+                        device=panel.q.device,
+                    )
+                ),
+            ),
+            dim=-1,
+        )
         scores.masked_fill_(~causal[None], -float("inf"))
         outputs.append((F.softmax(scores, -1) @ v).transpose(0, 1))
     return torch.stack(outputs).reshape(batch * mtp, hq, HEAD_DIM).bfloat16()
@@ -241,24 +256,23 @@ def _measure(calls, warmup, iters, repeat, graph_mode):
     names = list(calls)
     samples = {name: [] for name in names}
     for repeat_idx in range(repeat):
-        order = names[repeat_idx % len(names):] + names[:repeat_idx % len(names)]
+        order = names[repeat_idx % len(names) :] + names[: repeat_idx % len(names)]
         if repeat_idx & 1:
             order.reverse()
         for name in order:
-            samples[name].append(
-                _bench_ms(calls[name], warmup, iters, graph_mode)
-            )
-    return {
-        name: (statistics.median(values), min(values), max(values))
-        for name, values in samples.items()
-    }
+            samples[name].append(_bench_ms(calls[name], warmup, iters, graph_mode))
+    return {name: (statistics.median(values), min(values), max(values)) for name, values in samples.items()}
 
 
 @pytest.fixture(scope="module")
 def hpc_baseline():
-    triton.set_allocator(lambda size, _align, _stream: torch.empty(
-        size, dtype=torch.int8, device=test_backend.device,
-    ))
+    triton.set_allocator(
+        lambda size, _align, _stream: torch.empty(
+            size,
+            dtype=torch.int8,
+            device=test_backend.device,
+        )
+    )
     return _load_hpc()
 
 
@@ -284,15 +298,9 @@ def _print_performance_table():
                 str(result["mtp"]),
                 result["layout"],
                 result["flagattention_impl"],
-                f'{result["flagattention_ms"]:.4f}',
-                (
-                    f'{result["hpc_ms"]:.4f}'
-                    if result["hpc_ms"] is not None else "N/A"
-                ),
-                (
-                    f'{result["hpc_ms"] / result["flagattention_ms"]:.3f}x'
-                    if result["hpc_ms"] is not None else "N/A"
-                ),
+                f"{result['flagattention_ms']:.4f}",
+                (f"{result['hpc_ms']:.4f}" if result["hpc_ms"] is not None else "N/A"),
+                (f"{result['hpc_ms'] / result['flagattention_ms']:.3f}x" if result["hpc_ms"] is not None else "N/A"),
             )
         )
 
@@ -300,27 +308,17 @@ def _print_performance_table():
     separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
 
     def format_row(row):
-        return (
-            "| "
-            + " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
-            + " |"
-        )
+        return "| " + " | ".join(value.ljust(widths[index]) for index, value in enumerate(row)) + " |"
 
     print("\n\nHPC-Opc Decode Attention BF16 performance summary (CUDA Graph replay median)")
-    print(
-        f"Warmup replays: {BENCH_WARMUP}; Timed samples: {BENCH_ITERS}; "
-        f"Repeats: {BENCH_REPEAT}"
-    )
+    print(f"Warmup replays: {BENCH_WARMUP}; Timed samples: {BENCH_ITERS}; Repeats: {BENCH_REPEAT}")
     print(separator)
     print(format_row(rows[0]))
     print(separator)
     for row in rows[1:]:
         print(format_row(row))
     print(separator)
-    print(
-        "HPC/FlagAttention > 1: FlagAttention is faster; "
-        "HPC/FlagAttention < 1: HPC CUDA is faster."
-    )
+    print("HPC/FlagAttention > 1: FlagAttention is faster; HPC/FlagAttention < 1: HPC CUDA is faster.")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -337,52 +335,85 @@ def report_performance_results():
 @pytest.mark.parametrize("layout", BENCH_LAYOUTS)
 def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout, record_property):
     variant = f"bf16_{method}"
-    if not test_backend.supports_operator(f"hy3_attention_decode_{variant}", min_sm=(9, 0)):
+    if not test_backend.supports_operator(f"hy3_attention_decode_{variant}"):
         pytest.skip("selected Hy3 decode variant is unavailable on this device")
-    if not HAS_TLE and mtp != 1:
-        pytest.skip("pure Triton fallback supports MTP=1 only")
 
     hpc = hpc_baseline
     panel = make_inputs(
-        OFFICIAL_CASES[case], mtp, BENCH_NUM_HEAD_KV,
-        BENCH_NUM_HEAD_Q, layout,
+        OFFICIAL_CASES[case],
+        mtp,
+        BENCH_NUM_HEAD_KV,
+        BENCH_NUM_HEAD_Q,
+        layout,
     )
     reference = pytorch_reference(panel, mtp) if BENCH_CHECK else None
     cuda_out = torch.empty_like(panel.q) if hpc is not None else None
 
     if method == "static":
         inputs = StaticBF16Inputs(
-            panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens, layout,
+            panel.q,
+            panel.k,
+            panel.v,
+            panel.block_ids,
+            panel.kv_lens,
+            layout,
         )
         workspace = hy3_attention_prepare(inputs, variant="bf16_static")
         cuda_task_map = None
         cuda_call = (
-            None if hpc is None else lambda: hpc.attention_decode_bf16(
-                panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens,
-                mtp=mtp - 1, new_kv_included=True, splitk=True,
+            None
+            if hpc is None
+            else lambda: hpc.attention_decode_bf16(
+                panel.q,
+                panel.k,
+                panel.v,
+                panel.block_ids,
+                panel.kv_lens,
+                mtp=mtp - 1,
+                new_kv_included=True,
+                splitk=True,
                 output=cuda_out,
             )
         )
         tle_call = lambda: hy3_attention(inputs, workspace, stage="decode", variant="bf16_static")
     else:
         inputs = DynamicBF16Inputs(
-            panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens, layout,
+            panel.q,
+            panel.k,
+            panel.v,
+            panel.block_ids,
+            panel.kv_lens,
+            layout,
         )
         workspace = hy3_attention_prepare(inputs, variant="bf16_dynamic")
-        if HAS_TLE:
+        if hasattr(workspace, "route"):
             assert getattr(workspace, "mtp", None) == mtp
             assert getattr(workspace, "route", "")
         cuda_task_map = (
             _make_cuda_task_map(
-                hpc, panel.kv_lens, BENCH_NUM_HEAD_KV, mtp,
+                hpc,
+                panel.kv_lens,
+                BENCH_NUM_HEAD_KV,
+                mtp,
                 BENCH_MIN_PROCESS_LEN,
-            ) if hpc is not None else None
+            )
+            if hpc is not None
+            else None
         )
         cuda_call = (
-            None if hpc is None else lambda: hpc.attention_decode_bf16(
-                panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens,
-                mtp=mtp - 1, new_kv_included=True, splitk=True,
-                task_map=cuda_task_map, output=cuda_out,
+            None
+            if hpc is None
+            else lambda: hpc.attention_decode_bf16(
+                panel.q,
+                panel.k,
+                panel.v,
+                panel.block_ids,
+                panel.kv_lens,
+                mtp=mtp - 1,
+                new_kv_included=True,
+                splitk=True,
+                task_map=cuda_task_map,
+                output=cuda_out,
             )
         )
         tle_call = lambda: hy3_attention(inputs, workspace, stage="decode", variant="bf16_dynamic")
@@ -397,34 +428,49 @@ def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout, rec
             torch.testing.assert_close(expected, reference, atol=0.016, rtol=1e-5)
             torch.testing.assert_close(actual, expected, atol=0.032, rtol=1e-5)
         if method == "dynamic":
-            assert (workspace.is_reset() if hasattr(workspace, "is_reset")
-                    else bf16_dynamic_workspace_is_reset(workspace))
+            assert (
+                workspace.is_reset()
+                if hasattr(workspace, "is_reset")
+                else hy3_attention_workspace_is_reset(workspace, variant=variant)
+            )
 
     calls = {"triton+tle": tle_call}
     if cuda_call is not None:
         calls["cuda"] = cuda_call
     timing = _measure(
-        calls, BENCH_WARMUP, BENCH_ITERS, BENCH_REPEAT, BENCH_GRAPH,
+        calls,
+        BENCH_WARMUP,
+        BENCH_ITERS,
+        BENCH_REPEAT,
+        BENCH_GRAPH,
     )
     flagattention_ms = timing["triton+tle"][0]
     hpc_ms = timing["cuda"][0] if cuda_call is not None else None
-    PERF_RESULTS.append({
-        "case": case,
-        "method": method,
-        "mtp": mtp,
-        "layout": layout,
-        "flagattention_impl": "TLE" if HAS_TLE else "Triton",
-        "flagattention_ms": flagattention_ms,
-        "hpc_ms": hpc_ms,
-    })
+    PERF_RESULTS.append(
+        {
+            "case": case,
+            "method": method,
+            "mtp": mtp,
+            "layout": layout,
+            "flagattention_impl": "Triton"
+            if type(workspace).__module__ == "flag_attn.hpc_ops_attention.decode"
+            else "backend",
+            "flagattention_ms": flagattention_ms,
+            "hpc_ms": hpc_ms,
+        }
+    )
 
     record_benchmark_result(
-        record_property, op_name="hy3_attention",
+        record_property,
+        op_name="hy3_attention",
         dtype=str(torch.bfloat16),
-        result=[benchmark_metric(
-            shape_detail={"variant": "decode_bf16", "case": case, "mtp": mtp, "method": method, "layout": layout},
-            latency=flagattention_ms, latency_base=hpc_ms,
-        )],
+        result=[
+            benchmark_metric(
+                shape_detail={"variant": "decode_bf16", "case": case, "mtp": mtp, "method": method, "layout": layout},
+                latency=flagattention_ms,
+                latency_base=hpc_ms,
+            )
+        ],
         baseline="hpc CUDA" if hpc_ms is not None else None,
     )
 

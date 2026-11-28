@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-
 import math
 import sys
 from collections.abc import Callable
@@ -28,28 +27,28 @@ import torch
 import torch.nn.functional as F
 import triton
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from flag_attn.testing import backend as test_backend
-from flag_attn.hpc_ops_attention.decode import HAS_TLE  # noqa: E402
-from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
-    bf16_dynamic,
-)
 
-
-SUPPORTED_TEST_MTP = (1, 2, 3) if HAS_TLE else (1,)
-from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
-    bf16_static,
-)
-from flag_attn import hy3_attention, hy3_attention_prepare
+SUPPORTED_TEST_MTP = (1, 2, 3)
 from functools import partial
 
+from flag_attn import (
+    Hy3DynamicBF16Inputs as DynamicBF16Inputs,
+)
+from flag_attn import (
+    Hy3StaticBF16Inputs as StaticBF16Inputs,
+)
+from flag_attn import (
+    hy3_attention,
+    hy3_attention_prepare,
+)
 
-BLOCK_SIZE = bf16_static.BLOCK_SIZE
-HEAD_DIM = bf16_static.HEAD_DIM
+BLOCK_SIZE = 64
+HEAD_DIM = 128
 
 
 @dataclass
@@ -70,12 +69,12 @@ class _DecodeImplementation:
 
 _IMPLEMENTATIONS = {
     "static": _DecodeImplementation(
-        bf16_static.StaticBF16Inputs,
+        StaticBF16Inputs,
         partial(hy3_attention_prepare, variant="bf16_static"),
         partial(hy3_attention, stage="decode", variant="bf16_static"),
     ),
     "dynamic": _DecodeImplementation(
-        bf16_dynamic.DynamicBF16Inputs,
+        DynamicBF16Inputs,
         partial(hy3_attention_prepare, variant="bf16_dynamic"),
         partial(hy3_attention, stage="decode", variant="bf16_dynamic"),
     ),
@@ -129,12 +128,14 @@ def _make_inputs(
         device=test_backend.device,
     )
     history = torch.randint(
-        1, max_seq_kv, (num_batch,), dtype=torch.int32, device=test_backend.device,
+        1,
+        max_seq_kv,
+        (num_batch,),
+        dtype=torch.int32,
+        device=test_backend.device,
     )
     kv_lens = history + num_seq_q
-    block_counts = (
-        kv_lens + BLOCK_SIZE - 1
-    ) // BLOCK_SIZE
+    block_counts = (kv_lens + BLOCK_SIZE - 1) // BLOCK_SIZE
     total_blocks = int(block_counts.sum().item())
     max_num_blocks = int(total_blocks * 1.2) + num_batch + 8
     storage = torch.randn(
@@ -143,13 +144,10 @@ def _make_inputs(
         device=test_backend.device,
     )
     if kvcache_shape == "HND":
-        storage = (
-            storage.permute(0, 1, 3, 2, 4)
-            .contiguous()
-            .permute(0, 1, 3, 2, 4)
-        )
+        storage = storage.permute(0, 1, 3, 2, 4).contiguous().permute(0, 1, 3, 2, 4)
     packed_ids = torch.randperm(max_num_blocks)[:total_blocks].to(
-        dtype=torch.int32, device=test_backend.device,
+        dtype=torch.int32,
+        device=test_backend.device,
     )
     block_ids = torch.empty(
         (num_batch, int(block_counts.max().item())),
@@ -157,14 +155,20 @@ def _make_inputs(
         device=test_backend.device,
     )
     new_k = new_k.reshape(
-        num_batch, num_seq_q, num_head_kv, HEAD_DIM,
+        num_batch,
+        num_seq_q,
+        num_head_kv,
+        HEAD_DIM,
     )
     new_v = new_v.reshape(
-        num_batch, num_seq_q, num_head_kv, HEAD_DIM,
+        num_batch,
+        num_seq_q,
+        num_head_kv,
+        HEAD_DIM,
     )
     cursor = 0
     for batch_id, count in enumerate(block_counts.cpu().tolist()):
-        block_ids[batch_id, :count] = packed_ids[cursor:cursor + count]
+        block_ids[batch_id, :count] = packed_ids[cursor : cursor + count]
         cursor += count
         history_length = int(history[batch_id])
         for row in range(num_seq_q):
@@ -188,7 +192,10 @@ def _pytorch_reference(panel: _Panel, num_seq_q: int) -> torch.Tensor:
     num_head_kv = int(panel.k.shape[2])
     heads_per_group = num_head_q // num_head_kv
     q = panel.q.reshape(
-        num_batch, num_seq_q, num_head_q, HEAD_DIM,
+        num_batch,
+        num_seq_q,
+        num_head_q,
+        HEAD_DIM,
     )
     output = torch.empty_like(q)
     for batch_id in range(num_batch):
@@ -197,16 +204,25 @@ def _pytorch_reference(panel: _Panel, num_seq_q: int) -> torch.Tensor:
         ids = panel.block_ids[batch_id, :pages]
         k = panel.k[ids].reshape(-1, num_head_kv, HEAD_DIM)[:length]
         v = panel.v[ids].reshape(-1, num_head_kv, HEAD_DIM)[:length]
-        k = k.transpose(0, 1).repeat_interleave(
-            heads_per_group, dim=0,
-        ).float()
-        v = v.transpose(0, 1).repeat_interleave(
-            heads_per_group, dim=0,
-        ).float()
-        scores = (
-            q[batch_id].transpose(0, 1).float()
-            @ k.transpose(-1, -2)
-        ) / math.sqrt(HEAD_DIM)
+        k = (
+            k.transpose(0, 1)
+            .repeat_interleave(
+                heads_per_group,
+                dim=0,
+            )
+            .float()
+        )
+        v = (
+            v.transpose(0, 1)
+            .repeat_interleave(
+                heads_per_group,
+                dim=0,
+            )
+            .float()
+        )
+        # Individual FP32 GEMMs also support runtimes without strided batched SGEMM.
+        q_heads = q[batch_id].transpose(0, 1).float()
+        scores = torch.stack([torch.mm(q_heads[head], k[head].T) for head in range(num_head_q)]) / math.sqrt(HEAD_DIM)
         history = length - num_seq_q
         causal = torch.cat(
             (
@@ -215,29 +231,36 @@ def _pytorch_reference(panel: _Panel, num_seq_q: int) -> torch.Tensor:
                     dtype=torch.bool,
                     device=panel.q.device,
                 ),
-                torch.tril(torch.ones(
-                    (num_seq_q, num_seq_q),
-                    dtype=torch.bool,
-                    device=panel.q.device,
-                )),
+                torch.tril(
+                    torch.ones(
+                        (num_seq_q, num_seq_q),
+                        dtype=torch.bool,
+                        device=panel.q.device,
+                    )
+                ),
             ),
             dim=-1,
         )
         scores.masked_fill_(~causal[None], -float("inf"))
-        output[batch_id] = (
-            F.softmax(scores, dim=-1) @ v
+        probabilities = F.softmax(scores, dim=-1)
+        output[batch_id] = torch.stack(
+            [torch.mm(probabilities[head], v[head]) for head in range(num_head_q)]
         ).transpose(0, 1)
     return output.reshape_as(panel.q)
 
 
 @pytest.mark.skipif(
-    not (test_backend.supports_operator("hy3_attention_decode_bf16_static", min_sm=(9, 0))
-         or test_backend.supports_operator("hy3_attention_decode_bf16_dynamic", min_sm=(9, 0))),
-    reason="BF16 decode validation requires Hopper",
+    not (
+        test_backend.supports_operator("hy3_attention_decode_bf16_static")
+        or test_backend.supports_operator("hy3_attention_decode_bf16_dynamic")
+    ),
+    reason="requires an available accelerator",
 )
 @pytest.mark.parametrize("num_batch", [1, 16, 200])
 @pytest.mark.parametrize(
-    "num_seq_q", SUPPORTED_TEST_MTP, ids=lambda value: f"mtp{value}",
+    "num_seq_q",
+    SUPPORTED_TEST_MTP,
+    ids=lambda value: f"mtp{value}",
 )
 @pytest.mark.parametrize("max_seq_kv", [1024, 4096])
 @pytest.mark.parametrize("block_size", [64])
@@ -264,11 +287,15 @@ def test_attn_bf16_sm90(
     kvcache_shape: str,
 ):
     variant = "bf16_dynamic" if use_dynamic_sched else "bf16_static"
-    if not test_backend.supports_operator(f"hy3_attention_decode_{variant}", min_sm=(9, 0)):
+    if not test_backend.supports_operator(f"hy3_attention_decode_{variant}"):
         pytest.skip("selected Hy3 decode variant is unavailable on this device")
-    triton.set_allocator(lambda size, _align, _stream: torch.empty(
-        size, dtype=torch.int8, device=test_backend.device,
-    ))
+    triton.set_allocator(
+        lambda size, _align, _stream: torch.empty(
+            size,
+            dtype=torch.int8,
+            device=test_backend.device,
+        )
+    )
     assert block_size == BLOCK_SIZE
     assert head_dim == HEAD_DIM
     assert new_kv_included

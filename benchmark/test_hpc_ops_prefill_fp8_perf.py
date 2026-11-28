@@ -15,27 +15,18 @@
 
 import math
 from dataclasses import dataclass
-from importlib import import_module
 from statistics import median
 
 import pytest
 import torch
 
 from flag_attn.testing import backend as test_backend
-from flag_attn import runtime
 
-if runtime.device.vendor_name == "ascend":
-    pytest.skip("HY3 FP8 attention is not supported on Ascend", allow_module_level=True)
-
-bsa_ops = import_module(
-    "flag_attn.hpc_ops_attention.prefill.attention_blocksparse_prefill_fp8"
-)
 try:
     from benchmark.recording import benchmark_metric, record_benchmark_result
 except ModuleNotFoundError:
     from recording import benchmark_metric, record_benchmark_result
 
-from flag_attn.testing import backend as test_backend
 from flag_attn import hy3_attention
 
 try:
@@ -52,26 +43,18 @@ else:
         "QuantType",
         "attention_with_kvcache_blocksparse_prefill_fp8",
     )
-    missing_hpc_apis = tuple(
-        name for name in required_hpc_apis if not hasattr(hpc, name)
-    )
+    missing_hpc_apis = tuple(name for name in required_hpc_apis if not hasattr(hpc, name))
     if missing_hpc_apis:
-        HPC_IMPORT_ERROR = RuntimeError(
-            "hpc is missing required APIs: " + ", ".join(missing_hpc_apis)
-        )
+        HPC_IMPORT_ERROR = RuntimeError("hpc is missing required APIs: " + ", ".join(missing_hpc_apis))
         hpc = None
     else:
         required_quant_types = (
             "QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD",
             "QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR",
         )
-        missing_quant_types = tuple(
-            name for name in required_quant_types if not hasattr(hpc.QuantType, name)
-        )
+        missing_quant_types = tuple(name for name in required_quant_types if not hasattr(hpc.QuantType, name))
         if missing_quant_types:
-            HPC_IMPORT_ERROR = RuntimeError(
-                "hpc.QuantType is missing: " + ", ".join(missing_quant_types)
-            )
+            HPC_IMPORT_ERROR = RuntimeError("hpc.QuantType is missing: " + ", ".join(missing_quant_types))
             hpc = None
         else:
             HPC_IMPORT_ERROR = None
@@ -131,16 +114,12 @@ def _print_performance_table():
                 str(result["kv_len"]),
                 str(result["quant_type"]),
                 str(result["masked"]),
-                f'{result["effective_skip_ratio"]:.1%}',
+                f"{result['effective_skip_ratio']:.1%}",
                 result["kv_layout"],
                 result["flagattention_impl"],
-                f'{result["flagattention_ms"]:.4f}',
-                (f'{result["hpc_ms"]:.4f}' if result["hpc_ms"] is not None else "N/A"),
-                (
-                    f'{result["hpc_ms"] / result["flagattention_ms"]:.3f}x'
-                    if result["hpc_ms"] is not None
-                    else "N/A"
-                ),
+                f"{result['flagattention_ms']:.4f}",
+                (f"{result['hpc_ms']:.4f}" if result["hpc_ms"] is not None else "N/A"),
+                (f"{result['hpc_ms'] / result['flagattention_ms']:.3f}x" if result["hpc_ms"] is not None else "N/A"),
             )
         )
 
@@ -148,27 +127,18 @@ def _print_performance_table():
     separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
 
     def format_row(row):
-        return (
-            "| "
-            + " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
-            + " |"
-        )
+        return "| " + " | ".join(value.ljust(widths[index]) for index, value in enumerate(row)) + " |"
 
     first = PERF_RESULTS[0]
     print("\n\nBSA FP8 prefill performance summary (CUDA Graph replay median)")
-    print(
-        f'Warmup replays: {first["warmup"]}; ' f'Timed samples: {first["repetitions"]}'
-    )
+    print(f"Warmup replays: {first['warmup']}; Timed samples: {first['repetitions']}")
     print(separator)
     print(format_row(rows[0]))
     print(separator)
     for row in rows[1:]:
         print(format_row(row))
     print(separator)
-    print(
-        "HPC/FlagAttention > 1: FlagAttention is faster; "
-        "HPC/FlagAttention < 1: HPC CUDA is faster."
-    )
+    print("HPC/FlagAttention > 1: FlagAttention is faster; HPC/FlagAttention < 1: HPC CUDA is faster.")
     if hpc is None:
         print(f"HPC CUDA unavailable: {HPC_IMPORT_ERROR}")
 
@@ -203,10 +173,7 @@ def _make_block_mask(q_len, kv_len, masked, device):
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(SEED + 17)
-    block_mask = (
-        torch.rand((1, Q_HEADS, q_tiles, kv_tiles), generator=generator)
-        >= MASK_SKIP_RATIO
-    )
+    block_mask = torch.rand((1, Q_HEADS, q_tiles, kv_tiles), generator=generator) >= MASK_SKIP_RATIO
     block_mask &= causal.view(1, 1, q_tiles, kv_tiles)
 
     # Keep the right-causal frontier and the tile containing each Q tile's
@@ -214,9 +181,7 @@ def _make_block_mask(q_len, kv_len, masked, device):
     frontier = torch.clamp(causal_boundary, max=kv_tiles - 1)
     block_mask |= (cols == frontier).view(1, 1, q_tiles, kv_tiles)
     first_q_positions = kv_len - q_len + rows * BLOCK
-    first_q_tiles = torch.div(first_q_positions, BLOCK, rounding_mode="floor").clamp(
-        min=0, max=kv_tiles - 1
-    )
+    first_q_tiles = torch.div(first_q_positions, BLOCK, rounding_mode="floor").clamp(min=0, max=kv_tiles - 1)
     block_mask |= (cols == first_q_tiles).view(1, 1, q_tiles, kv_tiles)
 
     active_tiles = int(block_mask.sum().item())
@@ -233,10 +198,7 @@ def _make_inputs(q_len, kv_len, quant_type, masked, kv_layout):
     fp8 = torch.float8_e4m3fn
     requested_pages = math.ceil(kv_len / PAGE_SIZE)
     physical_pages = max(requested_pages * 2, requested_pages + 8)
-    q = (
-        torch.randn(q_len, Q_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
-        / math.sqrt(HEAD_DIM)
-    ).to(fp8)
+    q = (torch.randn(q_len, Q_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16) / math.sqrt(HEAD_DIM)).to(fp8)
     raw_cache = torch.randn(
         physical_pages,
         2,
@@ -281,9 +243,7 @@ def _make_inputs(q_len, kv_len, quant_type, masked, kv_layout):
     block_ids = torch.randperm(physical_pages, device=device)[:requested_pages]
     block_ids = block_ids.to(torch.int32).view(1, -1)
     kv_lens = torch.tensor([kv_len], device=device, dtype=torch.int32)
-    block_mask, bucket, effective_skip_ratio = _make_block_mask(
-        q_len, kv_len, masked, device
-    )
+    block_mask, bucket, effective_skip_ratio = _make_block_mask(q_len, kv_len, masked, device)
     return Inputs(
         q=q,
         k_cache=k,
@@ -304,17 +264,12 @@ def _make_inputs(q_len, kv_len, quant_type, masked, kv_layout):
 
 def _requested_count(request, option, default):
     invocation_args = tuple(map(str, request.config.invocation_params.args))
-    explicitly_set = any(
-        arg == option or arg.startswith(f"{option}=") for arg in invocation_args
-    )
+    explicitly_set = any(arg == option or arg.startswith(f"{option}=") for arg in invocation_args)
     return int(request.config.getoption(option)) if explicitly_set else default
 
 
 def _selected_flagattention_impl():
-    has_tle = bool(getattr(bsa_ops, "_HAS_TLE_HOPPER", False))
-    if has_tle and test_backend.cuda_capability() == (9, 0):
-        return "TLE"
-    return "Triton"
+    return "NVIDIA dispatch" if test_backend.has_specialization("hy3_attention") else "Triton"
 
 
 def _bench_cuda_graph(call_fn, warmup, repetitions):
@@ -355,30 +310,38 @@ def _bench_cuda_graph(call_fn, warmup, repetitions):
 
 
 @pytest.mark.hy3_attention
-@pytest.mark.skipif(not test_backend.supports_operator("hy3_attention"), reason=test_backend.skip_reason("hy3_attention"))
+@pytest.mark.skipif(
+    not test_backend.supports_operator("hy3_attention"), reason=test_backend.skip_reason("hy3_attention")
+)
 @pytest.mark.parametrize("q_len,kv_len", CASES)
 @pytest.mark.parametrize("quant_type", [0, 1])
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("kv_layout", ["nhd", "hnd"])
-def test_attention_blocksparse_prefill_fp8_perf(
-    request, q_len, kv_len, quant_type, masked, kv_layout, record_property
-):
+def test_attention_blocksparse_prefill_fp8_perf(request, q_len, kv_len, quant_type, masked, kv_layout, record_property):
     inputs = _make_inputs(q_len, kv_len, quant_type, masked, kv_layout)
 
     def record_result(flagattention_ms, hpc_ms):
         record_benchmark_result(
-            record_property, op_name="hy3_attention",
+            record_property,
+            op_name="hy3_attention",
             dtype=str(torch.float8_e4m3fn),
-            result=[benchmark_metric(
-                shape_detail={
-                    "variant": "prefill_fp8", "q_len": q_len, "kv_len": kv_len,
-                    "quant_type": quant_type, "masked": masked,
-                    "kv_layout": kv_layout,
-                },
-                latency=flagattention_ms, latency_base=hpc_ms,
-            )],
+            result=[
+                benchmark_metric(
+                    shape_detail={
+                        "variant": "prefill_fp8",
+                        "q_len": q_len,
+                        "kv_len": kv_len,
+                        "quant_type": quant_type,
+                        "masked": masked,
+                        "kv_layout": kv_layout,
+                    },
+                    latency=flagattention_ms,
+                    latency_base=hpc_ms,
+                )
+            ],
             baseline="hpc CUDA" if hpc_ms is not None else None,
         )
+
     warmup = _requested_count(request, "--warmup", DEFAULT_GRAPH_WARMUP)
     repetitions = _requested_count(request, "--iter", DEFAULT_GRAPH_ITERS)
     if warmup < 0 or repetitions < 1:

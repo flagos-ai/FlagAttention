@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hardware-specific attention operators grouped by execution phase."""
+"""Portable HY3 attention with automatic runtime backend selection."""
 
-from typing import Literal
 from importlib import import_module
+from typing import Literal
 
 from flag_attn.runtime.backend import resolve_operator
 
@@ -38,7 +38,9 @@ def hy3_attention_prepare(inputs, *, stage: Literal["decode"] = "decode", varian
     if variant not in _HY3_DECODE_IMPLEMENTATIONS:
         raise ValueError(f"Unsupported Hy3 decode variant: {variant!r}")
     return resolve_operator(
-        "hy3_attention_prepare", __name__, "_generic_hy3_attention_prepare",
+        "hy3_attention_prepare",
+        __name__,
+        "_generic_hy3_attention_prepare",
     )(inputs, variant=variant)
 
 
@@ -49,6 +51,25 @@ def _generic_hy3_attention_prepare(inputs, *, variant):
         "bf16_dynamic": "prepare_dynamic_bf16_workspace",
     }.get(variant, "prepare_decode_workspace")
     return getattr(import_module(f"{__name__}.decode.{module_name}"), function_name)(inputs)
+
+
+def hy3_attention_workspace_is_reset(workspace, *, variant):
+    """Report whether a decode workspace can be safely replayed."""
+    if variant not in _HY3_DECODE_IMPLEMENTATIONS:
+        raise ValueError(f"Unsupported Hy3 decode variant: {variant!r}")
+    if isinstance(workspace, (decode.PureTritonMTP1Workspace, decode.PureTritonMTPWorkspace)):
+        return True
+    if hasattr(workspace, "is_reset"):
+        return workspace.is_reset()
+    return resolve_operator(
+        "hy3_attention_workspace_is_reset",
+        __name__,
+        "_generic_workspace_is_reset",
+    )(workspace, variant=variant)
+
+
+def _generic_workspace_is_reset(workspace, *, variant):
+    raise TypeError(f"Not a portable HY3 decode workspace: {type(workspace)!r}")
 
 
 def hy3_attention(
@@ -67,7 +88,7 @@ def hy3_attention(
     be omitted. Decode requires variant and forwards (inputs, workspace)
     unchanged. qk denotes per-token Q/K with per-head V quantization;
     kv denotes per-token Q with per-tensor K/V quantization. Prepare the
-    workspace using the matching implementation module before calling.
+    workspace with hy3_attention_prepare using the same variant before calling.
     """
     if stage == "prefill":
         if variant is not None:
@@ -91,4 +112,4 @@ def hy3_attention(
     return implementation(*args, **kwargs)
 
 
-__all__ = ["hy3_attention", "hy3_attention_prepare", "decode", "prefill"]
+__all__ = ["hy3_attention", "hy3_attention_prepare", "hy3_attention_workspace_is_reset", "decode", "prefill"]
