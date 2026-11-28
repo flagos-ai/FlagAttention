@@ -33,8 +33,6 @@ import triton.language as tl
 from flag_attn import runtime
 
 
-from .parallel import exp2, log2
-
 WALL_DECODE_AUTOTUNE_CONFIGS = [
     triton.Config({"BT": BT}, num_warps=nw, num_stages=ns) for BT in (16, 32) for nw in (2, 4, 8) for ns in (2, 3)
 ]
@@ -129,7 +127,7 @@ def parallel_wall_attn_decode_kernel(
         o_c = (i_c + tl.arange(0, 1)).to(tl.int64)
         p_r = r_cache + (bos_nc * HQ + i_hq) * K + o_c[:, None] * (HQ * K) + o_d[None, :]
         b_R = tl.load(p_r, mask=(o_c[:, None] < NC) & (o_d[None, :] < K), other=0.0).to(tl.float32)
-        b_q_til = (b_q.to(tl.float32) * exp2(b_pq - b_R)).to(b_q.dtype)
+        b_q_til = (b_q.to(tl.float32) * tl.exp2(b_pq - b_R)).to(b_q.dtype)
 
         p_kt = k_tilde + (bos_kv * HQ + i_hq) * K + o_d[:, None] + o_k[None, :] * (HQ * K)
         p_v = v + (bos_kv * H + i_h) * V + o_k[:, None] * (H * V) + o_v[None, :]
@@ -150,17 +148,17 @@ def parallel_wall_attn_decode_kernel(
 
         b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
         b_mw = tl.where(b_m == float("-inf"), 0.0, b_m)
-        b_r = exp2(b_mp - b_mw)
-        b_p = exp2(b_s - b_mw[:, None])
+        b_r = tl.exp2(b_mp - b_mw)
+        b_p = tl.exp2(b_s - b_mw[:, None])
         b_acc = b_acc * b_r + tl.sum(b_p, 1)
         b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_v.dtype), b_v)
 
     if USE_SINK_BIAS:
         b_m = tl.where(b_m == float("-inf"), 0.0, b_m)
-        b_acc += exp2(b_sink_bias - b_m)
+        b_acc += tl.exp2(b_sink_bias - b_m)
 
     b_o = b_o / b_acc[:, None]
-    b_m += log2(b_acc)
+    b_m += tl.log2(b_acc)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_q[:, None] & (o_v[None, :] < V))
     if i_v == 0:
         tl.store(p_lse, b_m.to(p_lse.dtype.element_ty), mask=m_q)
