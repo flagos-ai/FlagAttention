@@ -27,7 +27,7 @@ limitations under the License.
 # Original complete source SHA256:
 # 6a71b9ebef4dbfaf489ca32fb4ad32ed51a3dc474b6d681c21ddf026eef1b5d2
 # This forward-only extraction retains the original forward operations and
-# launch configuration. Loads use .ca for legal 4/8/16-byte async copies.
+# arithmetic and ACP tile grouping. Device tuning is selected by runtime.
 # Backward and standalone upstream tests are excluded.
 import math
 from collections import defaultdict
@@ -38,27 +38,30 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from flag_attn.runtime import torch_device_fn
+from flag_attn.runtime.backend import resolve_operator
+from .launch import record_launch
+
 OFFICIAL_COMMIT = "883f260c636e87971339749b0d8310004794a5cc"
 __all__ = ["forgetting_attention"]
 
 def maybe_contiguous(x):
-    # only when the inner most dimension is contiguous can LDGSTS be used
-    # so inner-dimension contiguity is enforced.
+    # Contiguous inner dimensions allow coalesced loads on every backend.
     return x.contiguous() if x.stride(-1) != 1 else x
 
 class ForgettingAttention(torch.autograd.Function):
     events = defaultdict(lambda: {
-        "fwd_start_event": torch.cuda.Event(enable_timing=True),
-        "fwd_end_event": torch.cuda.Event(enable_timing=True),
-        "bwd_start_event": torch.cuda.Event(enable_timing=True),
-        "bwd_end_event": torch.cuda.Event(enable_timing=True),
+        "fwd_start_event": torch_device_fn.Event(enable_timing=True),
+        "fwd_end_event": torch_device_fn.Event(enable_timing=True),
+        "bwd_start_event": torch_device_fn.Event(enable_timing=True),
+        "bwd_end_event": torch_device_fn.Event(enable_timing=True),
 
-        "fwd_find_index_start_event": torch.cuda.Event(enable_timing=True),
-        "fwd_find_index_end_event": torch.cuda.Event(enable_timing=True),
-        "bwd_find_index_kv_start_event": torch.cuda.Event(enable_timing=True),
-        "bwd_find_index_kv_end_event": torch.cuda.Event(enable_timing=True),
-        "bwd_find_index_q_start_event": torch.cuda.Event(enable_timing=True),
-        "bwd_find_index_q_end_event": torch.cuda.Event(enable_timing=True),
+        "fwd_find_index_start_event": torch_device_fn.Event(enable_timing=True),
+        "fwd_find_index_end_event": torch_device_fn.Event(enable_timing=True),
+        "bwd_find_index_kv_start_event": torch_device_fn.Event(enable_timing=True),
+        "bwd_find_index_kv_end_event": torch_device_fn.Event(enable_timing=True),
+        "bwd_find_index_q_start_event": torch_device_fn.Event(enable_timing=True),
+        "bwd_find_index_q_end_event": torch_device_fn.Event(enable_timing=True),
     })
     info = defaultdict(lambda: {
         "fwd_time": 0.0,
@@ -146,9 +149,7 @@ class ForgettingAttention(torch.autograd.Function):
         q, k, v = maybe_contiguous(q), maybe_contiguous(k), maybe_contiguous(v)
 
         # to work around https://github.com/openai/triton/issues/2441
-        device = torch.cuda.device_of(q)
-
-        with torch.cuda.device(device):
+        with torch_device_fn.device(q.device):
 
             if M > 1:
                 config = get_fwd_config(B, H, M, N, D, causal)
@@ -180,7 +181,7 @@ class ForgettingAttention(torch.autograd.Function):
                 )
                 if record_find_index_time:
                     ForgettingAttention.events[record_time_key]["fwd_find_index_end_event"].record()
-                    torch.cuda.synchronize()
+                    torch_device_fn.synchronize()
                     elapsed = ForgettingAttention.events[record_time_key]["fwd_find_index_start_event"].elapsed_time(ForgettingAttention.events[record_time_key]["fwd_find_index_end_event"])
                     ForgettingAttention.info[record_time_key]["fwd_find_index_time"] += elapsed
                     ForgettingAttention.info[record_time_key]["fwd_find_index_count"] += 1
@@ -192,7 +193,7 @@ class ForgettingAttention(torch.autograd.Function):
                 return (triton.cdiv(M, META["BLOCK_M"]), H, B)
             o = torch.empty_like(q)
             L = torch.empty((B, H, M), device=q.device, dtype=torch.float32)
-            _fwd_kernel[grid](
+            compiled = _fwd_kernel[grid](
                 q, k, v, log_lambda, seq_start, start_index, sm_scale,
                 L, o,
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -209,6 +210,9 @@ class ForgettingAttention(torch.autograd.Function):
                 num_warps=num_warps, num_stages=num_stages,
             )
 
+            record_launch(_fwd_kernel, compiled, (triton.cdiv(M, BLOCK_M), H, B),
+                          dict(BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, num_warps=num_warps, num_stages=num_stages))
+
         # autograd context maintenance
         ctx.save_for_backward(q, k, v, o, L, log_lambda, seq_start, adaptive_threshold)
         ctx.sm_scale = sm_scale
@@ -222,7 +226,7 @@ class ForgettingAttention(torch.autograd.Function):
 
         if record_attention_time:
             ForgettingAttention.events[record_time_key]["fwd_end_event"].record()
-            torch.cuda.synchronize()
+            torch_device_fn.synchronize()
             elapsed = ForgettingAttention.events[record_time_key]["fwd_start_event"].elapsed_time(ForgettingAttention.events[record_time_key]["fwd_end_event"])
             ForgettingAttention.info[record_time_key]["fwd_time"] += elapsed
             ForgettingAttention.info[record_time_key]["fwd_count"] += 1
@@ -293,40 +297,16 @@ def forgetting_attention(
         out = rearrange(out, "b h t d -> b t h d")
     return out
 
-def get_fwd_config(B, H, M, N, D, causal):
+def _generic_fwd_config(B, H, M, N, D, causal):
     assert causal
-    if torch.cuda.get_device_capability() == (8, 0):
-        if D <= 64:
-            BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 32, 3, 4
-        else:
-            BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 4, 4
-    elif torch.cuda.get_device_capability() == (9, 0):
-        # H100
-        if D <= 64:
-            BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 8
-        else:
-            BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 2, 8
-    elif torch.cuda.get_device_capability() == (8, 6):
-        if not causal:
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
-            else:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
-        else: # causal
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
-            else:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
-    elif torch.cuda.get_device_capability() == (8, 9):
-        # L40S
-        if D <= 64:
-            BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 2, 4
-        else:
-            BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
-    else:
-        raise ValueError(f"Unsupported device capability {torch.cuda.get_device_capability()}. Please open an issue.")
-        # BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
-    return (BLOCK_M, BLOCK_N, num_stages, num_warps)
+    # Fixed ACP tile grouping preserves the pruning and accumulation contract.
+    return (128, 64, 3, 8) if D <= 64 else (128, 128, 2, 8)
+
+
+def get_fwd_config(B, H, M, N, D, causal):
+    return resolve_operator("forgetting_attention_fwd_config", __name__, "_generic_fwd_config")(
+        B, H, M, N, D, causal
+    )
 
 @triton.jit
 def _fwd_kernel(
@@ -386,13 +366,12 @@ def _fwd_kernel(
 
     # load q
     if DIVISIBLE_M:
-        # .ca permits 4/8-byte async loads too; .cg requires 16-byte copies.
-        q = tl.load(q_ptrs, cache_modifier=".ca")
-        log_lambda_out = tl.load(log_lambda_out_ptrs, cache_modifier=".ca")
+        q = tl.load(q_ptrs)
+        log_lambda_out = tl.load(log_lambda_out_ptrs)
     else:
         mask_m = offs_m < M
-        q = tl.load(q_ptrs, mask=mask_m[:, None], cache_modifier=".ca")
-        log_lambda_out = tl.load(log_lambda_out_ptrs, mask=mask_m, cache_modifier=".ca")
+        q = tl.load(q_ptrs, mask=mask_m[:, None])
+        log_lambda_out = tl.load(log_lambda_out_ptrs, mask=mask_m)
 
     #Dot I trick: to place q in registers, it saves shared memory
     # if BLOCK_DMODEL < 128:
@@ -450,14 +429,14 @@ def _fwd_kernel(
 
         # -- load k, v --
         if DIVISIBLE_N:
-            k = tl.load(k_ptrs, cache_modifier=".ca")
-            v = tl.load(v_ptrs, cache_modifier=".ca")
-            log_lambda_in = tl.load(log_lambda_in_ptrs, cache_modifier=".ca")
+            k = tl.load(k_ptrs)
+            v = tl.load(v_ptrs)
+            log_lambda_in = tl.load(log_lambda_in_ptrs)
         else:
             mask_n = offs_n < N
-            k = tl.load(k_ptrs, mask=mask_n[None, :], cache_modifier=".ca")
-            v = tl.load(v_ptrs, mask=mask_n[:, None], cache_modifier=".ca")
-            log_lambda_in = tl.load(log_lambda_in_ptrs, mask=mask_n, cache_modifier=".ca")
+            k = tl.load(k_ptrs, mask=mask_n[None, :])
+            v = tl.load(v_ptrs, mask=mask_n[:, None])
+            log_lambda_in = tl.load(log_lambda_in_ptrs, mask=mask_n)
 
         # -- compute qk ---
         # s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -513,11 +492,11 @@ def _fwd_kernel(
 
 
     if DIVISIBLE_M:
-        tl.store(l_ptrs, l, cache_modifier=".cg")
-        tl.store(o_ptrs, acc.to(input_dtype), cache_modifier=".cg")
+        tl.store(l_ptrs, l)
+        tl.store(o_ptrs, acc.to(input_dtype))
     else:
-        tl.store(l_ptrs, l, mask=mask_m, cache_modifier=".cg")
-        tl.store(o_ptrs, acc.to(input_dtype), mask=mask_m[:, None], cache_modifier=".cg")
+        tl.store(l_ptrs, l, mask=mask_m)
+        tl.store(o_ptrs, acc.to(input_dtype), mask=mask_m[:, None])
 
 @triton.jit
 def _find_start_index_kernel(

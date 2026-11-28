@@ -8,6 +8,7 @@ The benchmark imports the same inputs and reference adapters from this file.
 import gc
 import hashlib
 import importlib
+import os
 import weakref
 from functools import lru_cache
 
@@ -16,7 +17,10 @@ import torch
 import torch.nn.functional as F
 
 from flag_attn.testing import backend as test_backend
-from flag_attn.forgetting.parallel import TLE_AVAILABLE
+from flag_attn import capture_forgetting_attention, prepare_forgetting_attention
+from flag_attn.utils import has_triton_tle
+
+TLE_AVAILABLE = has_triton_tle(3, 6, 0, required_api=("gpu.wgmma", "gpu.copy", "gpu.set_layout"))
 
 # Inline pytest parameters: B, M, N, Hq, Hkv, D, dtype, scale, seed-0 SHA256.
 # Preserve all 90 historical configurations and their numerical regression oracle.
@@ -148,7 +152,7 @@ def optimized_entry():
 
 @lru_cache(maxsize=1)
 def official_entry():
-    return importlib.import_module("flag_attn.forgetting.naive").forgetting_attention
+    return importlib.import_module("flag_attn").naive_forgetting_attention
 
 
 def call_optimized(inputs, case, threshold=-10.0, scale=None):
@@ -190,7 +194,8 @@ def assert_bitwise(actual, expected):
     )
 
 
-CUDA_SM90 = test_backend.is_available() and test_backend.cuda_capability() == (9, 0)
+CUDA_SM90 = test_backend.is_nvidia() and test_backend.cuda_capability() == (9, 0)
+HOPPER_EXPECTED = CUDA_SM90 and TLE_AVAILABLE and os.environ.get("FLAG_ATTN_FORCE_GENERIC", "0") != "1"
 pytestmark = [
     pytest.mark.parallel_forgetting_attn,
     pytest.mark.skipif(not test_backend.supports_operator("parallel_forgetting_attn"), reason="selected Forgetting Attention implementation is unavailable"),
@@ -215,13 +220,10 @@ def test_forgetting_attention_matches_official(case, seed):
 @pytest.mark.parametrize("case", [c for c in CASES if c["id"] in
                                   ("S001", "S003", "S011", "S024", "S031", "S034", "S064")], ids=case_id)
 @torch.inference_mode()
-@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="prefix preparation requires SM90/TLE")
 def test_forgetting_attention_prefix_and_boundaries(case):
-    from flag_attn.forgetting.parallel import prepare, h100_config
     inputs = make_inputs(case)
     b, m, n, h, hk, d = (case[k] for k in ("B", "M", "N", "HQ", "H", "D"))
-    prep = h100_config(b, m, n, h, hk, d)[2]
-    prefix, starts, _, _, bn = prepare(*inputs, False, None, case["scale"], -10.0, prep, True)
+    prefix, starts, _, _, bn = prepare_forgetting_attention(*inputs, False, None, case["scale"], -10.0, 1, True)
     expected_prefix = torch.cumsum(inputs[3].transpose(1, 2), -1, dtype=torch.float32)
     assert torch.equal(prefix, expected_prefix)
     qm = 1 if m == 1 else 128
@@ -240,7 +242,6 @@ def _reuse_case(dtype="bfloat16"):
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @torch.inference_mode()
-@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="generic ACP implementation contract requires SM90/TLE")
 def test_forgetting_attention_launch_reuse(dtype):
     case = _reuse_case(dtype)
     inputs = make_inputs(case, 37)
@@ -257,7 +258,6 @@ def test_forgetting_attention_launch_reuse(dtype):
 
 @pytest.mark.parametrize("offset", [0, 1, 2, 3])
 @torch.inference_mode()
-@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="generic ACP implementation contract requires SM90/TLE")
 def test_forgetting_attention_gate_alignment(offset):
     case = _reuse_case()
     q, k, v, gate = make_inputs(case, 5)
@@ -269,8 +269,9 @@ def test_forgetting_attention_gate_alignment(offset):
 
 
 @torch.inference_mode()
-@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="generic ACP implementation contract requires SM90/TLE")
 def test_forgetting_attention_nondefault_stream_and_lifetime():
+    if not all(hasattr(test_backend.device_fn, name) for name in ("Stream", "stream")):
+        pytest.skip("backend does not expose streams")
     case = _reuse_case()
     for _ in range(2):
         stream = test_backend.device_fn.Stream()
@@ -289,8 +290,9 @@ def test_forgetting_attention_nondefault_stream_and_lifetime():
 @pytest.mark.parametrize("problem", ["head_first", "seq_start", "threshold_none", "threshold_positive",
                                     "threshold_nan", "scale_inf", "gate_dtype", "q_dtype", "noncontiguous"])
 @torch.inference_mode()
-@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="generic ACP implementation contract requires SM90/TLE")
 def test_forgetting_attention_rejects_unsupported(problem):
+    if not HOPPER_EXPECTED and problem in ("head_first", "seq_start", "threshold_none", "noncontiguous"):
+        pytest.skip("this restriction applies only to the Hopper specialization")
     case = _reuse_case()
     q, k, v, gate = make_inputs(case)
     kwargs = dict(head_first=False, seq_start=None, sm_scale=0.125, adaptive_threshold=-10.0)
@@ -318,17 +320,19 @@ def test_forgetting_attention_rejects_unsupported(problem):
 
 @pytest.mark.parametrize("id", ["S031", "S034", "S024"])
 @torch.inference_mode()
-@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="generic ACP implementation contract requires SM90/TLE")
 def test_forgetting_attention_explicit_async_and_hot_launch(id):
-    from flag_attn.forgetting.parallel import capture
     case = next(c for c in CASES if c["id"] == id)
     inputs = make_inputs(case)
     call_optimized(inputs, case)
-    with capture() as records:
+    with capture_forgetting_attention() as records:
         call_optimized(inputs, case)
     test_backend.device_fn.synchronize()
-    attention = [r for r in records if "cp.async.bulk.tensor" in r[1].asm["ptx"]]
-    assert len(attention) == 1
-    _, compiled, _, _, cache_hit = attention[0]
-    assert cache_hit
-    assert ("wgmma.mma_async" in compiled.asm["ptx"]) == (case["M"] > 1)
+    if HOPPER_EXPECTED:
+        attention = [r for r in records if "cp.async.bulk.tensor" in r[1].asm.get("ptx", "")]
+        assert len(attention) == 1
+        _, compiled, _, _, cache_hit = attention[0]
+        assert cache_hit
+        assert ("wgmma.mma_async" in compiled.asm["ptx"]) == (case["M"] > 1)
+    else:
+        assert any(r[0].__name__ == "_fwd_kernel" for r in records)
+        assert all(r[0].__module__.startswith("flag_attn.forgetting.") for r in records)

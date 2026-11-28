@@ -8,6 +8,7 @@ than assuming every backend exposing torch.cuda is an NVIDIA device.
 """
 
 import importlib
+import os
 import statistics
 import time
 
@@ -33,7 +34,6 @@ _CUDA_GENERIC_OPERATORS = {
     "parallax_attn_with_kvcache",
     "parallel_wall_attn",
     "log_linear_attn",
-    "parallel_forgetting_attn",
     "minimax_m3_sparse_attn",
     "minimax_m3_sparse_attn_decode",
     "minimax_m3_index_topk",
@@ -76,6 +76,8 @@ def get_device_name(*args):
 
 
 def has_specialization(name):
+    if os.environ.get("FLAG_ATTN_FORCE_GENERIC", "0") == "1":
+        return False
     module_name = f"flag_attn.runtime.backend._{runtime.device.vendor_name}"
     try:
         backend = importlib.import_module(module_name)
