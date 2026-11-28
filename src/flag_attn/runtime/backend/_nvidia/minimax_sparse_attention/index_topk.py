@@ -9,13 +9,16 @@ import triton
 import triton.language as tl
 from flag_attn.utils import current_platform, is_sm100_device, round_up
 from flag_attn.minimax_sparse_attention import index_topk as generic
-from flag_attn.minimax_sparse_attention.index_topk import (
+from .index_decode import (
     _decode_index_score_kernel,
     _decode_topk_identity_kernel,
     _topk_index_partial_kernel,
     _topk_index_merge_kernel,
-    _bitonic_merge,
 )
+from flag_attn.minimax_sparse_attention.index_topk import _bitonic_merge
+from . import index_decode as cuda_index
+from .index_radix import minimax_m3_index_topk
+from .dispatch import force_generic
 from .utils import _packed_bytes, _sm_count, _tensor_metadata, _can_reuse_launch, _cache_plan, _KernelLaunch
 
 SPARSE_BLOCK_SIZE = generic.SPARSE_BLOCK_SIZE
@@ -521,6 +524,8 @@ def minimax_m3_index_score(
         or k_scale is not None
     ):
         raise ValueError("Packed FP4 inputs/scales require explicit fp4_format")
+    if force_generic() and fp4_format is None:
+        return generic.minimax_m3_index_score(idx_q, index_kv_cache, block_table, cu_seqlens_q, seq_lens, prefix_lens, max_query_len, max_seq_len, num_kv_heads)
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert num_idx_heads == num_kv_heads, "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     if (
@@ -611,8 +616,10 @@ def minimax_m3_index_decode_score(
         or k_scale is not None
     ):
         raise ValueError("Packed FP4 inputs/scales require explicit fp4_format")
+    if force_generic() and fp4_format is None:
+        return generic.minimax_m3_index_decode_score(idx_q, index_kv_cache, block_table, seq_lens, max_seq_len, init_blocks, local_blocks, num_kv_heads, decode_query_len, max_decode_query_len, score_out)
     if not is_sm100_device(idx_q.device):
-        return generic.minimax_m3_index_decode_score(
+        return cuda_index.minimax_m3_index_decode_score(
             idx_q,
             index_kv_cache,
             block_table,
@@ -687,6 +694,8 @@ def minimax_m3_index_decode(
         or k_scale is not None
     ):
         raise ValueError("Packed FP4 inputs/scales require explicit fp4_format")
+    if force_generic() and fp4_format is None:
+        return generic.minimax_m3_index_decode(idx_q, index_kv_cache, block_table, seq_lens, max_seq_len, topk, init_blocks, local_blocks, num_kv_heads, decode_query_len, max_decode_query_len, out, score_out)
     if fp4_format is not None:
         if decode_query_len < 1:
             raise ValueError("decode_query_len must be positive")
@@ -729,7 +738,7 @@ def minimax_m3_index_decode(
         if selected is not None:
             return selected
     if fp4_format is None and not is_sm100_device(idx_q.device):
-        return generic.minimax_m3_index_decode(
+        return cuda_index.minimax_m3_index_decode(
             idx_q,
             index_kv_cache,
             block_table,

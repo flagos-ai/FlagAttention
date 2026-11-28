@@ -58,13 +58,13 @@ except ModuleNotFoundError:  # Direct script execution.
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import minimax_m3_sparse_attn, runtime
-from flag_attn.minimax_sparse_attention import (
+from flag_attn import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode,
     minimax_m3_index_score,
     minimax_m3_index_topk,
 )
-from flag_attn.minimax_sparse_attention import minimax_m3_sparse_attn_decode
+from flag_attn import minimax_m3_sparse_attn_decode
 from functools import partial
 
 try:
@@ -152,6 +152,8 @@ PREFILL_SHAPES = [
     (1, 1024, 16384, 1, 8),
     (1, 4096, 16384, 1, 8),
     (1, 8192, 16384, 1, 8),
+    (1, 12288, 16384, 1, 8),  # Hopper KV-outer crossover.
+    (1, 128, 131072, 1, 8),  # Wide-row radix TopK crossover.
     (1, 128, 65536, 1, 8),
     (1, 1024, 65536, 1, 8),
     (4, 128, 4096, 1, 8),

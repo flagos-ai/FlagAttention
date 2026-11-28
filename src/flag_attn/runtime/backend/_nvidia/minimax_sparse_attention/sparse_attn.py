@@ -2,7 +2,7 @@
 # Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
 
-"""NVIDIA MSA routing: shared FP8 QKV and Blackwell persistent/NVFP4."""
+"""NVIDIA MSA routing for Hopper TLE, PDL, FP8 and Blackwell persistent/NVFP4."""
 
 from math import prod
 
@@ -11,6 +11,9 @@ import triton
 import triton.language as tl
 from flag_attn.utils import is_sm90_device, is_sm100_device
 from flag_attn.minimax_sparse_attention import sparse_attn as generic
+from . import decode as cuda_decode
+from .prefill import _gqa_sparse_fwd_kernel
+from .dispatch import force_generic, hopper_prefill
 from .utils import _packed_bytes, _sm_count, _tensor_metadata, _cache_plan, _can_reuse_launch, _KernelLaunch
 
 # SM100 workload thresholds.
@@ -1606,7 +1609,7 @@ def _run_common_bf16_q_prefill(
         kernel = generic._gqa_sparse_fwd_fallback_kernel
         launch_options = {}
     else:
-        kernel = generic._gqa_sparse_fwd_kernel
+        kernel = _gqa_sparse_fwd_kernel
         launch_options = dict(num_warps=4, num_stages=3)
     grid = (max_query_len, num_kv_heads, cu_seqlens_q.shape[0] - 1)
     kernel[grid](
@@ -1683,29 +1686,29 @@ _DECODE_LAUNCH_CACHE = {}
 
 def _run_common_bf16_q_decode(q, kv, selected, pages, seq, heads, scale, output, qlen, k_scale, v_scale):
     """Run common `_gqa_sparse_decode_kernel` and `_merge_topk_attn_out_kernel`,
-    or delegate to `generic.minimax_m3_sparse_attn_decode`.
+    or delegate to `cuda_decode.minimax_m3_sparse_attn_decode`.
 
     Cache launch metadata and compiled code; allocate workspace per call.
     The fused/high-parallelism path uses the common launcher.
     """
-    attention = generic._gqa_sparse_decode_kernel
-    reduction = generic._merge_topk_attn_out_kernel
+    attention = cuda_decode._gqa_sparse_decode_kernel
+    reduction = cuda_decode._merge_topk_attn_out_kernel
     # This adapter supports the current single Heuristics -> JIT wrapper.
     # If upstream changes that interface, use its ordinary launcher.
     if not all(isinstance(k, triton.runtime.autotuner.Heuristics) for k in (attention, reduction)):
-        return generic.minimax_m3_sparse_attn_decode(
+        return cuda_decode.minimax_m3_sparse_attn_decode(
             q, kv, selected, pages, seq, heads, scale, output, qlen, k_scale, v_scale
         )
     kernel, merge = attention.fn, reduction.fn
     n, hq, dim = q.shape
     tensors = (q, kv, selected, pages, seq, output, k_scale, v_scale)
     if (
-        n * heads >= generic._MSA_DECODE_FUSED_MIN_PARALLELISM
+        n * heads >= cuda_decode._MSA_DECODE_FUSED_MIN_PARALLELISM
         or not _can_reuse_launch(kernel, merge)
         or type(scale) not in (float, int)
         or any(t is not None and type(t) is not torch.Tensor for t in tensors)
     ):
-        return generic.minimax_m3_sparse_attn_decode(
+        return cuda_decode.minimax_m3_sparse_attn_decode(
             q, kv, selected, pages, seq, heads, scale, output, qlen, k_scale, v_scale
         )
     key = tuple(_tensor_metadata(t) for t in tensors) + (heads, scale, qlen)
@@ -1714,7 +1717,7 @@ def _run_common_bf16_q_decode(q, kv, selected, pages, seq, heads, scale, output,
         # Device is part of the recipe key. Validate it when preparing a new
         # recipe, not on every launch of an already validated one.
         if not is_sm100_device(q.device):
-            return generic.minimax_m3_sparse_attn_decode(
+            return cuda_decode.minimax_m3_sparse_attn_decode(
                 q, kv, selected, pages, seq, heads, scale, output, qlen, k_scale, v_scale
             )
         assert n == seq.shape[0] * qlen
@@ -1727,17 +1730,17 @@ def _run_common_bf16_q_decode(q, kv, selected, pages, seq, heads, scale, output,
         _, _, ksh, kst, vsh, vst, mode = scales
         p, topk = max(1, n * heads), selected.shape[-1]
         target_grid = (
-            3 * generic._sm_count(q.device)
-            if generic._MSA_DECODE_GRID_BAND_LO <= p <= generic._MSA_DECODE_GRID_BAND_HI
-            else generic._MSA_DECODE_TARGET_GRID
+            3 * cuda_decode._sm_count(q.device)
+            if cuda_decode._MSA_DECODE_GRID_BAND_LO <= p <= cuda_decode._MSA_DECODE_GRID_BAND_HI
+            else cuda_decode._MSA_DECODE_TARGET_GRID
         )
-        if not fp8 and p <= generic._MSA_DECODE_TARGET_GRID:
-            skip = generic._MSA_DECODE_TARGET_GRID - 1
+        if not fp8 and p <= cuda_decode._MSA_DECODE_TARGET_GRID:
+            skip = cuda_decode._MSA_DECODE_TARGET_GRID - 1
             if max(1, min(topk, skip // p)) == 1 and max(1, min(topk, target_grid // p)) > 1:
                 target_grid = skip
         target = max(1, min(topk, target_grid // p))
         chunks = 1 << (target.bit_length() - 1)
-        pdl = generic._pdl_supported()
+        pdl = cuda_decode._pdl_supported()
         shape_o, shape_l = (chunks, n, hq, dim), (chunks, n, hq)
         stride_o = (n * hq * dim, hq * dim, dim, 1) if chunks > 1 else (0,) + output.stride()
         stride_l = (n * hq, hq, 1)
@@ -1821,6 +1824,11 @@ def minimax_m3_sparse_attn(
     No new arguments are required for existing BF16/FP8 callers.
     """
     _validate_attention_dtypes(q, kv_cache, kv_format, k_global_scale, v_global_scale)
+    if force_generic() and kv_format is None:
+        return generic.minimax_m3_sparse_attn(
+            q, kv_cache, topk_idx, block_table, cu_seqlens_q, seq_lens,
+            prefix_lens, max_query_len, num_kv_heads, sm_scale, output, k_scale, v_scale,
+        )
 
     # 1. Packed NVFP4 KV: SM100 only, never a common-kernel fallback.
     if kv_format == "nvfp4":
@@ -1895,10 +1903,10 @@ def minimax_m3_sparse_attn(
             v_scale,
         )
 
-    # 4. BF16 Q: only SM90 may enter common prefill's Hopper/TLE dispatch.
-    # Other devices reuse its non-TLE kernels through our explicit launcher.
-    if is_sm90_device(q.device):
-        return generic.minimax_m3_sparse_attn(
+    # 4. Only SM90 with compatible TLE may enter the Hopper implementation.
+    # Other devices use the ordinary NVIDIA or portable Triton kernels.
+    if is_sm90_device(q.device) and hopper_prefill() is not None:
+        return hopper_prefill().minimax_m3_sparse_attn(
             q,
             kv_cache,
             topk_idx,
@@ -1952,6 +1960,11 @@ def minimax_m3_sparse_attn_decode(
     if decode_query_len <= 0:
         raise ValueError("decode_query_len must be positive")
     _validate_attention_dtypes(q, kv_cache, kv_format, k_global_scale, v_global_scale)
+    if force_generic() and kv_format is None:
+        return generic.minimax_m3_sparse_attn_decode(
+            q, kv_cache, topk_idx, block_table, seq_lens, num_kv_heads,
+            sm_scale, output, decode_query_len, k_scale, v_scale,
+        )
 
     # 1. Packed NVFP4 KV: SM100 only.
     if kv_format == "nvfp4":

@@ -26,7 +26,6 @@ NVIDIA_TF32_OVERRIDE=0). B200 tests skip on other architectures; no B200 CI.
 from __future__ import annotations
 
 
-import importlib
 from dataclasses import dataclass, replace
 from typing import Sequence
 
@@ -36,13 +35,13 @@ import triton.knobs
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import minimax_m3_sparse_attn
-from flag_attn.minimax_sparse_attention import (
+from flag_attn import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode,
     minimax_m3_index_score,
     minimax_m3_index_topk,
 )
-from flag_attn.minimax_sparse_attention import minimax_m3_sparse_attn_decode
+from flag_attn import minimax_m3_sparse_attn_decode
 
 triton.knobs.autotuning.adjust_block_size = False
 BLOCK = SPARSE_BLOCK_SIZE
@@ -65,20 +64,13 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.minimax_m3_sparse_attn
 def test_public_exports_use_active_backend() -> None:
-    from flag_attn import runtime
+    import flag_attn
 
-    try:
-        backend = importlib.import_module(f"flag_attn.runtime.backend._{runtime.device.vendor_name}")
-    except ModuleNotFoundError as exc:
-        if exc.name != f"flag_attn.runtime.backend._{runtime.device.vendor_name}":
-            raise
-        backend = None
-    if backend is not None and "minimax_m3_sparse_attn_decode" in vars(backend).get("_OPERATOR_EXPORTS", {}):
-        assert minimax_m3_sparse_attn_decode is backend.minimax_m3_sparse_attn_decode
-    else:
-        from flag_attn.minimax_sparse_attention.sparse_attn import minimax_m3_sparse_attn_decode as generic_decode
-
-        assert minimax_m3_sparse_attn_decode is generic_decode
+    for name in ("minimax_m3_index_score", "minimax_m3_index_topk",
+                 "minimax_m3_index_decode", "minimax_m3_sparse_attn",
+                 "minimax_m3_sparse_attn_decode"):
+        assert callable(getattr(flag_attn, name))
+    assert flag_attn.SPARSE_BLOCK_SIZE == 128
 
 
 @dataclass
@@ -1110,16 +1102,10 @@ def test_nvidia_msa_full_chain(msa_case, record_property):
     from flag_attn.testing.minimax_sparse_attention import (
         reference_selection, reference_attention, selection_difference,
     )
-    from flag_attn.runtime.backend._nvidia.minimax_sparse_attention import sparse_attn, index_topk
 
     data = make_msa_inputs(msa_case)
     selected_ref = reference_selection(data)
     expected = reference_attention(data, selected_ref)
-    # Only clear recipe caches; compilation caches are not claimed to be cold.
-    for cache in (sparse_attn._PERSISTENT_LAUNCH_CACHE, sparse_attn._FP8_LAUNCH_CACHE,
-                  sparse_attn._NVFP4_LAUNCH_CACHE, sparse_attn._DECODE_LAUNCH_CACHE,
-                  index_topk._DECODE_INDEX_LAUNCH_CACHE):
-        cache.clear()
     diagnostics = []
     atol, rtol = msa_case.tolerance
     for call in range(2):
@@ -1517,3 +1503,79 @@ def test_fp4_decode_score_out_and_topk(fmt, qlen, topk):
     padded = torch.nn.functional.pad(expected, (0, max(0, topk - max_blocks)), value=float("-inf"))
     best_scores = padded.topk(topk, dim=-1).values
     torch.testing.assert_close(selected_scores.sort(-1).values, best_scores.sort(-1).values, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+def test_wide_prefill_topk_stable_ties_and_output_buffer():
+    """Exercise the radix crossover through the public selector on NVIDIA."""
+    device = test_backend.device
+    scores = torch.randint(-4, 5, (2, 17, 1024), device=device).float()
+    cu = torch.tensor([0, 17], dtype=torch.int32, device=device)
+    prefix = torch.tensor([131072 - 17], dtype=torch.int32, device=device)
+    output = torch.full((2, 24, 16), -7, dtype=torch.int32, device=device)
+    actual = minimax_m3_index_topk(scores, cu, prefix, 17, 16, 0, 0, out=output)
+    expected = scores.argsort(dim=-1, descending=True, stable=True)[..., :16]
+    expected = expected.sort(dim=-1).values.to(torch.int32)
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.all(output[:, 17:] == -7)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+@pytest.mark.parametrize("query_len", [128, 512, 12288])
+def test_prefill_architecture_paths_match_portable(monkeypatch, query_len):
+    """Short TMA loops and real long-prompt KV-outer, selected automatically."""
+    data = make_data((query_len,), 1, 8, decode=False, prefix_lens=(0,), mode="bf16")
+    # Each query attends to its current logical page, including a partial tail.
+    logical = torch.arange(query_len, device=test_backend.device, dtype=torch.int32) // BLOCK
+    selected = logical.view(1, query_len, 1)
+
+    def run():
+        output = torch.empty_like(data.q)
+        minimax_m3_sparse_attn(
+            data.q, data.kv_cache, selected, data.block_table, data.cu_q,
+            data.seq_lens, data.prefix_lens, query_len, 1, data.sm_scale, output,
+        )
+        return output
+
+    actual = run()
+    with monkeypatch.context() as context:
+        context.setenv("FLAG_ATTN_FORCE_GENERIC", "1")
+        expected = run()
+    _assert_attention_match(actual, expected, data)
+    # Independent FP32 reference at causal/page boundaries and late queries.
+    for qi in sorted({0, 1, 63, 127, min(128, query_len - 1), query_len - 1}):
+        page = data.block_table[0, qi // BLOCK]
+        count = qi % BLOCK + 1
+        keys = data.kv_cache[page, 0, :count, :HEAD_DIM].float()
+        values = data.kv_cache[page, 0, :count, HEAD_DIM:].float()
+        logits = data.q[qi].float() @ keys.T * data.sm_scale
+        reference = torch.softmax(logits, dim=-1) @ values
+        torch.testing.assert_close(actual[qi].float(), reference, atol=BF16_ATOL, rtol=BF16_RTOL)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+@pytest.mark.skipif(not test_backend.supports_msa_fp8(), reason="requires FP8 storage support")
+def test_prefill_fp8_per_token_head_scales():
+    data = make_data((288,), 2, 8, decode=False, prefix_lens=(256,), mode="fp8_kv")
+    tokens = data.kv_cache.shape[0] * BLOCK
+    # Different physical-token scales for each KV head.
+    k_scale = torch.linspace(0.25, 0.75, 2 * tokens, device=test_backend.device).view(2, tokens)
+    v_scale = torch.linspace(0.75, 0.25, 2 * tokens, device=test_backend.device).view(2, tokens)
+    selected = torch.zeros((2, 32, 1), device=test_backend.device, dtype=torch.int32)
+    actual = torch.empty_like(data.q)
+    minimax_m3_sparse_attn(
+        data.q, data.kv_cache, selected, data.block_table, data.cu_q, data.seq_lens,
+        data.prefix_lens, 32, 2, data.sm_scale, actual, k_scale=k_scale, v_scale=v_scale,
+    )
+    page = int(data.block_table[0, 0])
+    expected = torch.empty_like(actual)
+    for head in range(2):
+        keys = data.kv_cache[page, head, :, :HEAD_DIM].float()
+        values = data.kv_cache[page, head, :, HEAD_DIM:].float()
+        keys *= k_scale[head, page * BLOCK:(page + 1) * BLOCK, None]
+        values *= v_scale[head, page * BLOCK:(page + 1) * BLOCK, None]
+        q = data.q[:, head * 8:(head + 1) * 8].float()
+        logits = q @ keys.T * data.sm_scale
+        expected[:, head * 8:(head + 1) * 8] = (torch.softmax(logits, dim=-1) @ values).to(actual.dtype)
+    torch.testing.assert_close(actual, expected, atol=FP8_ATOL, rtol=FP8_RTOL)

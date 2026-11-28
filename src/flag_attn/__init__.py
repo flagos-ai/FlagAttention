@@ -59,6 +59,7 @@ _OPERATOR_EXPORTS = {
     "InfLLMV2Config": ("infllmv2",),
     "infllmv2_attention": ("infllmv2", "infllmv2_attention", None),
     "infllmv2_decode": ("infllmv2",),
+    "SPARSE_BLOCK_SIZE": ("minimax_sparse_attention.index_topk",),
     "minimax_m3_index_decode": ("minimax_sparse_attention.index_topk",),
     "minimax_m3_index_decode_score": ("minimax_sparse_attention.index_topk",),
     "minimax_m3_index_score": ("minimax_sparse_attention.index_topk",),
