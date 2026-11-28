@@ -1,0 +1,18 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Shared forward and backward candidates for Wall-Attention on PPU-ZW810E.
+# Selected by the BF16/FP16 forward benchmark and the BF16 GQA gradient test.
+parallel_wall_attn:
+  - META: {BT: 64, BS: 32}
+    num_warps: 8
+    num_stages: 3
+  - META: {BT: 64, BS: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BT: 64, BS: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BT: 64, BS: 32}
+    num_warps: 8
+    num_stages: 2
