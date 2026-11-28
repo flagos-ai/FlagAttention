@@ -9,7 +9,13 @@ from dataclasses import dataclass
 
 import torch
 
-from .forward import compress_k, pool_scores, select_blocks, sparse_attention, stage1
+from flag_attn.runtime.backend import resolve_operator
+
+from .forward import compress_k, pool_scores
+
+
+def _implementation(name):
+    return resolve_operator(f"infllmv2_{name}", "flag_attn.infllmv2.forward", name)
 
 
 @dataclass(frozen=True)
@@ -74,19 +80,19 @@ def _dense_packed(
     cu_seqlens_k: torch.Tensor,
     softmax_scale: float | None,
 ) -> torch.Tensor:
-    """Reuse FlagAttention FlashAttention for each continuous sequence."""
-    from flag_attn.flash import attention as flash_attention
+    """Dense causal attention through the portable all-block Triton kernel."""
+    from .forward import sparse_attention
 
-    chunks: list[torch.Tensor] = []
-    q_cu = cu_seqlens_q.detach().cpu().tolist()
-    k_cu = cu_seqlens_k.detach().cpu().tolist()
-    for qs, qe, ks, ke in zip(q_cu[:-1], q_cu[1:], k_cu[:-1], k_cu[1:]):
-        q_seq = q[qs:qe].transpose(0, 1).unsqueeze(0)
-        k_seq = k[ks:ke].transpose(0, 1).unsqueeze(0)
-        v_seq = v[ks:ke].transpose(0, 1).unsqueeze(0)
-        out = flash_attention(q_seq, k_seq, v_seq, causal=True, sm_scale=softmax_scale)
-        chunks.append(out.squeeze(0).transpose(0, 1))
-    return torch.cat(chunks, dim=0)
+    max_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+    max_k = int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+    block_size = 64
+    blocks = (max_k + block_size - 1) // block_size
+    selected = torch.arange(blocks, device=q.device, dtype=torch.int32)
+    selected = selected.view(1, 1, blocks).expand(k.shape[1], q.shape[0], blocks).contiguous()
+    return sparse_attention(
+        q, k, v, selected, cu_seqlens_q, cu_seqlens_k, max_q,
+        block_size, softmax_scale, True,
+    )
 
 
 def _run_sparse_pipeline(
@@ -104,7 +110,7 @@ def _run_sparse_pipeline(
     with torch.no_grad():
         k1, cu_k1 = compress_k(k, cu_seqlens_k, config.k1_kernel_size, config.k1_stride)
         k2, cu_k2 = compress_k(k, cu_seqlens_k, config.k2_kernel_size, config.k2_stride)
-        token_score = stage1(
+        token_score = _implementation("stage1")(
             q, k1, k2, cu_seqlens_q, cu_k1, cu_k2, max_seqlen_q,
             config.k1_stride, config.k2_stride, softmax_scale, config.causal, cu_seqlens_k,
         )
@@ -114,10 +120,10 @@ def _run_sparse_pipeline(
             config.init_blocks, config.local_blocks, cu_seqlens_k, max_seqlen_k,
             _valid_only=True,
         )
-        selected = select_blocks(
+        selected = _implementation("select_blocks")(
             block_score, cu_seqlens_q, config.topk, config.block_size, cu_seqlens_k
         )
-    return sparse_attention(
+    return _implementation("sparse_attention")(
         q, k, v, selected, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
         config.block_size, softmax_scale, config.causal,
     )
@@ -137,7 +143,9 @@ def _dispatch(
     # Batch-wide decision from the LONGEST per-sequence KV, never sum(KV).
     # Match the model's strict boundary: KV < dense_len is dense; equality sparse.
     if max_seqlen_k < config.dense_len:
-        return _dense_packed(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale)
+        return resolve_operator(
+            "infllmv2_dense_packed", "flag_attn.infllmv2.operator", "_dense_packed"
+        )(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale)
     return _run_sparse_pipeline(
         q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         config, softmax_scale,
