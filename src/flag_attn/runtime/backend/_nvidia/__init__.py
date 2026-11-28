@@ -17,6 +17,9 @@
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "parallel_wall_attn": (".hopper.wall_attn.parallel", "parallel_wall_attn"),
+    "wall_attn_select_route": (".hopper.wall_attn.parallel", "select_route"),
+    "wall_attn_get_last_route": (".hopper.wall_attn.parallel", "get_last_route"),
     "chunk_gdn2": (".gdn2.chunk", "chunk_gdn2"),
     "minimax_m3_index_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_score"),
     "minimax_m3_index_decode_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode_score"),

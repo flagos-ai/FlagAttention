@@ -25,11 +25,22 @@
 # Imported official implementation; only local dependency paths are adapted.
 """Eager PyTorch reference for Wall attention (correctness oracle)."""
 
+from itertools import pairwise
+
 import torch
 
-from flag_attn.FLA.cumsum import chunk_global_cumsum
-
 from .parallel import RCP_LN2
+
+
+def _prefix(x, cu_seqlens):
+    # Keep the oracle independent of the Triton scan and differentiable.
+    if cu_seqlens is None:
+        return x.float().cumsum(1) * RCP_LN2
+    boundaries = cu_seqlens.tolist()
+    return torch.cat([
+        x[:, start:end].float().cumsum(1)
+        for start, end in pairwise(boundaries)
+    ], dim=1) * RCP_LN2
 
 
 def naive_wall_attn(
@@ -53,7 +64,7 @@ def naive_wall_attn(
     if q.shape[2] % k.shape[2] != 0:
         raise ValueError("HQ must be divisible by H (GQA)")
 
-    P = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, scale=RCP_LN2)
+    P = _prefix(g, cu_seqlens)
     k_exp = k.repeat_interleave(G, dim=2)
     B, T, HQ, _K = q.shape
     diff = P.unsqueeze(2).float() - P.unsqueeze(1).float()
@@ -85,7 +96,7 @@ def naive_wall_attn(
     scores = scores.masked_fill(~valid_hq, float("-inf")) * (scale * RCP_LN2)
 
     if g_scalar is not None:
-        c = chunk_global_cumsum(g_scalar, cu_seqlens=cu_seqlens, scale=RCP_LN2)
+        c = _prefix(g_scalar, cu_seqlens)
         c_hq = c.permute(0, 2, 1).float()
         scores = scores + c_hq.unsqueeze(-1) - c_hq.unsqueeze(-2)
 

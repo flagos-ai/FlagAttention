@@ -25,27 +25,24 @@
 # Wall attention was contributed upstream by Tilde Research (Timor Averbuch, Dhruv Pai).
 """Wall-Attention prefill/training API, general kernels, and autograd support.
 
-SM90 inference uses the lazily imported Hopper implementation when both tensor
-metadata and cached operand checks pass. Training and other workloads use the
-general implementation below.
+All kernels use standard Triton primitives. Vendor-specific inference is
+selected by the runtime registry, outside this module.
 """
 
 # This module has no runtime dependency on the source FLA repository.
 
 import os
 from contextvars import ContextVar
-from functools import lru_cache
-from importlib import import_module
-from numbers import Real
 
 import torch
 import triton
 import triton.language as tl
 
+from flag_attn import runtime
 from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.index import prepare_chunk_indices
 from flag_attn.nsa.bwd_preprocess import parallel_attn_bwd_preprocess
-from flag_attn.utils import check_shared_mem, has_triton_tle, input_guard
+from flag_attn.utils import input_guard
 
 RCP_LN2 = 1.4426950216
 
@@ -629,15 +626,8 @@ def parallel_wall_attn_fwd(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
     G = HQ // H
-    if check_shared_mem('hopper', q.device.index):
-        BK = min(256, max(16, triton.next_power_of_2(K)))
-        BV = min(256, max(16, triton.next_power_of_2(V)))
-    elif check_shared_mem('ampere', q.device.index):
-        BK = min(256, max(16, triton.next_power_of_2(K)))
-        BV = min(128, max(16, triton.next_power_of_2(V)))
-    else:
-        BK = min(256, max(16, triton.next_power_of_2(K)))
-        BV = min(64, max(16, triton.next_power_of_2(V)))
+    BK = min(256, max(16, triton.next_power_of_2(K)))
+    BV = min(64, max(16, triton.next_power_of_2(V)))
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
     assert NK == 1, "The key dimension can not be larger than 256"
@@ -647,12 +637,7 @@ def parallel_wall_attn_fwd(
         # single BT. Pin BT=128 and bypass the autotuner (calling the heuristics-wrapped
         # jit directly) so the varlen chunk map stays valid.
         BT = 128
-        if check_shared_mem('hopper', q.device.index):
-            BS, num_warps, num_stages = min(64, max(16, triton.next_power_of_2(T))), 8, 2
-        elif check_shared_mem('ampere', q.device.index):
-            BS, num_warps, num_stages = min(32, max(16, triton.next_power_of_2(T))), 4, 2
-        else:
-            BS, num_warps, num_stages = min(32, max(16, triton.next_power_of_2(T))), 2, 2
+        BS, num_warps, num_stages = min(32, max(16, triton.next_power_of_2(T))), 4, 2
         if chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
         NT = len(chunk_indices)
@@ -733,17 +718,12 @@ def parallel_wall_attn_bwd(
     extra = {}
     if is_varlen:
         BT = 128
-        if check_shared_mem('hopper'):
-            BS, num_warps = min(64, max(16, triton.next_power_of_2(T))), 8
-        elif check_shared_mem('ampere'):
-            BS, num_warps = min(32, max(16, triton.next_power_of_2(T))), 4
-        else:
-            BS, num_warps = min(32, max(16, triton.next_power_of_2(T))), 2
+        BS, num_warps = min(32, max(16, triton.next_power_of_2(T))), 4
         if chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
         NT = len(chunk_indices)
         grid = (NV, NT, B * HQ)
-        extra = dict(BT=BT, BS=BS, num_warps=num_warps, num_stages=2)
+        extra = {"BT": BT, "BS": BS, "num_warps": num_warps, "num_stages": 2}
     else:
         def grid(meta):
             return (NV, triton.cdiv(T, meta['BT']), B * HQ)
@@ -819,7 +799,10 @@ def parallel_wall_attn_bwd(
         V=V,
         BK=BK,
         BV=BV,
-        DIAG_BF16=_DKV_DIAG_BF16,
+        # Scalar prefix gradients subtract the query/key score reductions.
+        # Match the query kernel's FP32 diagonal scores so reverse cumsum
+        # does not amplify BF16 rounding differences between the two kernels.
+        DIAG_BF16=_DKV_DIAG_BF16 and g_scalar_cumsum is None,
         **extra,
     )
     dk = dk.view(B, T, H, G, K).sum(3)
@@ -844,7 +827,7 @@ class WallParallelAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     @input_guard
-    @torch.amp.custom_fwd(device_type="cuda")
+    @torch.amp.custom_fwd(device_type=runtime.device.name)
     def forward(ctx, q, k, v, g, sink_bias, scale, window_size, cu_seqlens, g_scalar=None, chunk_indices=None):
         if g.shape[-1] != q.shape[-1] or g.shape[2] != q.shape[2]:
             raise ValueError(
@@ -902,7 +885,7 @@ class WallParallelAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     @input_guard
-    @torch.amp.custom_bwd(device_type="cuda")
+    @torch.amp.custom_bwd(device_type=runtime.device.name)
     def backward(ctx, do):
         q, k, v, o, P, lse, sink_bias_scaled, c_or_empty = ctx.saved_tensors
         c = c_or_empty if ctx.has_scalar_g else None
@@ -1005,33 +988,12 @@ def _parallel_wall_attn_default(
     )
 
 
-_FAST_T = frozenset((512, 1024, 2048, 4096))
-_FAST_H = frozenset((2, 8))
-_FAST_BF16_D = frozenset((64, 128))
 _LAST_ROUTE: ContextVar[str | None] = ContextVar("wall_attn_route", default=None)
 
 
 def get_last_route() -> str | None:
-    """Return the completed call's route in this context, for benchmark reporting."""
+    """Return the completed call's route in this context."""
     return _LAST_ROUTE.get()
-
-
-@lru_cache(maxsize=1)
-def _load_fwd_module():
-    """Load Hopper-only kernels after metadata dispatch accepts an inference call."""
-    module = import_module(f"{__package__}.parallel_fwd")
-    triton.set_allocator(module.allocate_descriptor)
-    return module
-
-
-@lru_cache(maxsize=None)
-def _is_sm90(device_index: int) -> bool:
-    """Return whether ``device_index`` is an NVIDIA Hopper SM90 device."""
-    return torch.cuda.get_device_capability(device_index) == (9, 0)
-
-
-def _requires_backward(*tensors: torch.Tensor | None) -> bool:
-    return torch.is_grad_enabled() and any(tensor is not None and tensor.requires_grad for tensor in tensors)
 
 
 def select_route(
@@ -1046,77 +1008,8 @@ def select_route(
     window_size: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
 ) -> str:
-    """Select a candidate path from metadata; preprocessing checks numerical safety."""
-    if any(value is not None for value in (g_scalar, sink_bias, window_size, cu_seqlens)):
-        return "official_fallback"
-    if scale is not None and not isinstance(scale, Real):
-        return "official_fallback"
-    if any(tensor.layout != torch.strided for tensor in (q, k, v, g)):
-        return "official_fallback"
-    if not all(tensor.is_cuda for tensor in (q, k, v, g)):
-        return "official_fallback"
-    if not (q.device == k.device == v.device == g.device):
-        return "official_fallback"
-    if not all(tensor.is_contiguous() for tensor in (q, k, v, g)):
-        return "official_fallback"
-    if any(tensor.ndim != 4 for tensor in (q, k, v, g)):
-        return "official_fallback"
-
-    device_index = q.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    if not _is_sm90(device_index):
-        return "official_fallback"
-    if not has_triton_tle():
-        return "official_fallback"
-
-    b, t, hq, d = q.shape
-    if b != 1 or t not in _FAST_T or hq != 8:
-        return "official_fallback"
-    h = k.shape[2]
-    if h not in _FAST_H or hq % h != 0:
-        return "official_fallback"
-    if k.shape != (b, t, h, d) or v.shape != (b, t, h, d) or g.shape != q.shape:
-        return "official_fallback"
-    if _requires_backward(q, k, v, g):
-        return "official_fallback"
-    # Numerical validation reads a device flag. Keep graph capture on the
-    # general implementation, which does not require a device-to-host read.
-    with torch.cuda.device(q.device):
-        if torch.cuda.is_current_stream_capturing():
-            return "official_fallback"
-
-    if q.dtype == k.dtype == v.dtype == g.dtype == torch.bfloat16 and d in _FAST_BF16_D:
-        return "hopper_bf16"
-    if q.dtype == k.dtype == v.dtype == g.dtype == torch.float16 and d == 64:
-        return "hopper_fp16"
+    """The portable provider supports the full contract on every backend."""
     return "official_fallback"
-
-
-def _parallel_wall_attn_fast_path(
-    route: str,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    scale: float,
-) -> torch.Tensor | None:
-    fwd = _load_fwd_module()
-    b, t, hq, d = q.shape
-    cache_dtype = q.dtype if route == "hopper_bf16" else torch.bfloat16
-    q_cache = torch.empty((b, hq, t, d), device=q.device, dtype=cache_dtype)
-    k_cache = torch.empty_like(q_cache)
-    anchor = torch.empty((b, hq, d), device=q.device, dtype=torch.float32)
-    output = torch.empty((b, t, hq, d), device=q.device, dtype=v.dtype)
-    lse = torch.empty((b, t, hq), device=q.device, dtype=torch.float32)
-    unsafe = torch.zeros((), device=q.device, dtype=torch.int32)
-
-    fwd.prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe)
-    if unsafe.item() != 0:
-        return None
-
-    fwd.parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, capacity=2, scale=scale)
-    return output
 
 
 def parallel_wall_attn(
@@ -1131,43 +1024,10 @@ def parallel_wall_attn(
     window_size: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
 ) -> torch.Tensor:
-    """Run a numerically checked H100 path or the full official implementation.
-
-    Fast paths require nonpositive gates and finite, non-underflowing BF16 Q/K
-    operands with gauge exponents within +/-125. Other data use the general
-    implementation. Validation synchronizes with the host; graph capture uses
-    the general implementation instead.
-    """
+    """Run portable Wall Attention, including prefill and autograd."""
     _LAST_ROUTE.set(None)
-    route = select_route(
-        q,
-        k,
-        v,
-        g,
-        g_scalar=g_scalar,
-        sink_bias=sink_bias,
-        scale=scale,
-        window_size=window_size,
-        cu_seqlens=cu_seqlens,
-    )
-    if route != "official_fallback":
-        with torch.cuda.device(q.device):
-            output = _parallel_wall_attn_fast_path(
-                route,
-                q,
-                k,
-                v,
-                g,
-                scale=k.shape[-1] ** -0.5 if scale is None else float(scale),
-            )
-        if output is not None:
-            _LAST_ROUTE.set(route)
-            return output
     output = _parallel_wall_attn_default(
-        q,
-        k,
-        v,
-        g,
+        q, k, v, g,
         g_scalar=g_scalar,
         sink_bias=sink_bias,
         scale=scale,
@@ -1178,4 +1038,4 @@ def parallel_wall_attn(
     return output
 
 
-__all__ = ["parallel_wall_attn", "select_route", "get_last_route"]
+__all__ = ["get_last_route", "parallel_wall_attn", "select_route"]

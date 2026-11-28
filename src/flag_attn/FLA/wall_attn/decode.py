@@ -31,7 +31,6 @@ import triton
 import triton.language as tl
 
 from flag_attn import runtime
-from flag_attn.utils import check_shared_mem
 
 from .parallel import exp2, log2
 
@@ -218,15 +217,8 @@ def parallel_wall_attn_decode(
     if g_scalar_cumsum is not None and g_scalar_cumsum.stride(-1) != 1:
         raise ValueError("g_scalar_cumsum must be contiguous in the last dim")
 
-    if check_shared_mem("hopper", q.device.index):
-        BK = min(256, max(16, triton.next_power_of_2(K)))
-        BV = min(256, max(16, triton.next_power_of_2(V)))
-    elif check_shared_mem("ampere", q.device.index):
-        BK = min(256, max(16, triton.next_power_of_2(K)))
-        BV = min(128, max(16, triton.next_power_of_2(V)))
-    else:
-        BK = min(256, max(16, triton.next_power_of_2(K)))
-        BV = min(64, max(16, triton.next_power_of_2(V)))
+    BK = min(256, max(16, triton.next_power_of_2(K)))
+    BV = min(64, max(16, triton.next_power_of_2(V)))
     NV = triton.cdiv(V, BV)
     assert triton.cdiv(K, BK) == 1, "decode kernel requires K <= 256"
 

@@ -1,405 +1,80 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM90 Wall-Attention preprocessing and asynchronous warp-group forward kernels.
-
-BF16 inputs use BF16 QK/PV operands. FP16 inputs use BF16 QK and FP16 PV
-operands. Both paths use FP32 softmax and accumulation, BM=BN=64, and a
-two-slot K/V pipeline. The host API validates cached operands before launching
-attention and includes validation synchronization in its end-to-end latency.
-"""
+"""Portable cache preparation and causal attention on pre-rescaled Q/K."""
 
 from __future__ import annotations
 
 import torch
 import triton
 import triton.language as tl
-import triton.experimental.tle.language as tle
 
+from flag_attn import runtime
 from flag_attn.FLA.cumsum import chunk_global_cumsum
 
-
-BT = 128
-BM = 64
-BN = 64
 RCP_LN2 = 1.4426950216
 
 
 def allocate_descriptor(size: int, alignment: int, stream: int | None):
+    """Compatibility allocator on the active backend; no descriptors are needed."""
     del alignment, stream
-    return torch.empty(size, dtype=torch.uint8, device="cuda")
-
-
-@triton.jit
-def _wall_attn_producer(
-    q_desc,
-    k_desc,
-    v_desc,
-    q0,
-    q1,
-    k_stages,
-    v_stages,
-    q0_full,
-    q1_full,
-    k_full,
-    v_full,
-    empty,
-    query_tile,
-    tile_count,
-    BM_VALUE: tl.constexpr,
-    BN_VALUE: tl.constexpr,
-    D_VALUE: tl.constexpr,
-    CAPACITY_VALUE: tl.constexpr,
-):
-    q_start = query_tile * (2 * BM_VALUE)
-    tle.gpu.copy(
-        q_desc,
-        q0,
-        [BM_VALUE, D_VALUE],
-        [q_start, 0],
-        barrier=q0_full,
-    )
-    tle.gpu.copy(
-        q_desc,
-        q1,
-        [BM_VALUE, D_VALUE],
-        [q_start + BM_VALUE, 0],
-        barrier=q1_full,
-    )
-    for tile in range(0, tile_count):
-        slot = tile % CAPACITY_VALUE
-        generation = tile // CAPACITY_VALUE
-        tle.gpu.barrier_wait(empty[slot], phaseIdx=generation)
-        tle.gpu.copy(
-            k_desc,
-            k_stages.slot(slot),
-            [BN_VALUE, D_VALUE],
-            [tile * BN_VALUE, 0],
-            barrier=k_full[slot],
-        )
-        tle.gpu.copy(
-            v_desc,
-            v_stages.slot(slot),
-            [BN_VALUE, D_VALUE],
-            [tile * BN_VALUE, 0],
-            barrier=v_full[slot],
-        )
-
-
-@triton.jit
-def _wall_attn_consumer(
-    output,
-    lse,
-    q_smem,
-    p_smem,
-    q_full,
-    k_stages,
-    v_stages,
-    k_full,
-    v_full,
-    empty,
-    query_tile,
-    head,
-    row_in_cta: tl.constexpr,
-    scale_log2: tl.constexpr,
-    T_VALUE: tl.constexpr,
-    HQ_VALUE: tl.constexpr,
-    D_VALUE: tl.constexpr,
-    BM_VALUE: tl.constexpr,
-    BN_VALUE: tl.constexpr,
-    CAPACITY_VALUE: tl.constexpr,
-    QK_IS_BF16: tl.constexpr,
-    PV_IS_BF16: tl.constexpr,
-    OUTPUT_IS_BF16: tl.constexpr,
-):
-    rows = tl.arange(0, BM_VALUE)
-    dims = tl.arange(0, D_VALUE)
-    query_start = query_tile * (2 * BM_VALUE) + row_in_cta
-    query_rows = query_start + rows
-    tile_count = (query_tile + 1) * 2
-
-    tle.gpu.barrier_wait(q_full, phaseIdx=0)
-    running_max = tl.full((BM_VALUE,), float("-inf"), tl.float32)
-    running_sum = tl.zeros((BM_VALUE,), tl.float32)
-    output_acc = tl.zeros((BM_VALUE, D_VALUE), tl.float32)
-
-    for tile in range(0, tile_count):
-        slot = tile % CAPACITY_VALUE
-        generation = tile // CAPACITY_VALUE
-        tle.gpu.barrier_wait(k_full[slot], phaseIdx=generation)
-        score = tle.gpu.wgmma(
-            q_smem,
-            k_stages.slot(slot),
-            out_dtype=tl.float32,
-            trans_b=True,
-        )
-        score = tle.gpu.wgmma_wait(0, score) * scale_log2
-        key_rows = tile * BN_VALUE + tl.arange(0, BN_VALUE)
-        score = tl.where(
-            query_rows[:, None] >= key_rows[None, :],
-            score,
-            float("-inf"),
-        )
-        tile_max = tl.max(score, axis=1)
-        next_max = tl.maximum(running_max, tile_max)
-        alpha = tl.exp2(running_max - next_max)
-        probability = tl.exp2(score - next_max[:, None])
-        running_sum = running_sum * alpha + tl.sum(probability, axis=1)
-        output_acc *= alpha[:, None]
-        if PV_IS_BF16:
-            tl.store(tle.gpu.local_ptr(p_smem), probability.to(tl.bfloat16))
-        else:
-            tl.store(tle.gpu.local_ptr(p_smem), probability.to(tl.float16))
-
-        tle.gpu.barrier_wait(v_full[slot], phaseIdx=generation)
-        tile_output = tle.gpu.wgmma(
-            p_smem,
-            v_stages.slot(slot),
-            out_dtype=tl.float32,
-        )
-        output_acc += tle.gpu.wgmma_wait(0, tile_output)
-        running_max = next_max
-        tle.gpu.barrier_arrive(empty[slot], phaseIdx=generation)
-
-    output_acc /= running_sum[:, None]
-    output_ptrs = output + query_rows[:, None] * (HQ_VALUE * D_VALUE) + head * D_VALUE + dims[None, :]
-    lse_ptrs = lse + query_rows * HQ_VALUE + head
-    if OUTPUT_IS_BF16:
-        tl.store(output_ptrs, output_acc.to(tl.bfloat16))
-    else:
-        tl.store(output_ptrs, output_acc.to(tl.float16))
-    tl.store(lse_ptrs, running_max + tl.log2(running_sum))
+    return torch.empty(size, dtype=torch.uint8, device=runtime.device.name)
 
 
 @triton.jit
 def parallel_wall_attn_fwd_kernel(
-    q_cache,
-    k_cache,
-    v,
-    output,
-    lse,
-    scale_log2: tl.constexpr,
-    T_VALUE: tl.constexpr,
-    HQ_VALUE: tl.constexpr,
-    H_VALUE: tl.constexpr,
-    G_VALUE: tl.constexpr,
-    D_VALUE: tl.constexpr,
-    BM_VALUE: tl.constexpr,
-    BN_VALUE: tl.constexpr,
-    CAPACITY_VALUE: tl.constexpr,
-    QK_IS_BF16: tl.constexpr,
-    PV_IS_BF16: tl.constexpr,
-    OUTPUT_IS_BF16: tl.constexpr,
+    q_cache, k_cache, v, output, lse, scale,
+    T: tl.constexpr, HQ: tl.constexpr, H: tl.constexpr,
+    D: tl.constexpr, V: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
 ):
-    query_tile = tl.program_id(0)
-    head = tl.program_id(1)
-    tile_count = (query_tile + 1) * 2
-    q_desc = tl.make_tensor_descriptor(
-        q_cache + head * T_VALUE * D_VALUE,
-        shape=[T_VALUE, D_VALUE],
-        strides=[D_VALUE, 1],
-        block_shape=[BM_VALUE, D_VALUE],
-    )
-    k_desc = tl.make_tensor_descriptor(
-        k_cache + head * T_VALUE * D_VALUE,
-        shape=[T_VALUE, D_VALUE],
-        strides=[D_VALUE, 1],
-        block_shape=[BN_VALUE, D_VALUE],
-    )
-    kv_head = head // G_VALUE
-    v_desc = tl.make_tensor_descriptor(
-        v + kv_head * D_VALUE,
-        shape=[T_VALUE, D_VALUE],
-        strides=[H_VALUE * D_VALUE, 1],
-        block_shape=[BN_VALUE, D_VALUE],
-    )
-
-    if QK_IS_BF16:
-        k_stages = tle.gpu.alloc(
-            (CAPACITY_VALUE, BN_VALUE, D_VALUE),
-            dtype=tl.bfloat16,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=True,
-        )
-        q0 = tle.gpu.alloc(
-            (BM_VALUE, D_VALUE), dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=True
-        )
-        q1 = tle.gpu.alloc(
-            (BM_VALUE, D_VALUE), dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=True
-        )
-    else:
-        k_stages = tle.gpu.alloc(
-            (CAPACITY_VALUE, BN_VALUE, D_VALUE),
-            dtype=tl.float16,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=True,
-        )
-        q0 = tle.gpu.alloc(
-            (BM_VALUE, D_VALUE), dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=True
-        )
-        q1 = tle.gpu.alloc(
-            (BM_VALUE, D_VALUE), dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=True
-        )
-
-    if PV_IS_BF16:
-        v_stages = tle.gpu.alloc(
-            (CAPACITY_VALUE, BN_VALUE, D_VALUE),
-            dtype=tl.bfloat16,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=True,
-        )
-        p0 = tle.gpu.alloc(
-            (BM_VALUE, BN_VALUE), dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=True
-        )
-        p1 = tle.gpu.alloc(
-            (BM_VALUE, BN_VALUE), dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=True
-        )
-    else:
-        v_stages = tle.gpu.alloc(
-            (CAPACITY_VALUE, BN_VALUE, D_VALUE),
-            dtype=tl.float16,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=True,
-        )
-        p0 = tle.gpu.alloc(
-            (BM_VALUE, BN_VALUE), dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=True
-        )
-        p1 = tle.gpu.alloc(
-            (BM_VALUE, BN_VALUE), dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=True
-        )
-    q0_full = tle.gpu.alloc_barrier(expect_bytes=BM_VALUE * D_VALUE * 2)
-    q1_full = tle.gpu.alloc_barrier(expect_bytes=BM_VALUE * D_VALUE * 2)
-    k_full = tle.gpu.alloc_barriers(
-        num_barriers=CAPACITY_VALUE,
-        expect_bytes=BN_VALUE * D_VALUE * 2,
-    )
-    v_full = tle.gpu.alloc_barriers(
-        num_barriers=CAPACITY_VALUE,
-        expect_bytes=BN_VALUE * D_VALUE * 2,
-    )
-    empty = tle.gpu.alloc_barriers(
-        num_barriers=CAPACITY_VALUE,
-        arrive_count=2,
-        init=tle.gpu.READY,
-    )
-    # Keep consumers as direct partition entries so TLE lowers their shared-memory
-    # synchronization to partition-local barriers rather than CTA-wide barriers.
-    tle.gpu.warp_specialize(
-        [
-            (
-                _wall_attn_producer,
-                (
-                    q_desc,
-                    k_desc,
-                    v_desc,
-                    q0,
-                    q1,
-                    k_stages,
-                    v_stages,
-                    q0_full,
-                    q1_full,
-                    k_full,
-                    v_full,
-                    empty,
-                    query_tile,
-                    tile_count,
-                    BM_VALUE,
-                    BN_VALUE,
-                    D_VALUE,
-                    CAPACITY_VALUE,
-                ),
-            ),
-            (
-                _wall_attn_consumer,
-                (
-                    output,
-                    lse,
-                    q0,
-                    p0,
-                    q0_full,
-                    k_stages,
-                    v_stages,
-                    k_full,
-                    v_full,
-                    empty,
-                    query_tile,
-                    head,
-                    0,
-                    scale_log2,
-                    T_VALUE,
-                    HQ_VALUE,
-                    D_VALUE,
-                    BM_VALUE,
-                    BN_VALUE,
-                    CAPACITY_VALUE,
-                    QK_IS_BF16,
-                    PV_IS_BF16,
-                    OUTPUT_IS_BF16,
-                ),
-            ),
-            (
-                _wall_attn_consumer,
-                (
-                    output,
-                    lse,
-                    q1,
-                    p1,
-                    q1_full,
-                    k_stages,
-                    v_stages,
-                    k_full,
-                    v_full,
-                    empty,
-                    query_tile,
-                    head,
-                    BM_VALUE,
-                    scale_log2,
-                    T_VALUE,
-                    HQ_VALUE,
-                    D_VALUE,
-                    BM_VALUE,
-                    BN_VALUE,
-                    CAPACITY_VALUE,
-                    QK_IS_BF16,
-                    PV_IS_BF16,
-                    OUTPUT_IS_BF16,
-                ),
-            ),
-        ],
-        [4, 4],
-        [224, 224],
-    )
+    RCP_LN2: tl.constexpr = 1.4426950216
+    tile, bh, value_tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    batch, head = bh // HQ, bh % HQ
+    kv_head = head // (HQ // H)
+    rows = tile * BM + tl.arange(0, BM)
+    dims = tl.arange(0, BK)
+    values = value_tile * BV + tl.arange(0, BV)
+    query = tl.load(q_cache + (bh * T + rows[:, None]) * D + dims[None, :],
+                    (rows[:, None] < T) & (dims[None, :] < D), other=0)
+    maximum = tl.full((BM,), -float("inf"), tl.float32)
+    denominator = tl.zeros((BM,), tl.float32)
+    accumulator = tl.zeros((BM, BV), tl.float32)
+    for start in range(0, tl.minimum((tile + 1) * BM, T), BN):
+        cols = start + tl.arange(0, BN)
+        key = tl.load(k_cache + (bh * T + cols[None, :]) * D + dims[:, None],
+                      (cols[None, :] < T) & (dims[:, None] < D), other=0)
+        value = tl.load(v + ((batch * T + cols[:, None]) * H + kv_head) * V + values[None, :],
+                        (cols[:, None] < T) & (values[None, :] < V), other=0)
+        score = tl.dot(query, key, input_precision="ieee") * scale * RCP_LN2
+        score = tl.where((rows[:, None] >= cols[None, :]) & (cols[None, :] < T), score, -float("inf"))
+        next_maximum = tl.maximum(maximum, tl.max(score, 1))
+        correction = tl.exp2(maximum - next_maximum)
+        probability = tl.exp2(score - next_maximum[:, None])
+        denominator = denominator * correction + tl.sum(probability, 1)
+        accumulator = accumulator * correction[:, None] + tl.dot(probability.to(value.dtype), value, input_precision="ieee")
+        maximum = next_maximum
+    tl.store(output + ((batch * T + rows[:, None]) * HQ + head) * V + values[None, :],
+             accumulator / denominator[:, None], (rows[:, None] < T) & (values[None, :] < V))
+    if value_tile == 0:
+        tl.store(lse + (batch * T + rows) * HQ + head,
+                 maximum + tl.log2(denominator), rows < T)
 
 
 def parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, capacity: int, scale=None):
-    _, hq, t, d = q_cache.shape
-    h = v.shape[2]
-    if scale is None:
-        scale = d**-0.5
-    return parallel_wall_attn_fwd_kernel[(t // BT, hq)](
-        q_cache,
-        k_cache,
-        v,
-        output,
-        lse,
-        scale_log2=scale * RCP_LN2,
-        T_VALUE=t,
-        HQ_VALUE=hq,
-        H_VALUE=h,
-        G_VALUE=hq // h,
-        D_VALUE=d,
-        BM_VALUE=BM,
-        BN_VALUE=BN,
-        CAPACITY_VALUE=capacity,
-        QK_IS_BF16=q_cache.dtype == torch.bfloat16,
-        PV_IS_BF16=v.dtype == torch.bfloat16,
-        OUTPUT_IS_BF16=output.dtype == torch.bfloat16,
-        num_warps=4,
-        num_stages=1,
+    """Fill output/LSE from [B, HQ, T, D] caches using standard Triton.
+
+    ``capacity`` is retained for compatibility with pipelined implementations.
+    Callers must check the unsafe flag from ``prepare_qk_cache`` first.
+    """
+    del capacity
+    b, hq, t, d = q_cache.shape
+    value_dim = v.shape[-1]
+    return parallel_wall_attn_fwd_kernel[(triton.cdiv(t, 32), b * hq, triton.cdiv(value_dim, 64))](
+        q_cache, k_cache, v, output, lse, d**-0.5 if scale is None else scale,
+        T=t, HQ=hq, H=v.shape[2], D=d, V=value_dim,
+        BM=32, BN=32, BK=max(16, triton.next_power_of_2(d)), BV=64,
+        num_warps=4, num_stages=1,
     )
 
 
@@ -428,7 +103,7 @@ def parallel_wall_attn_fwd_kernel_preprocess(
 
     total = tl.zeros((1, BLOCK_C), tl.float32)
     first = tl.zeros((1, BLOCK_C), tl.float32)
-    for tile in range(0, tl.cdiv(T_VALUE, BLOCK_T)):
+    for tile in range(tl.cdiv(T_VALUE, BLOCK_T)):
         tokens = tile * BLOCK_T + tl.arange(0, BLOCK_T)
         qg_offsets = batch * T_VALUE * HQ_VALUE * D_VALUE + tokens[:, None] * HQ_VALUE * D_VALUE + channels[None, :]
         mask = (tokens[:, None] < T_VALUE) & channel_mask[None, :]
@@ -448,7 +123,7 @@ def parallel_wall_attn_fwd_kernel_preprocess(
     query_heads = channels // D_VALUE
     dims = channels - query_heads * D_VALUE
     kv_heads = query_heads // G_VALUE
-    for tile in range(0, tl.cdiv(T_VALUE, BLOCK_T)):
+    for tile in range(tl.cdiv(T_VALUE, BLOCK_T)):
         tokens = tile * BLOCK_T + tl.arange(0, BLOCK_T)
         qg_offsets = batch * T_VALUE * HQ_VALUE * D_VALUE + tokens[:, None] * HQ_VALUE * D_VALUE + channels[None, :]
         k_offsets = (

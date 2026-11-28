@@ -5,14 +5,12 @@
 
 from __future__ import annotations
 
-
 import math
 import statistics
 import subprocess
 from collections.abc import Callable
-from functools import lru_cache
+from functools import lru_cache, partial
 from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
 
 import pytest
 import torch
@@ -23,10 +21,8 @@ try:
 except ModuleNotFoundError:
     from recording import benchmark_metric, record_benchmark_result
 
+import flag_attn
 from flag_attn.testing import backend as test_backend
-from flag_attn import parallel_wall_attn
-from flag_attn.FLA.wall_attn import get_last_route, select_route
-from flag_attn.utils import has_triton_tle
 
 SEQUENCE_LENGTHS = (512, 1024, 2048, 4096)
 SHAPE_FAMILIES = (("mha", 8), ("gqa", 2))
@@ -35,34 +31,11 @@ MEASUREMENT_MS = 200
 REPEATS = 7
 
 
-def _source_revision(directory: Path) -> str | None:
-    """Record a Git revision when running from a checkout, without requiring Git."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(directory), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return result.stdout.strip() if result.returncode == 0 else None
-
-
 def _environment():
     try:
         fla_version = version("flash-linear-attention")
     except PackageNotFoundError:
         fla_version = None
-    try:
-        import fla
-        fla_directory = Path(fla.__file__).resolve().parent.parent
-    except ImportError:
-        fla_directory = None
-
-    # Installed wheels may have no Git metadata. Keep the package version and
-    # report an absent revision explicitly rather than guessing a source SHA.
     device = test_backend.device_fn.current_device()
     try:
         driver = subprocess.run(
@@ -83,8 +56,6 @@ def _environment():
         "triton_version": str(triton.__version__),
         "driver_version": driver_version,
         "fla_version": fla_version,
-        "fla_revision": _source_revision(fla_directory) if fla_directory is not None else None,
-        "candidate_revision": _source_revision(Path(__file__).resolve().parent.parent),
     }
 
 
@@ -142,17 +113,15 @@ def _run_benchmark(dtype_name, dtype, record_property=None):
         for t in SEQUENCE_LENGTHS:
             inputs = _make_inputs(t, h, dtype)
             scale = 64**-0.5
-            providers = {"optimized": lambda: parallel_wall_attn(*inputs, scale=scale)}
+            providers = {"optimized": partial(flag_attn.parallel_wall_attn, *inputs, scale=scale)}
             if fla_wall_attn is not None:
-                providers["fla"] = lambda: fla_wall_attn(*inputs, scale=scale)
-            generic_hopper = (test_backend.is_nvidia() and test_backend.cuda_capability() == (9, 0)
-                              and has_triton_tle() and not test_backend.has_specialization("parallel_wall_attn"))
-            if generic_hopper:
-                expected_route = "hopper_bf16" if dtype is torch.bfloat16 else "hopper_fp16"
-                assert select_route(*inputs, scale=scale) == expected_route
+                providers["fla"] = partial(fla_wall_attn, *inputs, scale=scale)
+            candidate_route = flag_attn.wall_attn_select_route(*inputs, scale=scale)
 
             outputs = {name: fn() for name, fn in providers.items()}
-            actual_route = get_last_route() if not test_backend.has_specialization("parallel_wall_attn") else test_backend.runtime.device.vendor_name
+            actual_route = flag_attn.wall_attn_get_last_route() or test_backend.runtime.device.vendor_name
+            if candidate_route.startswith("hopper"):
+                assert actual_route == candidate_route
             test_backend.device_fn.synchronize()
             for name, output in outputs.items():
                 assert torch.isfinite(output).all(), f"{name} produced NaN/Inf"
@@ -200,7 +169,7 @@ def _run_benchmark(dtype_name, dtype, record_property=None):
                     latency_base=fla_ms,
                     latency=optimized_ms,
                     speedup=speedup,
-                    provider_route=actual_route,
+                    candidate_source=actual_route,
                     samples=latency,
                 )
             )
