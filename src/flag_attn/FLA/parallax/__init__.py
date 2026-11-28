@@ -16,14 +16,58 @@
 
 from typing import Literal
 
+import torch
+
 from flag_attn.runtime.backend import resolve_operator
 
-from .decode import HAS_TLE, parallax_attn_with_kvcache, parallax_decode
 from .parallel import (
     ParallaxFunction,
     parallel_parallax_bwd,
     parallel_parallax_fwd,
 )
+
+
+def __getattr__(name):
+    if name == "HAS_TLE":
+        from . import decode
+
+        return decode.HAS_TLE
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def parallax_decode(
+    q: torch.Tensor,
+    r: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qk_scale: float | None = None,
+    *,
+    window_size_left: int = -1,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode through runtime dispatch, preserving the original decode interface."""
+    return resolve_operator("parallax_decode", "flag_attn.FLA.parallax.decode")(
+        q, r, k, v, qk_scale, window_size_left=window_size_left, out=out
+    )
+
+
+def parallax_attn_with_kvcache(
+    q: torch.Tensor,
+    r: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    page_table: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    window_size=None,
+    scale: float | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode a KV cache through runtime dispatch, including caller-owned output."""
+    return resolve_operator("parallax_attn_with_kvcache", "flag_attn.FLA.parallax.decode")(
+        q, r, k_cache, v_cache, page_table=page_table, seqused_k=seqused_k,
+        window_size=window_size, scale=scale, out=out,
+    )
 
 
 def parallel_parallax(*args, stage: Literal["prefill", "decode", "kvcache"] = "prefill", **kwargs):
@@ -37,9 +81,9 @@ def parallel_parallax(*args, stage: Literal["prefill", "decode", "kvcache"] = "p
     if stage == "prefill":
         return resolve_operator("parallel_parallax", "flag_attn.FLA.parallax.parallel")(*args, **kwargs)
     if stage == "decode":
-        return resolve_operator("parallax_decode", "flag_attn.FLA.parallax.decode")(*args, **kwargs)
+        return parallax_decode(*args, **kwargs)
     if stage == "kvcache":
-        return resolve_operator("parallax_attn_with_kvcache", "flag_attn.FLA.parallax.decode")(*args, **kwargs)
+        return parallax_attn_with_kvcache(*args, **kwargs)
     raise ValueError(f"Unsupported Parallax stage: {stage!r}; expected 'prefill', 'decode' or 'kvcache'")
 
 

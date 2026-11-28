@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark the FlagAttention Parallax TLE decode kernel with pytest.
+"""Benchmark the FlagAttention Parallax decode API with pytest.
 
 Each case is checked against the fp32 reference before it is timed. On NVIDIA
 SM90, the upstream Parallax CuTe decode kernel is timed with the same inputs
@@ -31,7 +31,6 @@ import torch
 import pytest
 from flag_attn.testing import backend as test_backend
 from flag_attn import parallel_parallax
-from flag_attn.FLA.parallax import HAS_TLE
 
 try:
     from benchmark.recording import BenchmarkRecorder
@@ -97,7 +96,7 @@ def _sample_median_and_mad(
     calls_per_graph: int,
     samples: int,
 ) -> tuple[float, float]:
-    """Replay the local TLE graph and report median latency and MAD%."""
+    """Replay the selected implementation graph and report median latency and MAD%."""
     values = [_graph_sample_ms(graph, calls_per_graph) for _ in range(samples)]
     return _median_and_mad_percent(values)
 
@@ -177,7 +176,7 @@ def test_perf_parallax_decode(
     dtype: torch.dtype,
     record_property,
 ) -> None:
-    if not test_backend.supports_operator("parallax_decode", tle=True):
+    if not test_backend.supports_operator("parallax_decode"):
         pytest.skip("selected Parallax decode implementation is unavailable")
 
     assert WARMUP > 0
@@ -212,10 +211,10 @@ def test_perf_parallax_decode(
         seed=seed,
     )
     scale = 1.0 / math.sqrt(head_dim)
-    out_tle = torch.empty_like(q)
+    out_actual = torch.empty_like(q)
     out_baseline = torch.empty_like(q) if baseline_op is not None else None
 
-    def tle_fn():
+    def flag_attn_fn():
         return parallel_parallax(
             q,
             r,
@@ -224,7 +223,7 @@ def test_perf_parallax_decode(
             scale,
             stage="decode",
             window_size_left=WINDOW_SIZE_LEFT,
-            out=out_tle,
+            out=out_actual,
         )
 
     def baseline_fn():
@@ -235,11 +234,11 @@ def test_perf_parallax_decode(
         )
 
     # Compile outside the timed region and reject numerically invalid rows.
-    tle_fn()
+    flag_attn_fn()
     test_backend.device_fn.synchronize()
     reference = _decode_reference(q, r, k, v, scale, WINDOW_SIZE_LEFT)
-    tle_ref_error = _rel_err(out_tle, reference)
-    assert tle_ref_error < 1e-2
+    flag_attn_ref_error = _rel_err(out_actual, reference)
+    assert flag_attn_ref_error < 1e-2
     baseline_ref_error = None
     if baseline_op is not None:
         baseline_fn()
@@ -252,11 +251,11 @@ def test_perf_parallax_decode(
         print(f"[baseline] {baseline_reason}", flush=True)
 
     if not test_backend.graph_available():
-        tle_samples = [
-            test_backend.do_bench(tle_fn, warmup=WARMUP, rep=100, return_mode="median")
+        flag_attn_samples = [
+            test_backend.do_bench(flag_attn_fn, warmup=WARMUP, rep=100, return_mode="median")
             for _ in range(SAMPLES)
         ]
-        tle_ms = statistics.median(tle_samples)
+        flag_attn_ms = statistics.median(flag_attn_samples)
         baseline_ms = None
         if baseline_op is not None:
             baseline_samples = [
@@ -264,27 +263,27 @@ def test_perf_parallax_decode(
                 for _ in range(SAMPLES)
             ]
             baseline_ms = statistics.median(baseline_samples)
-        speedup = baseline_ms / tle_ms if baseline_ms is not None else None
+        speedup = baseline_ms / flag_attn_ms if baseline_ms is not None else None
         baseline_text = f"{baseline_ms:.6f} ms" if baseline_ms is not None else "N/A"
         speedup_text = f"{speedup:.3f}x" if speedup is not None else "N/A"
         print(
             f"B={batch_size} L={sequence_length} dtype={dtype} "
-            f"TLE={tle_ms:.6f} ms CuTe={baseline_text} "
+            f"FlagAttention={flag_attn_ms:.6f} ms CuTe={baseline_text} "
             f"speedup={speedup_text} (without graph capture)",
             flush=True,
         )
-        recorder.add(shape_detail=shape_detail, latency=tle_ms, latency_base=baseline_ms)
+        recorder.add(shape_detail=shape_detail, latency=flag_attn_ms, latency_base=baseline_ms)
         recorder.record()
         return
 
     # Warm every lazy path before capture. Stable out/workspace tensors are
     # supplied by the closure, so replay performs no allocator work.
     for _ in range(WARMUP):
-        tle_fn()
+        flag_attn_fn()
         if baseline_op is not None:
             baseline_fn()
     test_backend.device_fn.synchronize()
-    graph = _capture_graph(tle_fn, CALLS_PER_GRAPH)
+    graph = _capture_graph(flag_attn_fn, CALLS_PER_GRAPH)
     baseline_graph = (
         _capture_graph(baseline_fn, CALLS_PER_GRAPH)
         if baseline_op is not None else None
@@ -295,21 +294,21 @@ def test_perf_parallax_decode(
             baseline_graph.replay()
     test_backend.device_fn.synchronize()
 
-    tle_ms, tle_mad = _sample_median_and_mad(graph, CALLS_PER_GRAPH, SAMPLES)
+    flag_attn_ms, flag_attn_mad = _sample_median_and_mad(graph, CALLS_PER_GRAPH, SAMPLES)
     baseline_ms = None
     if baseline_graph is not None:
         baseline_ms, _ = _sample_median_and_mad(
             baseline_graph, CALLS_PER_GRAPH, SAMPLES
         )
-    speedup = baseline_ms / tle_ms if baseline_ms is not None else None
+    speedup = baseline_ms / flag_attn_ms if baseline_ms is not None else None
     baseline_text = f"{baseline_ms:.6f} ms" if baseline_ms is not None else "N/A"
     speedup_text = f"{speedup:.3f}x" if speedup is not None else "N/A"
     print(
         f"B={batch_size} L={sequence_length} HQ={num_query_heads} "
         f"HKV={num_kv_heads} D={head_dim} dtype={dtype} "
-        f"TLE={tle_ms:.6f} ms CuTe={baseline_text} speedup={speedup_text} "
-        f"MAD={tle_mad:.3f}% ref={tle_ref_error:.3e} "
+        f"FlagAttention={flag_attn_ms:.6f} ms CuTe={baseline_text} speedup={speedup_text} "
+        f"MAD={flag_attn_mad:.3f}% ref={flag_attn_ref_error:.3e} "
         f"cute_ref={baseline_ref_error if baseline_ref_error is not None else 'N/A'}"
     )
-    recorder.add(shape_detail=shape_detail, latency=tle_ms, latency_base=baseline_ms)
+    recorder.add(shape_detail=shape_detail, latency=flag_attn_ms, latency_base=baseline_ms)
     recorder.record()

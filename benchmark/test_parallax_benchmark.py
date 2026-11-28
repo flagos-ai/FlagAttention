@@ -38,25 +38,13 @@ except ModuleNotFoundError:
 try:
     if not test_backend.is_nvidia():
         raise ImportError("external FLA CUDA comparison unavailable")
-    from fla.ops.parallax.parallel import (
-        _block_size as fla_block_size,
-        parallel_parallax_bwd as fla_parallel_parallax_bwd,
-        parallel_parallax_fwd as fla_parallel_parallax_fwd,
-    )
-    from fla.ops.utils import prepare_chunk_indices as fla_prepare_chunk_indices
+    from fla.ops.parallax import parallel_parallax as fla_parallel_parallax
 except ImportError as exc:
     FLA_IMPORT_ERROR = exc
 else:
     FLA_IMPORT_ERROR = None
 
-from flag_attn.FLA.index import (
-    prepare_chunk_indices as flag_attn_prepare_chunk_indices,
-)
-from flag_attn.FLA.parallax.parallel import (
-    _block_size as flag_attn_block_size,
-    parallel_parallax_bwd as flag_attn_parallel_parallax_bwd,
-    parallel_parallax_fwd as flag_attn_parallel_parallax_fwd,
-)
+from flag_attn import parallel_parallax
 
 
 pytestmark = pytest.mark.parallel_parallax
@@ -273,44 +261,6 @@ def _case_seed(case: ParallaxCase, dtype: torch.dtype) -> int:
     return seed
 
 
-def _build_chunk_indices(
-    case: ParallaxCase,
-    q: torch.Tensor,
-    cu_seqlens: torch.Tensor | None,
-) -> tuple[
-    torch.Tensor | None,
-    torch.Tensor | None,
-]:
-    if cu_seqlens is None:
-        return None, None
-
-    device_index = q.device.index
-
-    flag_attn_bt = flag_attn_block_size(
-        case.D,
-        device_index,
-    )
-
-    fla_chunk_indices = None
-    if FLA_IMPORT_ERROR is None:
-        fla_bt = fla_block_size(
-            case.D,
-            device_index,
-        )
-        fla_chunk_indices = fla_prepare_chunk_indices(
-            cu_seqlens,
-            fla_bt,
-        )
-
-    flag_attn_chunk_indices = flag_attn_prepare_chunk_indices(
-        cu_seqlens,
-        flag_attn_bt,
-    )
-
-    return (
-        fla_chunk_indices,
-        flag_attn_chunk_indices,
-    )
 
 
 def _bench_ms(fn: Callable[[], object]) -> float:
@@ -579,99 +529,30 @@ def _benchmark_case(
         dtype,
     )
 
-    if test_backend.has_specialization("parallel_parallax"):
-        from flag_attn import parallel_parallax
-
-        if phase == "fwd":
-            def run_public():
-                with torch.no_grad():
-                    return parallel_parallax(q, r, k, v, scale=scale, cu_seqlens=cu_seqlens, window_size=window_size_left)
-        elif phase == "fwd_bwd":
-            tensors = tuple(t.detach().requires_grad_(True) for t in (q, r, k, v))
-            grad_output = torch.randn_like(q)
-
-            def run_public():
-                output = parallel_parallax(*tensors, scale=scale, cu_seqlens=cu_seqlens, window_size=window_size_left)
-                return torch.autograd.grad(output, tensors, grad_output)
-        else:
-            raise ValueError(f"Unsupported benchmark phase: {phase}")
-        print(f"{case}: selected public API, {phase}, full-call timing")
-        return _bench_single(run_public)
-
-    (
-        fla_chunk_indices,
-        flag_attn_chunk_indices,
-    ) = _build_chunk_indices(
-        case,
-        q,
-        cu_seqlens,
-    )
-
+    window_size = None if window_size_left < 0 else window_size_left
+    tensors = tuple(t.detach().requires_grad_(True) for t in (q, r, k, v))
     grad_output = torch.randn_like(q)
 
+    def run_fwd(op):
+        with torch.no_grad():
+            return (op(q, r, k, v, scale=scale, cu_seqlens=cu_seqlens, window_size=window_size),)
+
+    def run_fwd_bwd(op):
+        with torch.enable_grad():
+            output = op(*tensors, scale=scale, cu_seqlens=cu_seqlens, window_size=window_size)
+            return torch.autograd.grad(output, tensors, grad_output)
+
     def run_fla_fwd():
-        return fla_parallel_parallax_fwd(
-            q,
-            r,
-            k,
-            v,
-            scale,
-            cu_seqlens,
-            fla_chunk_indices,
-            window_size_left,
-        )
+        return run_fwd(fla_parallel_parallax)
 
     def run_fla_fwd_bwd():
-        o, barv, d1, bart, m = run_fla_fwd()
-
-        return fla_parallel_parallax_bwd(
-            q,
-            r,
-            k,
-            v,
-            o,
-            barv,
-            d1,
-            bart,
-            m,
-            grad_output,
-            scale,
-            cu_seqlens,
-            fla_chunk_indices,
-            window_size_left,
-        )
+        return run_fwd_bwd(fla_parallel_parallax)
 
     def run_flag_attn_fwd():
-        return flag_attn_parallel_parallax_fwd(
-            q,
-            r,
-            k,
-            v,
-            scale,
-            cu_seqlens,
-            flag_attn_chunk_indices,
-            window_size_left,
-        )
+        return run_fwd(parallel_parallax)
 
     def run_flag_attn_fwd_bwd():
-        o, barv, d1, bart, m = run_flag_attn_fwd()
-
-        return flag_attn_parallel_parallax_bwd(
-            q,
-            r,
-            k,
-            v,
-            o,
-            barv,
-            d1,
-            bart,
-            m,
-            grad_output,
-            scale,
-            cu_seqlens,
-            flag_attn_chunk_indices,
-            window_size_left,
-        )
+        return run_fwd_bwd(parallel_parallax)
 
     if phase == "fwd":
         fla_fn = run_fla_fwd
@@ -786,9 +667,8 @@ def _run_phase_table(
         recorder = (
             BenchmarkRecorder(
                 record_property, op_name="parallel_parallax",
-                dtype=str(dtype), mode=Config.mode.value, phase="forward",
+                dtype=str(dtype), mode=Config.mode.value, phase="forward" if phase == "fwd" else "forward_backward",
             )
-            if phase == "fwd" else None
         )
         for case in DEFAULT_CASES:
             result = _benchmark_case(
@@ -844,7 +724,7 @@ def test_perf_parallel_parallax(record_property) -> None:
         print("timing = CUDA Event batch elapsed time / calls per sample; latency values are milliseconds")
     if FLA_IMPORT_ERROR is None:
         print("baseline = FLA; speedup = FLA latency / FlagAttention latency; >1 means FlagAttention is faster")
-    print("fwd+bwd = forward + backward")
+    print("fwd+bwd = forward + backward; all providers use their public API")
 
     _run_phase_table(
         phase="fwd",
@@ -859,4 +739,5 @@ def test_perf_parallel_parallax(record_property) -> None:
         title="[Forward + Backward]",
         fla_column="FLA-fwdbwd(ms)",
         flag_attn_column="FlagAttention-fwdbwd(ms)",
+        record_property=record_property,
     )
