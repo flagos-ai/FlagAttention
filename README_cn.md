@@ -87,13 +87,13 @@ FlagAttention 是一个使用 [Triton](https://github.com/triton-lang/triton) �
 
 运行时能够识别 `nvidia`、`amd`、`hygon`、`iluvatar`、`metax`、`thead`、`enflame`、`ascend`、`cambricon`、`mthreads`、`intel` 和 `cpu`，用于设备元数据及显式选择。能够识别后端并不表示每个算子都已在该后端实现或验证；算子级覆盖情况请查看 [`conf/operators.yaml`](./conf/operators.yaml)、[`src/flag_attn/runtime/backend`](./src/flag_attn/runtime/backend) 中的后端包以及对应测试。
 
-后端派发因算子而异，且基于名字查表。每个厂商包声明一张 `_OPERATOR_EXPORTS` 表：当表中出现某个公开 API 的名字时解析到厂商实现，否则保留通用 Triton 实现。已声明但导入或执行失败的覆盖会直接报错，而不是静默回落。通用实现以 NVIDIA 为基准，因此 `_nvidia` 不声明任何覆盖，只提供调优配置。
+后端派发因算子而异，且基于名字查表。每个厂商包声明一张 `_OPERATOR_EXPORTS` 表：当表中出现某个公开 API 的名字时解析到厂商实现，否则保留通用 Triton 实现。已声明但导入或执行失败的覆盖会直接报错，而不是静默回落。NVIDIA 实现位于 `_nvidia`，其中 Wall Attention 等架构特化实现位于 `_nvidia/hopper`。
 
 各厂商包当前提供覆盖的算子族如下：
 
 | 后端 | 设备类型 | 提供厂商实现的算子族 |
 | --- | --- | --- |
-| `_nvidia` | `cuda` | 无覆盖；使用通用 Triton 路径及 `tune_configs.yaml` |
+| `_nvidia` | `cuda` | GDN2、MiniMax M3、Hopper Wall Attention |
 | `_metax` | `cuda` | MiniMax M3、SageAttention、NSA、GLA、KDA、GDN2、AttnRes |
 | `_hygon` | `cuda` | MiniMax M3、SageAttention、NSA、GLA、KDA、AttnRes，以及私有的 `mla` 算子族 |
 | `_mthreads` | `musa` | MiniMax M3、SageAttention、NSA、GLA、KDA、GDN2、MoBA |
@@ -307,6 +307,7 @@ GLA、GDN2 和 KDA 使用 sequence-first `[B,T,H,D]`。Gated Delta Rule 默认 `
 - [`log_linear_attn`](./src/flag_attn/FLA/log_linear_attn/chunk_tle.py) 是基于 TLE kernel 的稠密纯前向 Log-Linear Attention 入口，接收 `(q, k, v, g, level_scales)`，其中 `level_scales` 提供各层级的门控缩放。`chunk_log_linear_attn` 是同一函数的清单名称。
 - [`parallel_parallax`](./src/flag_attn/FLA/parallax) 是参数化局部线性注意力，单一公开入口通过 `stage=` 选择三个阶段。Prefill（`"prefill"`，默认）接收 `(q, r, k, v)`，其中 `q/r: [B,T,HQ,D]`、`k/v: [B,T,H,D]`，支持 GQA、autograd、可选 `window_size`，并通过 `cu_seqlens` 支持 packed varlen。注意 `r` 不会被 `scale` 预先缩放。`"decode"` 和 `"kvcache"` 阶段则路由到 KV-cache decode kernel。
 - [`parallel_wall_attn`](./src/flag_attn/FLA/wall_attn/parallel.py) 是带门控的窗口注意力，接收 `(q, k, v, g)`，可选 `g_scalar`、`sink_bias`、`window_size` 和 `cu_seqlens`，提供前向与反向。公开入口会校验输入并在经过数值检查的快速路径与通用实现之间选择；校验需要与 host 同步，因此 graph capture 场景始终使用通用实现。
+  通用实现和可复用的缓存预处理位于 `FLA/wall_attn`，仅使用标准 Triton 原语；Hopper TLE/WGMMA 内核及其路由位于 [`runtime/backend/_nvidia/hopper/wall_attn`](./src/flag_attn/runtime/backend/_nvidia/hopper/wall_attn)。使用 `flag_attn.parallel_wall_attn` 自动分发；训练、不支持的输入以及缺少 TLE 或所需扩展接口时回退到通用实现。在 NVIDIA 后端设置 `FLAG_ATTN_FORCE_GENERIC=1` 可通过同一个顶层接口验证通用路径。精度和性能测试命令为 `pytest -m parallel_wall_attn tests/flag_attn/test_parallel_wall_attn.py benchmark/test_parallel_wall_attn_benchmark.py`，分别在默认环境和设置该变量后运行。`flag_attn.wall_attn_get_last_route()` 可查看实际执行路径。
 
 ### Native Sparse Attention
 

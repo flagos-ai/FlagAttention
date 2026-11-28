@@ -71,13 +71,13 @@ PyTorch and accelerator runtimes are intentionally not hard dependencies in [`py
 
 The runtime recognizes `nvidia`, `amd`, `hygon`, `iluvatar`, `metax`, `thead`, `enflame`, `ascend`, `cambricon`, `mthreads`, `intel`, and `cpu` for device metadata and explicit selection. Recognition does not mean that every operator is implemented or tested on every backend; consult [`conf/operators.yaml`](./conf/operators.yaml), the backend packages in [`src/flag_attn/runtime/backend`](./src/flag_attn/runtime/backend), and the relevant tests for operator-level coverage.
 
-Backend routing is operator-specific and name-based. Each vendor package declares an `_OPERATOR_EXPORTS` table; a public API resolves to the vendor implementation when that table names it, and otherwise keeps the generic Triton implementation. A declared override that fails to import or run is an error rather than a silent fallback. The generic implementations target NVIDIA, so `_nvidia` declares no overrides and supplies only tuning configuration.
+Backend routing is operator-specific and name-based. Each vendor package declares an `_OPERATOR_EXPORTS` table; a public API resolves to the vendor implementation when that table names it, and otherwise keeps the generic Triton implementation. A declared override that fails to import or run is an error rather than a silent fallback. NVIDIA implementations live under `_nvidia`, with architecture-specific implementations such as Wall Attention under `_nvidia/hopper`.
 
 Vendor packages currently ship overrides for these operator families:
 
 | Backend | Device | Operator families with vendor implementations |
 | --- | --- | --- |
-| `_nvidia` | `cuda` | None; generic Triton paths plus `tune_configs.yaml` |
+| `_nvidia` | `cuda` | GDN2, MiniMax M3, Hopper Wall Attention |
 | `_metax` | `cuda` | MiniMax M3, SageAttention, NSA, GLA, KDA, GDN2, AttnRes |
 | `_hygon` | `cuda` | MiniMax M3, SageAttention, NSA, GLA, KDA, AttnRes, and a private `mla` family |
 | `_mthreads` | `musa` | MiniMax M3, SageAttention, NSA, GLA, KDA, GDN2, MoBA |
@@ -291,6 +291,7 @@ GLA, GDN2, and KDA use sequence-first `[B,T,H,D]`. Gated Delta Rule defaults to 
 - [`log_linear_attn`](./src/flag_attn/FLA/log_linear_attn/chunk_tle.py) is a dense, forward-only Log-Linear Attention entry built on TLE kernels. It takes `(q, k, v, g, level_scales)`, where `level_scales` supplies the per-level gate scales. `chunk_log_linear_attn` is the same function under its inventory name.
 - [`parallel_parallax`](./src/flag_attn/FLA/parallax) is parameterized local linear attention with a single public entry and three stages selected by `stage=`. Prefill (`"prefill"`, the default) takes `(q, r, k, v)` with `q/r: [B,T,HQ,D]` and `k/v: [B,T,H,D]`, supports GQA, autograd, an optional `window_size`, and packed variable lengths via `cu_seqlens`. Note that `r` is not pre-scaled by `scale`. The `"decode"` and `"kvcache"` stages route to the KV-cache decode kernels.
 - [`parallel_wall_attn`](./src/flag_attn/FLA/wall_attn/parallel.py) is gated windowed attention taking `(q, k, v, g)` with optional `g_scalar`, `sink_bias`, `window_size`, and `cu_seqlens`. It provides forward and backward. The public entry validates its inputs and picks a numerically checked fast path or the general implementation; validation synchronizes with the host, so graph capture always uses the general path.
+  Portable kernels and reusable cache preparation stay in `FLA/wall_attn` and use standard Triton primitives. Hopper TLE/WGMMA kernels and their routing live in [`runtime/backend/_nvidia/hopper/wall_attn`](./src/flag_attn/runtime/backend/_nvidia/hopper/wall_attn). Call `flag_attn.parallel_wall_attn` for automatic dispatch; training, unsupported inputs, and missing or incompatible TLE use the generic implementation. On NVIDIA, set `FLAG_ATTN_FORCE_GENERIC=1` to validate the generic path through the same public API. Run `pytest -m parallel_wall_attn tests/flag_attn/test_parallel_wall_attn.py benchmark/test_parallel_wall_attn_benchmark.py` both with the default environment and with this variable set. `flag_attn.wall_attn_get_last_route()` reports the executed path.
 
 ### Native Sparse Attention
 

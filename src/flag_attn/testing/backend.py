@@ -31,7 +31,6 @@ _CUDA_GENERIC_OPERATORS = {
     "parallel_parallax",
     "parallax_decode",
     "parallax_attn_with_kvcache",
-    "parallel_wall_attn",
     "log_linear_attn",
     "parallel_forgetting_attn",
     "minimax_m3_sparse_attn",
