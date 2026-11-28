@@ -21,9 +21,6 @@ CuTe is an optional comparison baseline; no vLLM installation is required.
 
 from __future__ import annotations
 
-
-import pytest
-
 import argparse
 import importlib
 import os
@@ -34,6 +31,7 @@ from functools import cache, partial
 from pathlib import Path
 from typing import Any, Callable
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -44,16 +42,16 @@ except ModuleNotFoundError:
     from base import Benchmark
     from recording import BenchmarkRecorder
 
+from flag_attn import inkling_fa4_rel_attention
+from flag_attn.inkling_fa4 import tle_available
 from flag_attn.testing import backend as test_backend
-from flag_attn.inkling_fa4 import get_backend, tle_available
-
 
 pytestmark = pytest.mark.inkling_fa4_rel_attention
 
 HEAD_DIM = 128
 BLOCK_SIZE = 16
 DTYPE = torch.bfloat16
-BACKEND_NAMES = ("triton", "tle", "official_cute")
+BACKEND_NAMES = ("triton", "auto", "tle", "official_cute")
 
 
 @dataclass(frozen=True)
@@ -280,19 +278,13 @@ def make_runner(backend: Backend, prep: Prepared) -> Callable[[], Any]:
 def resolve_backends(names: list[str], flash_root: str | None) -> dict[str, Backend]:
     """Skip unavailable optional providers; propagate local implementation bugs."""
     resolved = {}
-    capability = test_backend.cuda_capability()
     for name in dict.fromkeys(names):
         if name == "official_cute":
             fn, reason = _load_official_cute(flash_root) if test_backend.is_nvidia() else (None, "CuTe requires NVIDIA")
         elif name == "tle":
             available, reason = tle_available()
-            if capability[0] != 9:
-                available, reason = False, "Hopper TLE requires SM90"
-            fn = get_backend(name) if available else None
+            fn = partial(inkling_fa4_rel_attention, backend=name) if available else None
         else:
-            from flag_attn import inkling_fa4_rel_attention
-            from functools import partial
-
             fn, reason = partial(inkling_fa4_rel_attention, backend=name), ""
         if fn is None:
             print(f"SKIP {name}: {reason}")
@@ -368,7 +360,7 @@ class InklingFA4Benchmark(Benchmark):
             self.backends["official_cute"].fn
             if "official_cute" in self.backends else None
         )
-        self.set_gems(self.backends["triton"].fn if "triton" in self.backends else None)
+        self.set_gems(self.backends["auto"].fn if "auto" in self.backends else None)
         self.init_user_config()
         prepared = {
             data.config.name: data
@@ -398,13 +390,15 @@ class InklingFA4Benchmark(Benchmark):
                         "case": case.name,
                         **{f"{name} (ms)": value for name, value in latencies.items()},
                     })
-                    if self.gems_op is not None:
+                    for name in self.backends:
+                        if name == "official_cute":
+                            continue
                         recorder.add(
                             shape_detail={
                                 "case": case.name, "num_splits": splits,
-                                "rel": self.args.rel,
+                                "rel": self.args.rel, "backend": name,
                             },
-                            latency=latencies["triton"],
+                            latency=latencies[name],
                             latency_base=latencies.get("official_cute"),
                         )
                 print(f"inkling_fa4-bf16-splits-{splits}-rel-{self.args.rel}:")
@@ -416,9 +410,10 @@ def run_benchmark(args, record_property=None) -> None:
     InklingFA4Benchmark(args).run(record_property)
 
 
-def test_inkling_fa4_rel_attention_benchmark(record_property):
+@pytest.mark.parametrize("num_splits", [1, 4])
+def test_inkling_fa4_rel_attention_benchmark(record_property, num_splits):
     args = argparse.Namespace(
-        cases=None, providers=list(BACKEND_NAMES), num_splits=[1],
+        cases=None, providers=list(BACKEND_NAMES), num_splits=[num_splits],
         warmup=25, rep=100, rel="real", flash_attn_root=os.getenv("FLASH_ATTN_ROOT"),
     )
     run_benchmark(args, record_property)

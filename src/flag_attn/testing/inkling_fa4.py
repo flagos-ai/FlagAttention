@@ -37,10 +37,11 @@ def ref_rel_attn(
     num_heads = q.shape[1]
     num_kv_heads = key_cache.shape[2]
     head_dim = q.shape[2]
+    value_dim = value_cache.shape[3]
     block_size = key_cache.shape[1]
     group_size = num_heads // num_kv_heads
     batch_size = cache_seqlens.shape[0]
-    out = torch.empty_like(q)
+    out = torch.empty((*q.shape[:2], value_dim), device=q.device, dtype=q.dtype)
 
     for seq_id in range(batch_size):
         q_start = int(cu_seqlens_q[seq_id])
@@ -50,7 +51,7 @@ def ref_rel_attn(
         num_blocks = (k_len + block_size - 1) // block_size
         physical_blocks = block_table[seq_id, :num_blocks].long()
         k = key_cache[physical_blocks].reshape(-1, num_kv_heads, head_dim)[:k_len].float()
-        v = value_cache[physical_blocks].reshape(-1, num_kv_heads, head_dim)[:k_len].float()
+        v = value_cache[physical_blocks].reshape(-1, num_kv_heads, value_dim)[:k_len].float()
         q_seq = q[q_start:q_end].float()
         rel_seq = rel_logits[q_start:q_end].float()
 
